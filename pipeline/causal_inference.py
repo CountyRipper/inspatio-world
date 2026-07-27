@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 import torch
 import time
 from contextlib import nullcontext
@@ -130,6 +130,8 @@ class CausalInferencePipeline(torch.nn.Module):
         render_latent: Optional[torch.Tensor] = None,
         mask_latent: Optional[torch.Tensor] = None,
         decode: bool = True,
+        block_condition_provider: Optional[Callable[[int, int, int], Tuple[torch.Tensor, torch.Tensor]]] = None,
+        block_output_callback: Optional[Callable[..., None]] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -180,11 +182,25 @@ class CausalInferencePipeline(torch.nn.Module):
 
         start_index = 0
         last_pred = None
-        for num_block_frame in all_num_frames:
+        for block_index, num_block_frame in enumerate(all_num_frames):
             noisy_input = noise[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             ref_block = ref_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
-            render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
-            mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
+
+            if block_condition_provider is None:
+                assert render_latent is not None and mask_latent is not None
+                render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
+                mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
+            else:
+                render_block, mask_block = block_condition_provider(
+                    block_index, start_index, num_block_frame
+                )
+                render_block = render_block.to(device=noise.device, dtype=noise.dtype)
+                mask_block = mask_block.to(device=noise.device, dtype=noise.dtype)
+
+            assert render_block.shape[:2] == (batch_size, num_block_frame)
+            assert mask_block.shape[:2] == (batch_size, num_block_frame)
+            assert render_block.shape[2] == 16, f"Expected 16 render channels, got {render_block.shape}"
+            assert mask_block.shape[2] == 4, f"Expected 4 mask channels, got {mask_block.shape}"
             render_block = torch.cat([mask_block, render_block], dim=2)
 
             kv_size = 1560*3
@@ -202,6 +218,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 context_frames = torch.cat([ref_block, last_pred_padded], dim=1)
                 kv_size = kv_size + 1560 * 3
 
+            if block_output_callback is not None and noisy_input.is_cuda:
+                torch.cuda.synchronize(noisy_input.device)
+            t_dit_start = time.perf_counter()
+
             denoised_pred, _ = denoise_block(
                 self.generator, self.scheduler, noisy_input, conditional_dict,
                 self.kv_cache1,
@@ -213,10 +233,22 @@ class CausalInferencePipeline(torch.nn.Module):
                 denoising_steps=self.denoising_step_list,
             )
 
+            if block_output_callback is not None and noisy_input.is_cuda:
+                torch.cuda.synchronize(noisy_input.device)
+            dit_ms = (time.perf_counter() - t_dit_start) * 1000.0
+
 
             # Step 3.2: record the model's output
             output[:, start_index:start_index + num_block_frame] = denoised_pred
             last_pred = denoised_pred.clone().detach()
+
+            if block_output_callback is not None:
+                block_output_callback(
+                    block_index=block_index,
+                    latent_start=start_index,
+                    denoised_latent=last_pred,
+                    dit_ms=dit_ms,
+                )
 
             # Step 3.4: update the start and end frame indices
             start_index += num_block_frame

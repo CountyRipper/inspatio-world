@@ -88,6 +88,9 @@ class TestDataset():
         render_dir = os.path.join(source_conf["vggt_depth_path"], 'render')
         render_video_path = os.path.join(render_dir, 'render_offline.mp4')
         mask_video_path = os.path.join(render_dir, 'mask_offline.mp4')
+        target_c2w_path = os.path.join(render_dir, 'target_c2w.npy')
+        target_intrinsic_path = os.path.join(render_dir, 'intrinsic.npy')
+        reference_depth_path = os.path.join(render_dir, 'depth_offline.npy')
 
         # render_video: [T, C, H, W] in [0, 1] -> normalized to [-1, 1]
         render_video = read_frames(render_video_path)  # t c h w, [0, 1]
@@ -97,6 +100,20 @@ class TestDataset():
         mask_video = read_frames(mask_video_path)  # t c h w, [0, 1]
         mask_video = (mask_video > 0.5).float()
         mask_video = mask_video * 2.0 - 1.0  # to [-1, 1] range
+
+        # Exact camera geometry saved by scripts/render_point_cloud.py. These
+        # are the poses/intrinsic that produced render_video, unlike the legacy
+        # target_extrinsics below which are regenerated independently.
+        exact_target_c2w = None
+        exact_target_intrinsic = None
+        exact_reference_depth = None
+        if os.path.exists(target_c2w_path) and os.path.exists(target_intrinsic_path):
+            exact_target_c2w = torch.from_numpy(np.load(target_c2w_path).astype(np.float32))
+            exact_target_intrinsic = torch.from_numpy(np.load(target_intrinsic_path).astype(np.float32))
+        if os.path.exists(reference_depth_path):
+            exact_reference_depth = torch.from_numpy(
+                np.load(reference_depth_path).astype(np.float32, copy=False)
+            )
 
         # Time-freeze: repeat a frame in source_video to match render/mask freeze
         if self.freeze_repeat > 0:
@@ -114,10 +131,19 @@ class TestDataset():
                   f'{n_src} -> {source_video.shape[0]} frames')
 
         # Align frame counts: render/mask may differ slightly from source_video
-        min_frames = min(source_video.shape[0], render_video.shape[0], mask_video.shape[0])
+        frame_counts = [source_video.shape[0], render_video.shape[0], mask_video.shape[0]]
+        if exact_target_c2w is not None:
+            frame_counts.append(exact_target_c2w.shape[0])
+        if exact_reference_depth is not None:
+            frame_counts.append(exact_reference_depth.shape[0])
+        min_frames = min(frame_counts)
         source_video = source_video[:min_frames]
         render_video = render_video[:min_frames]
         mask_video = mask_video[:min_frames]
+        if exact_target_c2w is not None:
+            exact_target_c2w = exact_target_c2w[:min_frames]
+        if exact_reference_depth is not None:
+            exact_reference_depth = exact_reference_depth[:min_frames]
         n_frames = min_frames
 
         # ===================== load depth for radius computation =====================
@@ -178,6 +204,10 @@ class TestDataset():
                     source_video = source_video[expand_indices]
                     render_video = render_video[expand_indices]
                     mask_video = mask_video[expand_indices]
+                    if exact_target_c2w is not None:
+                        exact_target_c2w = exact_target_c2w[expand_indices]
+                    if exact_reference_depth is not None:
+                        exact_reference_depth = exact_reference_depth[expand_indices]
                     n_frames = target_n_frames
                 elif n_frames > max_needed:
                     target_n_frames = max_needed
@@ -187,6 +217,10 @@ class TestDataset():
                     source_video = source_video[subsample_indices]
                     render_video = render_video[subsample_indices]
                     mask_video = mask_video[subsample_indices]
+                    if exact_target_c2w is not None:
+                        exact_target_c2w = exact_target_c2w[subsample_indices]
+                    if exact_reference_depth is not None:
+                        exact_reference_depth = exact_reference_depth[subsample_indices]
                     n_frames = target_n_frames
                 else:
                     print(f'[Traj adaptive] Frame count OK, no adjustment needed')
@@ -203,6 +237,11 @@ class TestDataset():
         data['source_video'] = source_video
         data['render_video'] = render_video
         data['mask_video'] = mask_video
+        if exact_target_c2w is not None:
+            data['target_c2w'] = exact_target_c2w
+            data['target_intrinsic'] = exact_target_intrinsic
+        if exact_reference_depth is not None:
+            data['reference_depth'] = exact_reference_depth
 
         print(f"data['source_video'].shape {data['source_video'].shape}, "
               f"data['render_video'].shape {data['render_video'].shape}, "

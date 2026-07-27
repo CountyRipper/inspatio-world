@@ -173,6 +173,11 @@ def center_poses_by_mean_translation(T_w2c):
 ##### traj pose generation #####
 from scipy.interpolate import UnivariateSpline, interp1d
 def txt_interpolation(input_list, n, mode='smooth'):
+    # A dense trajectory is already sampled at the target frame rate. Running
+    # SciPy's smoothing spline over it changes both the requested extrema and
+    # the return pose, so preserve per-frame controls exactly.
+    if len(input_list) == n:
+        return np.asarray(input_list, dtype=np.float64).copy()
     x = np.linspace(0, 1, len(input_list))
     if mode == 'smooth':
         f = UnivariateSpline(x, input_list, k=3)

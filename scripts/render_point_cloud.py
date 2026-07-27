@@ -59,14 +59,17 @@ def load_ply_data(ply_path, device):
 
 
 def render_batch(points, colors, c2w, K, width, height, point_size=2,
-                 ss_ratio=2.0, bg_color=0):
+                 ss_ratio=2.0, bg_color=0, return_depth=False):
     """Render point cloud from given camera pose with supersampling.
 
-    Returns (rgb_bgr, mask) as numpy arrays.
+    Returns (rgb_bgr, mask), or (rgb_bgr, mask, depth) when requested.
     """
     if points is None or colors is None:
-        return (np.zeros((height, width, 3), dtype=np.uint8),
-                np.zeros((height, width), dtype=np.uint8))
+        empty = (np.zeros((height, width, 3), dtype=np.uint8),
+                 np.zeros((height, width), dtype=np.uint8))
+        if return_depth:
+            return (*empty, np.zeros((height, width), dtype=np.float32))
+        return empty
 
     H_high = int(height * ss_ratio)
     W_high = int(width * ss_ratio)
@@ -88,8 +91,11 @@ def render_batch(points, colors, c2w, K, width, height, point_size=2,
 
     mask_z = z > MIN_DEPTH_THRESHOLD
     if mask_z.sum() == 0:
-        return (np.zeros((height, width, 3), dtype=np.uint8),
-                np.zeros((height, width), dtype=np.uint8))
+        empty = (np.zeros((height, width, 3), dtype=np.uint8),
+                 np.zeros((height, width), dtype=np.uint8))
+        if return_depth:
+            return (*empty, np.zeros((height, width), dtype=np.float32))
+        return empty
 
     xyz = cam_xyz[mask_z]
     rgb = colors[mask_z]
@@ -150,7 +156,26 @@ def render_batch(points, colors, c2w, K, width, height, point_size=2,
                             interpolation=cv2.INTER_NEAREST)
 
     img_bgr = cv2.cvtColor(img_final, cv2.COLOR_RGB2BGR)
-    return img_bgr, mask_final
+    if not return_depth:
+        return img_bgr, mask_final
+
+    integer_ss_ratio = int(round(ss_ratio))
+    if integer_ss_ratio <= 0 or H_high != height * integer_ss_ratio or W_high != width * integer_ss_ratio:
+        raise ValueError("Depth output requires an integer supersampling ratio")
+    depth_high = depth_buffer.reshape(H_high, W_high)
+    depth_tiles = depth_high.reshape(
+        height, integer_ss_ratio, width, integer_ss_ratio
+    )
+    depth_final = depth_tiles.amin(dim=(1, 3))
+    mask_final_tensor = torch.from_numpy(mask_final).to(
+        device=depth_final.device, dtype=torch.bool
+    )
+    depth_final = torch.where(
+        torch.isfinite(depth_final) & mask_final_tensor,
+        depth_final,
+        torch.zeros_like(depth_final),
+    )
+    return img_bgr, mask_final, depth_final.cpu().numpy().astype(np.float32)
 
 
 # ── Data loading ──
@@ -287,6 +312,19 @@ def open_ffmpeg_writer(output_path, width, height, fps=24):
         output_path,
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+
+def save_render_geometry(output_dir, target_c2ws, K_render):
+    """Persist the exact camera contract shared by RGB, mask, and depth."""
+    target_c2w_path = os.path.join(output_dir, "target_c2w.npy")
+    intrinsic_path = os.path.join(output_dir, "intrinsic.npy")
+    np.save(
+        target_c2w_path,
+        torch.stack(target_c2ws, dim=0).detach().cpu().numpy().astype(np.float32),
+    )
+    np.save(intrinsic_path, K_render.detach().cpu().numpy().astype(np.float32))
+    logger.info(f"Saved exact target c2w poses: {target_c2w_path}")
+    logger.info(f"Saved exact render intrinsic: {intrinsic_path}")
 
 
 class DepthWarper:
@@ -614,6 +652,7 @@ def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, hei
     logger.info(f"  Warped {num_frames} frames")
 
     os.makedirs(output_dir, exist_ok=True)
+    save_render_geometry(output_dir, target_c2ws, K_render)
     video_path = os.path.join(output_dir, "render_offline.mp4")
     mask_path = os.path.join(output_dir, "mask_offline.mp4")
     write_tensor_videos(render, mask, video_path, mask_path, width, height, fps)
@@ -671,11 +710,19 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
 
     # Setup output
     os.makedirs(output_dir, exist_ok=True)
+    save_render_geometry(output_dir, target_c2ws, K_render)
     video_path = os.path.join(output_dir, "render_offline.mp4")
     mask_path = os.path.join(output_dir, "mask_offline.mp4")
+    depth_path = os.path.join(output_dir, "depth_offline.npy")
 
     video_proc = open_ffmpeg_writer(video_path, width, height, fps)
     mask_proc = open_ffmpeg_writer(mask_path, width, height, fps)
+    depth_output = np.lib.format.open_memmap(
+        depth_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(num_frames, height, width),
+    )
 
     try:
         for idx in range(num_frames):
@@ -685,10 +732,12 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
             cols = colors_list[pcd_idx]
             c2w = target_c2ws[idx]
 
-            img_bgr, mask_gray = render_batch(
+            img_bgr, mask_gray, depth = render_batch(
                 pts, cols, c2w, K_render, width, height,
-                point_size=point_size, ss_ratio=2.0, bg_color=0
+                point_size=point_size, ss_ratio=2.0, bg_color=0,
+                return_depth=True,
             )
+            depth_output[idx] = depth
 
             # BGR -> RGB for ffmpeg
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -706,6 +755,7 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
         mask_proc.stdin.close()
         video_proc.wait()
         mask_proc.wait()
+        depth_output.flush()
 
     if video_proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed for {video_path}")
@@ -714,6 +764,7 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
 
     logger.info(f"Saved: {video_path}")
     logger.info(f"Saved: {mask_path}")
+    logger.info(f"Saved: {depth_path}")
 
 
 def render_point_cloud(da3_dir, traj_txt_path, output_dir, width=832, height=480,

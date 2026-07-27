@@ -36,6 +36,17 @@ set -e
 #   --use_tae             (optional) Use Tiny Auto Encoder (TAE) instead of WanVAE
 #   --tae_checkpoint_path (optional) Path to TAE checkpoint file (required when --use_tae is set)
 #   --compile_dit         (optional) Apply torch.compile to the DiT model
+#   --historical_memory   (optional) Enable training-free historical RGB point memory
+#   --memory_depth_backend (optional) da3 or align3r (default: da3)
+#   --memory_map_mode     (optional) bounded_voxel or dense_two_layer (default: bounded_voxel)
+#   --memory_depth_device (optional) Logical CUDA device for memory DA3
+#   --memory_update_mode  (optional) keyframe, latent_keyframe, or full_block (default: keyframe)
+#   --memory_voxel_size   (optional) Historical point voxel size (default: 0.02)
+#   --memory_max_points   (optional) Maximum historical point count (default: 500000)
+#   --memory_point_size   (optional) Historical point splat size (default: 1)
+#   --disable_memory_diagnostics (optional) Disable historical/fused diagnostic videos
+#   --profile_blocks      (optional) Save per-block DiT timing
+#   --save_denoised_latents (optional) Save final denoised latent tensor
 #   --freeze_repeat       (optional) Repeat a frame N times for time-freeze effect (default: 0, disabled)
 #   --freeze_frame        (optional) Frame index to freeze (default: middle frame)
 #   --render_backend      (optional) Rendering backend: warper (default, no point-cloud save) or ply
@@ -66,6 +77,25 @@ USE_TAE=false
 TAE_CHECKPOINT_PATH="${SCRIPT_DIR}/checkpoints/taehv/taew2_1.pth"
 COMPILE_DIT=false
 RENDER_BACKEND="warper"
+HISTORICAL_MEMORY=false
+MEMORY_MAP_MODE="bounded_voxel"
+MEMORY_DEPTH_BACKEND="da3"
+MEMORY_DEPTH_DEVICE=""
+MEMORY_ALIGN3R_PYTHON=""
+MEMORY_ALIGN3R_ROOT=""
+MEMORY_ALIGN3R_WEIGHTS=""
+MEMORY_ALIGN3R_WORK_DIR=""
+MEMORY_ALIGN3R_GPU=""
+MEMORY_ALIGN3R_TORCH_HOME=""
+MEMORY_ALIGN3R_XDG_CONFIG_HOME=""
+MEMORY_ALIGN3R_DISABLE_CUROPE=false
+MEMORY_UPDATE_MODE="keyframe"
+MEMORY_VOXEL_SIZE="0.02"
+MEMORY_MAX_POINTS="500000"
+MEMORY_POINT_SIZE="1"
+MEMORY_DIAGNOSTICS=true
+PROFILE_BLOCKS=false
+SAVE_DENOISED_LATENTS=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -162,6 +192,82 @@ while [[ $# -gt 0 ]]; do
             COMPILE_DIT=true
             shift
             ;;
+        --historical_memory)
+            HISTORICAL_MEMORY=true
+            shift
+            ;;
+        --memory_map_mode)
+            MEMORY_MAP_MODE="$2"
+            shift 2
+            ;;
+        --memory_depth_backend)
+            MEMORY_DEPTH_BACKEND="$2"
+            shift 2
+            ;;
+        --memory_depth_device)
+            MEMORY_DEPTH_DEVICE="$2"
+            shift 2
+            ;;
+        --memory_align3r_python)
+            MEMORY_ALIGN3R_PYTHON="$2"
+            shift 2
+            ;;
+        --memory_align3r_root)
+            MEMORY_ALIGN3R_ROOT="$2"
+            shift 2
+            ;;
+        --memory_align3r_weights)
+            MEMORY_ALIGN3R_WEIGHTS="$2"
+            shift 2
+            ;;
+        --memory_align3r_work_dir)
+            MEMORY_ALIGN3R_WORK_DIR="$2"
+            shift 2
+            ;;
+        --memory_align3r_gpu)
+            MEMORY_ALIGN3R_GPU="$2"
+            shift 2
+            ;;
+        --memory_align3r_torch_home)
+            MEMORY_ALIGN3R_TORCH_HOME="$2"
+            shift 2
+            ;;
+        --memory_align3r_xdg_config_home)
+            MEMORY_ALIGN3R_XDG_CONFIG_HOME="$2"
+            shift 2
+            ;;
+        --memory_align3r_disable_curope)
+            MEMORY_ALIGN3R_DISABLE_CUROPE=true
+            shift
+            ;;
+        --memory_update_mode)
+            MEMORY_UPDATE_MODE="$2"
+            shift 2
+            ;;
+        --memory_voxel_size)
+            MEMORY_VOXEL_SIZE="$2"
+            shift 2
+            ;;
+        --memory_max_points)
+            MEMORY_MAX_POINTS="$2"
+            shift 2
+            ;;
+        --memory_point_size)
+            MEMORY_POINT_SIZE="$2"
+            shift 2
+            ;;
+        --disable_memory_diagnostics)
+            MEMORY_DIAGNOSTICS=false
+            shift
+            ;;
+        --profile_blocks)
+            PROFILE_BLOCKS=true
+            shift
+            ;;
+        --save_denoised_latents)
+            SAVE_DENOISED_LATENTS=true
+            shift
+            ;;
         --render_backend)
             RENDER_BACKEND="$2"
             shift 2
@@ -181,6 +287,36 @@ fi
 if [ -z "$TRAJ_TXT_PATH" ]; then
     echo "Error: --traj_txt_path is required"
     exit 1
+fi
+if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ]; then
+    echo "Error: --memory_map_mode must be 'bounded_voxel' or 'dense_two_layer'"
+    exit 1
+fi
+if [ "$MEMORY_DEPTH_BACKEND" != "da3" ] && [ "$MEMORY_DEPTH_BACKEND" != "align3r" ]; then
+    echo "Error: --memory_depth_backend must be 'da3' or 'align3r'"
+    exit 1
+fi
+if [ "$HISTORICAL_MEMORY" = true ] && [ "$MEMORY_DEPTH_BACKEND" = "align3r" ]; then
+    for required_value in \
+        "$MEMORY_ALIGN3R_PYTHON" \
+        "$MEMORY_ALIGN3R_ROOT" \
+        "$MEMORY_ALIGN3R_WEIGHTS" \
+        "$MEMORY_ALIGN3R_WORK_DIR" \
+        "$MEMORY_ALIGN3R_GPU"; do
+        if [ -z "$required_value" ]; then
+            echo "Error: Align3R memory backend requires python/root/weights/work_dir/gpu"
+            exit 1
+        fi
+    done
+fi
+if [ "$MEMORY_MAP_MODE" = "dense_two_layer" ]; then
+    if [ "$MEMORY_UPDATE_MODE" != "latent_keyframe" ] && [ "$MEMORY_UPDATE_MODE" != "full_block" ]; then
+        echo "Error: dense_two_layer requires --memory_update_mode latent_keyframe or full_block"
+        exit 1
+    fi
+    # Dense reference depth is the visible PLY z-buffer. Legacy runs retain
+    # the latest upstream fast-warper default.
+    RENDER_BACKEND="ply"
 fi
 if [ "$RENDER_BACKEND" != "warper" ] && [ "$RENDER_BACKEND" != "ply" ]; then
     echo "Error: --render_backend must be 'warper' or 'ply'"
@@ -222,6 +358,17 @@ echo "  Save point cloud:$SAVE_POINT_CLOUD"
 echo "  Use TAE:         $USE_TAE"
 echo "  TAE checkpoint:  ${TAE_CHECKPOINT_PATH:-N/A}"
 echo "  Compile DiT:     $COMPILE_DIT"
+echo "  Historical memory: $HISTORICAL_MEMORY"
+echo "  Memory depth backend: $MEMORY_DEPTH_BACKEND"
+echo "  Memory map mode: $MEMORY_MAP_MODE"
+echo "  Memory depth device: ${MEMORY_DEPTH_DEVICE:-same as DiT}"
+echo "  Align3R memory GPU: ${MEMORY_ALIGN3R_GPU:-N/A}"
+echo "  Align3R memory work dir: ${MEMORY_ALIGN3R_WORK_DIR:-N/A}"
+echo "  Memory update mode: $MEMORY_UPDATE_MODE"
+echo "  Memory voxel/max points/splat: $MEMORY_VOXEL_SIZE / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
+echo "  Memory diagnostics: $MEMORY_DIAGNOSTICS"
+echo "  Profile blocks: $PROFILE_BLOCKS"
+echo "  Save denoised latents: $SAVE_DENOISED_LATENTS"
 echo "============================================"
 
 ##############################################################################
@@ -390,7 +537,27 @@ if [ "$SKIP_STEP3" = false ]; then
         --output_folder "$OUTPUT_FOLDER" \
         $([ "$USE_TAE" = true ] && echo "--use_tae") \
         $([ -n "$TAE_CHECKPOINT_PATH" ] && echo "--tae_checkpoint_path $TAE_CHECKPOINT_PATH") \
-        $([ "$COMPILE_DIT" = true ] && echo "--compile_dit")
+        $([ "$COMPILE_DIT" = true ] && echo "--compile_dit") \
+        $([ "$HISTORICAL_MEMORY" = true ] && echo "--historical_memory") \
+        --memory_depth_backend "$MEMORY_DEPTH_BACKEND" \
+        --memory_map_mode "$MEMORY_MAP_MODE" \
+        $([ -n "$MEMORY_DEPTH_DEVICE" ] && echo "--memory_depth_device $MEMORY_DEPTH_DEVICE") \
+        --memory_update_mode "$MEMORY_UPDATE_MODE" \
+        --memory_da3_model_path "$DA3_MODEL_PATH" \
+        $([ -n "$MEMORY_ALIGN3R_PYTHON" ] && echo "--memory_align3r_python $MEMORY_ALIGN3R_PYTHON") \
+        $([ -n "$MEMORY_ALIGN3R_ROOT" ] && echo "--memory_align3r_root $MEMORY_ALIGN3R_ROOT") \
+        $([ -n "$MEMORY_ALIGN3R_WEIGHTS" ] && echo "--memory_align3r_weights $MEMORY_ALIGN3R_WEIGHTS") \
+        $([ -n "$MEMORY_ALIGN3R_WORK_DIR" ] && echo "--memory_align3r_work_dir $MEMORY_ALIGN3R_WORK_DIR") \
+        $([ -n "$MEMORY_ALIGN3R_GPU" ] && echo "--memory_align3r_gpu $MEMORY_ALIGN3R_GPU") \
+        $([ -n "$MEMORY_ALIGN3R_TORCH_HOME" ] && echo "--memory_align3r_torch_home $MEMORY_ALIGN3R_TORCH_HOME") \
+        $([ -n "$MEMORY_ALIGN3R_XDG_CONFIG_HOME" ] && echo "--memory_align3r_xdg_config_home $MEMORY_ALIGN3R_XDG_CONFIG_HOME") \
+        $([ "$MEMORY_ALIGN3R_DISABLE_CUROPE" = true ] && echo "--memory_align3r_disable_curope") \
+        --memory_voxel_size "$MEMORY_VOXEL_SIZE" \
+        --memory_max_points "$MEMORY_MAX_POINTS" \
+        --memory_point_size "$MEMORY_POINT_SIZE" \
+        $([ "$MEMORY_DIAGNOSTICS" = false ] && echo "--disable_memory_diagnostics") \
+        $([ "$PROFILE_BLOCKS" = true ] && echo "--profile_blocks") \
+        $([ "$SAVE_DENOISED_LATENTS" = true ] && echo "--save_denoised_latents")
 
     rm -f "$TMP_CONFIG"
 

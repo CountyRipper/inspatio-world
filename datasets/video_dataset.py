@@ -66,8 +66,15 @@ class VideoDataset(torch.utils.data.Dataset):
         target_frames = self.num_frames
         if target_frames < current_frames:
             indices = torch.linspace(0, current_frames - 1, target_frames).long()
-            for key in list(data.keys()):
-                if key in data and isinstance(data[key], (torch.Tensor, np.ndarray)):
+            for key in (
+                'source_video', 'target_video', 'render_video', 'mask_video',
+                'target_c2w', 'target_extrinsics', 'reference_depth',
+            ):
+                if (
+                    key in data
+                    and isinstance(data[key], (torch.Tensor, np.ndarray))
+                    and data[key].shape[0] == current_frames
+                ):
                     data[key] = data[key][indices]
         return data
 

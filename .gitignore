@@ -2,6 +2,7 @@
 checkpoints/
 checkpoints
 output/
+/tmp/
 test/example/new_vggt/
 test/example2/new_vggt/
 test/example3/new_vggt/
@@ -12,6 +13,11 @@ test/example3/new.json
 .claude
 .ruff_cache
 condaenv.pkapro9t.requirements.txt
+._*
+
+# Local experiment notes; the implementation branch is source-only.
+/DENSE_MEMORY_BASELINE_V2_2.md
+/DENSE_TWO_LAYER_MEMORY.md
 
 # Common Python ignores
 __pycache__/
