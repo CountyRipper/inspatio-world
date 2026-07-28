@@ -40,6 +40,13 @@ CSV_FIELDS = (
     "registration_inliers",
     "points_before",
     "points_after",
+    "points_before_read",
+    "points_after_previous_block",
+    "memory_read_point_continuity",
+    "historical_pixels",
+    "history_injected_pixels",
+    "fused_rgb_l1_from_reference",
+    "evicted_voxels",
     *STAGE_FIELDS,
 )
 
@@ -72,14 +79,17 @@ def stage_stats(blocks, field):
 def validate_contract(payload):
     summary = payload["summary"]
     blocks = payload["blocks"]
-    if summary.get("memory_map_mode") != "overlap_voxel_v3":
-        raise AssertionError("Timing artifact is not overlap_voxel_v3")
+    mode = summary.get("memory_map_mode")
+    if mode not in {"overlap_voxel_v3", "overlap_voxel_v3_1"}:
+        raise AssertionError("Timing artifact is not an overlap-voxel mode")
     if len(blocks) != int(summary["num_blocks"]):
         raise AssertionError("Block count disagrees with summary")
     if not blocks:
         raise AssertionError("No block timing records found")
 
     previous_anchor = None
+    previous_points_after = 0
+    injected_blocks = 0
     for index, block in enumerate(blocks):
         if int(block["block_index"]) != index:
             raise AssertionError(f"Non-contiguous block index at {index}")
@@ -99,9 +109,44 @@ def validate_contract(payload):
             raise AssertionError(f"Anchor chain is broken at block {index}")
         previous_anchor = block.get("anchor_frame_index_output")
 
+        if mode == "overlap_voxel_v3_1":
+            if block.get("memory_read_contract") != \
+                    "gpu_voxel_render+offline_reference_fuse+vae_encode":
+                raise AssertionError(f"V3.1 memory-read contract missing at block {index}")
+            if block.get("memory_render_uses_planned_c2w") is not True:
+                raise AssertionError(f"V3.1 planned-camera render missing at block {index}")
+            if block.get("memory_ply_roundtrip") is not False:
+                raise AssertionError(f"V3.1 unexpectedly uses a PLY roundtrip at block {index}")
+            if block.get("memory_read_point_continuity") is not True:
+                raise AssertionError(f"V3.1 point continuity failed at block {index}")
+            if int(block.get("points_before_read", -1)) != previous_points_after:
+                raise AssertionError(f"V3.1 read/write point count differs at block {index}")
+            if index == 0 and (
+                int(block.get("historical_pixels", -1)) != 0
+                or int(block.get("history_injected_pixels", -1)) != 0
+            ):
+                raise AssertionError("V3.1 block zero must have empty history")
+            if int(block.get("evicted_voxels", 0)) != 0:
+                raise AssertionError(f"V3.1 point cap evicted voxels at block {index}")
+            if int(block.get("history_injected_pixels", 0)) > 0:
+                if float(block.get("fused_rgb_l1_from_reference", 0.0)) <= 0:
+                    raise AssertionError(f"Injected V3.1 RGB has zero delta at block {index}")
+                injected_blocks += 1
+            previous_points_after = int(block["points_after"])
+
     output_frames = sum(int(block.get("pixel_frames", 0)) for block in blocks)
     if output_frames != int(summary["output_frames"]):
         raise AssertionError("Output frame count disagrees with summary")
+    if mode == "overlap_voxel_v3_1":
+        adaptive = summary.get("adaptive_voxel")
+        if not adaptive or not adaptive.get("adaptive_voxel"):
+            raise AssertionError("V3.1 adaptive voxel metadata is missing")
+        if float(adaptive["projected_pixel_spacing"]) > 3.1:
+            raise AssertionError("V3.1 projected voxel spacing exceeds the 3px target")
+        if int(summary.get("splat_diameter", 0)) < 3:
+            raise AssertionError("V3.1 splat does not cover at least 3x3 pixels")
+        if injected_blocks == 0:
+            raise AssertionError("V3.1 never injected historical RGB into a later block")
 
 
 def write_csv(path, blocks):

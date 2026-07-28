@@ -1,0 +1,21 @@
+InSpatio-World overlap-voxel V3.1 (server 15)
+
+Run the two official examples with their original 247/300 frame counts and the
+dense yaw 0 -> 45 -> 0 -> 45 controls:
+
+  cd /data4/daixiangting/inspatio-world
+  GPU=2 OUTPUT_ROOT=/data4/daixiangting/inspatio_v3_1_results \
+    bash run_overlap_voxel_v3_1_server15.sh
+
+Optional controls:
+
+  TARGET_PIXEL_SPACING=3.0  projected voxel spacing at median reference depth
+  MAX_POINTS=3000000       safety cap; validation fails if the cap evicts voxels
+
+V3.1 keeps one previous-block DA3 anchor, robust Sim(3), three latent frames per
+block, and one generated RGB keyframe per latent. It computes one canonical
+voxel size from the offline reference median depth and focal length, then uses a
+3x3 z-buffer splat. Before every block, the GPU-resident canonical voxel map is
+rendered with that block's planned c2w, strict-reference-priority fused with the
+offline reference RGB/mask, VAE-encoded, and passed as the render condition.
+There is no PLY save/reload in the online memory-read path.

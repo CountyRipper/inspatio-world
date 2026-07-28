@@ -31,6 +31,9 @@ from utils.overlap_da3_registration import (
 from utils.render_warper import convert_mask_video
 
 
+_OVERLAP_VOXEL_MODES = {"overlap_voxel_v3", "overlap_voxel_v3_1"}
+
+
 def _synchronize(device: torch.device) -> None:
     device = torch.device(device)
     if device.type == "cuda":
@@ -112,6 +115,7 @@ class HistoricalMemoryController:
         memory_map_mode: str = "bounded_voxel",
         reference_depth_thw: Optional[torch.Tensor] = None,
         memory_anchor_count: int = 1,
+        adaptive_voxel_details: Optional[dict] = None,
         fps: int = 24,
         save_diagnostics: bool = True,
     ):
@@ -152,7 +156,7 @@ class HistoricalMemoryController:
         if memory_update_mode not in {"keyframe", "latent_keyframe", "full_block"}:
             raise ValueError(f"Unsupported memory update mode: {memory_update_mode}")
         if memory_map_mode not in {
-            "bounded_voxel", "dense_two_layer", "overlap_voxel_v3"
+            "bounded_voxel", "dense_two_layer", *_OVERLAP_VOXEL_MODES
         }:
             raise ValueError(f"Unsupported memory map mode: {memory_map_mode}")
         if memory_map_mode == "dense_two_layer" and memory_update_mode not in {
@@ -162,15 +166,15 @@ class HistoricalMemoryController:
                 "dense_two_layer requires memory_update_mode=latent_keyframe or full_block"
             )
         if memory_update_mode == "latent_keyframe" and memory_map_mode not in {
-            "dense_two_layer", "overlap_voxel_v3"
+            "dense_two_layer", *_OVERLAP_VOXEL_MODES
         }:
             raise ValueError(
                 "latent_keyframe requires dense_two_layer or overlap_voxel_v3"
             )
-        if memory_map_mode in {"dense_two_layer", "overlap_voxel_v3"} \
+        if memory_map_mode in {"dense_two_layer", *_OVERLAP_VOXEL_MODES} \
                 and self.reference_depth is None:
             raise ValueError(f"{memory_map_mode} requires aligned reference_depth_thw")
-        if memory_map_mode == "overlap_voxel_v3":
+        if memory_map_mode in _OVERLAP_VOXEL_MODES:
             if memory_update_mode != "latent_keyframe":
                 raise ValueError("overlap_voxel_v3 requires latent_keyframe updates")
             if self.depth_backend != "da3":
@@ -179,6 +183,9 @@ class HistoricalMemoryController:
                 raise NotImplementedError(
                     "Multi-anchor DA3 windows are reserved but not implemented"
                 )
+            if memory_map_mode == "overlap_voxel_v3_1" \
+                    and adaptive_voxel_details is None:
+                raise ValueError("overlap_voxel_v3_1 requires adaptive voxel metadata")
         self.memory_update_mode = memory_update_mode
         self.memory_map_mode = memory_map_mode
         self.save_diagnostics = save_diagnostics
@@ -187,6 +194,7 @@ class HistoricalMemoryController:
         self.previous_depth_scale = None
         self._historical_depth_by_block = {}
         self.memory_anchor_count = int(memory_anchor_count)
+        self.adaptive_voxel_details = adaptive_voxel_details
         self.anchor_rgb = None
         self.anchor_world_points = None
         self.anchor_valid = None
@@ -245,6 +253,21 @@ class HistoricalMemoryController:
             .permute(1, 0, 2, 3) > 0
         )
         poses = self.target_c2w[pixel_start:pixel_end]
+        points_before_read = self.memory.point_count
+        points_after_previous_block = 0
+        if self.memory_map_mode == "overlap_voxel_v3_1":
+            if block_index > 0:
+                previous_metric = self._metric_for_block(block_index - 1)
+                if "points_after" not in previous_metric:
+                    raise AssertionError(
+                        "V3.1 memory read occurred before the previous block write"
+                    )
+                points_after_previous_block = int(previous_metric["points_after"])
+            if points_before_read != points_after_previous_block:
+                raise AssertionError(
+                    "V3.1 GPU map continuity failed: "
+                    f"read={points_before_read}, previous_write={points_after_previous_block}"
+                )
 
         _synchronize(self.memory.device)
         t_render = time.perf_counter()
@@ -267,6 +290,15 @@ class HistoricalMemoryController:
             historical_mask,
         )
         merge_ms = (time.perf_counter() - t_merge) * 1000.0
+
+        historical_pixels = int(historical_mask.sum().item())
+        history_injected_pixels = int(hist_only.sum().item())
+        if self.memory_map_mode == "overlap_voxel_v3_1" \
+                and block_index == 0 and historical_pixels != 0:
+            raise AssertionError("V3.1 block zero must not read historical pixels")
+        fused_rgb_l1_from_reference = float(
+            (fused_rgb - reference_rgb.to(self.memory.device)).abs().mean().item()
+        )
 
         if not torch.equal((fused_rgb != reference_rgb.to(self.memory.device)).any(dim=1, keepdim=True) & reference_mask.to(self.memory.device),
                            torch.zeros_like(reference_mask.to(self.memory.device))):
@@ -313,7 +345,26 @@ class HistoricalMemoryController:
             "historical_coverage": float(historical_mask.float().mean().item()),
             "hist_only_coverage": float(hist_only.float().mean().item()),
             "fused_coverage": float(fused_mask.float().mean().item()),
-            "points_before_read": self.memory.point_count,
+            "historical_pixels": historical_pixels,
+            "history_injected_pixels": history_injected_pixels,
+            "fused_rgb_l1_from_reference": fused_rgb_l1_from_reference,
+            "render_latent_l1": float(render_latent.float().abs().mean().item()),
+            "points_before_read": points_before_read,
+            "points_after_previous_block": points_after_previous_block,
+            "memory_read_point_continuity": (
+                points_before_read == points_after_previous_block
+                if self.memory_map_mode == "overlap_voxel_v3_1" else None
+            ),
+            "memory_read_contract": (
+                "gpu_voxel_render+offline_reference_fuse+vae_encode"
+                if self.memory_map_mode == "overlap_voxel_v3_1" else None
+            ),
+            "memory_render_uses_planned_c2w": (
+                True if self.memory_map_mode == "overlap_voxel_v3_1" else None
+            ),
+            "memory_ply_roundtrip": (
+                False if self.memory_map_mode == "overlap_voxel_v3_1" else None
+            ),
             "memory_map_mode": self.memory_map_mode,
             "cuda_allocated_peak_gb": cuda_allocated_peak_gb,
             "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
@@ -344,7 +395,7 @@ class HistoricalMemoryController:
 
         self.writers["pred"].write(block_rgb[0])
 
-        if self.memory_map_mode == "overlap_voxel_v3":
+        if self.memory_map_mode in _OVERLAP_VOXEL_MODES:
             self._output_callback_overlap_v3(
                 block_index=block_index,
                 latent_start=latent_start,
@@ -811,7 +862,7 @@ class HistoricalMemoryController:
         for writer in self.writers.values():
             writer.close()
 
-        if self.memory_map_mode == "overlap_voxel_v3":
+        if self.memory_map_mode in _OVERLAP_VOXEL_MODES:
             camera_indices = sorted(self.observed_keyframes)
             observed = np.stack([
                 self.observed_keyframes[index].numpy() for index in camera_indices
@@ -841,6 +892,8 @@ class HistoricalMemoryController:
             "memory_map_mode": self.memory_map_mode,
             "depth_backend": self.depth_backend,
         }
+        if self.adaptive_voxel_details is not None:
+            manifest["adaptive_voxel"] = self.adaptive_voxel_details
         if self.memory_map_mode == "dense_two_layer":
             manifest["historical_map_chunk_manifest"] = map_index_path
         else:
@@ -885,6 +938,9 @@ class HistoricalMemoryController:
             "num_blocks": len(self.metrics),
             "output_frames": output_frames,
             "final_point_count": self.memory.point_count,
+            "voxel_size": getattr(self.memory, "voxel_size", None),
+            "splat_diameter": getattr(self.memory, "splat_diameter", None),
+            "adaptive_voxel": self.adaptive_voxel_details,
             "da3_peak_memory_gb": max(
                 (float(block.get("da3_peak_memory_gb", 0.0)) for block in self.metrics),
                 default=0.0,

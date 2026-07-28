@@ -38,10 +38,11 @@ set -e
 #   --compile_dit         (optional) Apply torch.compile to the DiT model
 #   --historical_memory   (optional) Enable training-free historical RGB point memory
 #   --memory_depth_backend (optional) da3 or align3r (default: da3)
-#   --memory_map_mode     (optional) bounded_voxel, dense_two_layer, or overlap_voxel_v3
+#   --memory_map_mode     (optional) bounded_voxel, dense_two_layer, overlap_voxel_v3, or overlap_voxel_v3_1
 #   --memory_depth_device (optional) Logical CUDA device for memory DA3
 #   --memory_update_mode  (optional) keyframe, latent_keyframe, or full_block (default: keyframe)
 #   --memory_voxel_size   (optional) Historical point voxel size (default: 0.02)
+#   --memory_voxel_target_pixels (optional) V3.1 median-depth projected spacing (default: 3.0)
 #   --memory_max_points   (optional) Maximum historical point count (default: 500000)
 #   --memory_point_size   (optional) Historical point splat size (default: 1)
 #   --memory_anchor_count (optional) V3 DA3 anchor count; only 1 is implemented
@@ -92,6 +93,7 @@ MEMORY_ALIGN3R_XDG_CONFIG_HOME=""
 MEMORY_ALIGN3R_DISABLE_CUROPE=false
 MEMORY_UPDATE_MODE="keyframe"
 MEMORY_VOXEL_SIZE="0.02"
+MEMORY_VOXEL_TARGET_PIXELS="3.0"
 MEMORY_MAX_POINTS="500000"
 MEMORY_POINT_SIZE="1"
 MEMORY_ANCHOR_COUNT="1"
@@ -250,6 +252,10 @@ while [[ $# -gt 0 ]]; do
             MEMORY_VOXEL_SIZE="$2"
             shift 2
             ;;
+        --memory_voxel_target_pixels)
+            MEMORY_VOXEL_TARGET_PIXELS="$2"
+            shift 2
+            ;;
         --memory_max_points)
             MEMORY_MAX_POINTS="$2"
             shift 2
@@ -296,7 +302,8 @@ if [ -z "$TRAJ_TXT_PATH" ]; then
 fi
 if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] \
         && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ] \
-        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3" ]; then
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3" ] \
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3_1" ]; then
     echo "Error: invalid --memory_map_mode"
     exit 1
 fi
@@ -326,13 +333,14 @@ if [ "$MEMORY_MAP_MODE" = "dense_two_layer" ]; then
     # the latest upstream fast-warper default.
     RENDER_BACKEND="ply"
 fi
-if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3" ]; then
+if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ]; then
     if [ "$MEMORY_UPDATE_MODE" != "latent_keyframe" ]; then
-        echo "Error: overlap_voxel_v3 requires --memory_update_mode latent_keyframe"
+        echo "Error: overlap-voxel modes require --memory_update_mode latent_keyframe"
         exit 1
     fi
     if [ "$MEMORY_DEPTH_BACKEND" != "da3" ]; then
-        echo "Error: overlap_voxel_v3 currently requires DA3"
+        echo "Error: overlap-voxel modes currently require DA3"
         exit 1
     fi
     if [ "$MEMORY_ANCHOR_COUNT" != "1" ]; then
@@ -389,7 +397,12 @@ echo "  Align3R memory GPU: ${MEMORY_ALIGN3R_GPU:-N/A}"
 echo "  Align3R memory work dir: ${MEMORY_ALIGN3R_WORK_DIR:-N/A}"
 echo "  Memory update mode: $MEMORY_UPDATE_MODE"
 echo "  Memory anchor count: $MEMORY_ANCHOR_COUNT (multi-anchor reserved)"
-echo "  Memory voxel/max points/splat: $MEMORY_VOXEL_SIZE / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
+if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ]; then
+    echo "  Memory voxel/max points/splat: adaptive / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
+else
+    echo "  Memory voxel/max points/splat: $MEMORY_VOXEL_SIZE / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
+fi
+echo "  Memory voxel target pixels: $MEMORY_VOXEL_TARGET_PIXELS"
 echo "  Memory diagnostics: $MEMORY_DIAGNOSTICS"
 echo "  Profile blocks: $PROFILE_BLOCKS"
 echo "  Save denoised latents: $SAVE_DENOISED_LATENTS"
@@ -577,6 +590,7 @@ if [ "$SKIP_STEP3" = false ]; then
         $([ -n "$MEMORY_ALIGN3R_XDG_CONFIG_HOME" ] && echo "--memory_align3r_xdg_config_home $MEMORY_ALIGN3R_XDG_CONFIG_HOME") \
         $([ "$MEMORY_ALIGN3R_DISABLE_CUROPE" = true ] && echo "--memory_align3r_disable_curope") \
         --memory_voxel_size "$MEMORY_VOXEL_SIZE" \
+        --memory_voxel_target_pixels "$MEMORY_VOXEL_TARGET_PIXELS" \
         --memory_max_points "$MEMORY_MAX_POINTS" \
         --memory_point_size "$MEMORY_POINT_SIZE" \
         --memory_anchor_count "$MEMORY_ANCHOR_COUNT" \

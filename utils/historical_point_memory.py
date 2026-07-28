@@ -82,6 +82,74 @@ def dense_point_count(frame_count: int, height: int, width: int) -> int:
     return int(frame_count) * int(height) * int(width)
 
 
+def scale_adaptive_voxel_size(
+    reference_depth: torch.Tensor,
+    K: torch.Tensor,
+    reference_mask: Optional[torch.Tensor] = None,
+    *,
+    target_pixel_spacing: float = 3.0,
+    min_voxel_size: float = 0.003,
+    max_voxel_size: float = 0.012,
+) -> Tuple[float, dict]:
+    """Choose one canonical voxel size from the reference scene scale."""
+    if target_pixel_spacing <= 0:
+        raise ValueError("target_pixel_spacing must be positive")
+    if min_voxel_size <= 0 or max_voxel_size < min_voxel_size:
+        raise ValueError("Invalid adaptive voxel bounds")
+
+    depth = reference_depth.detach().float()
+    while depth.ndim > 3 and depth.shape[0] == 1:
+        depth = depth[0]
+    if depth.ndim != 3:
+        raise ValueError(f"Expected reference depth [T,H,W], got {tuple(depth.shape)}")
+
+    valid = torch.isfinite(depth) & (depth > 0)
+    if reference_mask is not None:
+        mask = reference_mask.detach()
+        while mask.ndim > 3 and mask.shape[0] == 1:
+            mask = mask[0]
+        if mask.ndim == 4 and mask.shape[0] in (1, 3):
+            mask = mask[0]
+        if mask.shape != depth.shape:
+            raise ValueError(
+                f"Reference mask {tuple(mask.shape)} does not match depth {tuple(depth.shape)}"
+            )
+        valid &= mask.to(depth.device) > 0
+
+    valid_depth = depth[valid]
+    if valid_depth.numel() == 0:
+        raise ValueError("Reference depth has no valid pixels for adaptive voxel sizing")
+
+    intrinsic = K.detach().float()
+    while intrinsic.ndim > 2 and intrinsic.shape[0] == 1:
+        intrinsic = intrinsic[0]
+    if intrinsic.shape != (3, 3):
+        raise ValueError(f"Expected K [3,3], got {tuple(intrinsic.shape)}")
+    focal = float(torch.maximum(intrinsic[0, 0].abs(), intrinsic[1, 1].abs()).item())
+    if not np.isfinite(focal) or focal <= 0:
+        raise ValueError(f"Invalid focal length: {focal}")
+
+    median_depth = float(torch.median(valid_depth).item())
+    world_pixel_size = median_depth / focal
+    raw_voxel_size = target_pixel_spacing * world_pixel_size
+    voxel_size = float(np.clip(raw_voxel_size, min_voxel_size, max_voxel_size))
+    projected_pixel_spacing = voxel_size / world_pixel_size
+    return voxel_size, {
+        "adaptive_voxel": True,
+        "target_pixel_spacing": float(target_pixel_spacing),
+        "median_reference_depth": median_depth,
+        "reference_focal": focal,
+        "world_pixel_size_at_median_depth": world_pixel_size,
+        "raw_voxel_size": raw_voxel_size,
+        "voxel_size": voxel_size,
+        "min_voxel_size": float(min_voxel_size),
+        "max_voxel_size": float(max_voxel_size),
+        "projected_pixel_spacing": projected_pixel_spacing,
+        "voxel_size_clamped": not np.isclose(voxel_size, raw_voxel_size),
+        "valid_reference_pixels": int(valid_depth.numel()),
+    }
+
+
 def _log_depth_gradient(depth: torch.Tensor, min_depth: float) -> torch.Tensor:
     """Conservative four-neighbour log-depth gradient for edge rejection/weighting."""
     valid = torch.isfinite(depth) & (depth > min_depth)
@@ -572,6 +640,10 @@ class IncrementalVoxelSurfelMemory(RGBPointMemory):
             (0,), device=self.device, dtype=torch.int64
         )
 
+    @property
+    def splat_diameter(self) -> int:
+        return 1 if self.point_size <= 1 else 2 * (self.point_size // 2) + 1
+
     def update_points(
         self,
         points: torch.Tensor,
@@ -700,6 +772,7 @@ class IncrementalVoxelSurfelMemory(RGBPointMemory):
             observation_counts=counts,
             voxel_coords=coords,
             voxel_size=np.float32(self.voxel_size),
+            splat_diameter=np.int32(self.splat_diameter),
         )
 
         ply_path = path_prefix + ".ply"

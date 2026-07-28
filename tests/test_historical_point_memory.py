@@ -14,6 +14,7 @@ from utils.historical_point_memory import (
     fuse_reference_and_history,
     latent_block_to_pixel_span,
     latent_keyframe_indices,
+    scale_adaptive_voxel_size,
 )
 
 
@@ -126,6 +127,20 @@ class HistoricalPointMemoryTest(unittest.TestCase):
         self.assertEqual(latent_keyframe_indices(6, 3), (24, 28, 32))
         self.assertEqual(len(latent_keyframe_indices(0, 60)), 60)
         self.assertEqual(latent_keyframe_indices(0, 60)[-1], 236)
+
+    def test_scale_adaptive_voxel_matches_projected_spacing(self):
+        depth = torch.full((3, self.height, self.width), 0.9727777)
+        K = torch.tensor([
+            [722.6658, 0.0, (self.width - 1) / 2.0],
+            [0.0, 720.0, (self.height - 1) / 2.0],
+            [0.0, 0.0, 1.0],
+        ])
+        voxel_size, details = scale_adaptive_voxel_size(
+            depth, K, torch.ones_like(depth), target_pixel_spacing=3.0
+        )
+        self.assertAlmostEqual(voxel_size, 0.004038, places=5)
+        self.assertAlmostEqual(details["projected_pixel_spacing"], 3.0, places=5)
+        self.assertFalse(details["voxel_size_clamped"])
 
     def test_dense_five_second_trajectory_landmarks(self):
         trajectory_path = os.path.join(
@@ -700,6 +715,88 @@ class HistoricalPointMemoryTest(unittest.TestCase):
             self.assertTrue(controller.metrics[0]["registration_accepted"])
             self.assertTrue(controller.metrics[1]["registration_accepted"])
             self.assertEqual(summary["accepted_blocks"], 2)
+
+    def test_v3_1_reads_previous_gpu_map_into_fused_condition(self):
+        try:
+            from pipeline.historical_memory_controller import HistoricalMemoryController
+        except ModuleNotFoundError as error:
+            if error.name == "einops":
+                self.skipTest("local lightweight torch environment does not include einops")
+            raise
+
+        num_frames = 21
+        reference_rgb = torch.zeros((1, 3, num_frames, self.height, self.width))
+        reference_mask = torch.ones_like(reference_rgb)
+        reference_mask[:, :, :, :, self.width // 2:] = -1
+        reference_depth = torch.ones((1, num_frames, self.height, self.width))
+        target_c2w = self.pose.repeat(num_frames, 1, 1).unsqueeze(0)
+        memory = self.make_voxel_surfel_memory(voxel_size=0.01, point_size=3)
+        encoded_inputs = []
+
+        def recording_encode(video):
+            encoded_inputs.append(video.detach().clone())
+            latent_frames = (video.shape[2] + 3) // 4
+            value = video.float().mean()
+            return torch.ones(
+                (1, latent_frames, 16, self.height // 8, self.width // 8)
+            ) * value
+
+        adaptive_details = {
+            "adaptive_voxel": True,
+            "voxel_size": 0.01,
+            "projected_pixel_spacing": 3.0,
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            controller = HistoricalMemoryController(
+                reference_rgb_bcthw=reference_rgb,
+                reference_mask_bcthw=reference_mask,
+                reference_depth_thw=reference_depth,
+                target_c2w=target_c2w,
+                K=self.K.unsqueeze(0),
+                encode_video=recording_encode,
+                block_decoder=FakeBlockDecoder(self.height, self.width),
+                depth_estimator=FakeDepthEstimator(),
+                memory=memory,
+                output_dir=output_dir,
+                output_prefix="v3_1",
+                rank=0,
+                reference_map_path="reference/frames_pcd",
+                memory_update_mode="latent_keyframe",
+                memory_map_mode="overlap_voxel_v3_1",
+                adaptive_voxel_details=adaptive_details,
+                save_diagnostics=False,
+            )
+            controller.condition_provider(0, 0, 3)
+            controller.output_callback(
+                block_index=0,
+                latent_start=0,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            points_after_block0 = memory.point_count
+            controller.condition_provider(1, 3, 3)
+            controller.output_callback(
+                block_index=1,
+                latent_start=3,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            summary = controller.close()
+
+        self.assertEqual(controller.metrics[0]["historical_pixels"], 0)
+        self.assertEqual(controller.metrics[0]["history_injected_pixels"], 0)
+        self.assertEqual(controller.metrics[1]["points_before_read"], points_after_block0)
+        self.assertTrue(controller.metrics[1]["memory_read_point_continuity"])
+        self.assertGreater(controller.metrics[1]["history_injected_pixels"], 0)
+        self.assertGreater(controller.metrics[1]["fused_rgb_l1_from_reference"], 0)
+        self.assertTrue((encoded_inputs[1] > -1).any())
+        self.assertEqual(
+            controller.metrics[1]["memory_read_contract"],
+            "gpu_voxel_render+offline_reference_fuse+vae_encode",
+        )
+        self.assertFalse(controller.metrics[1]["memory_ply_roundtrip"])
+        self.assertEqual(summary["splat_diameter"], 3)
+        self.assertEqual(summary["adaptive_voxel"], adaptive_details)
 
 
 if __name__ == "__main__":

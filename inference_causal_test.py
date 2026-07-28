@@ -47,9 +47,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--memory_map_mode",
-    choices=["bounded_voxel", "dense_two_layer", "overlap_voxel_v3"],
+    choices=[
+        "bounded_voxel", "dense_two_layer", "overlap_voxel_v3",
+        "overlap_voxel_v3_1",
+    ],
     default="bounded_voxel",
-    help="Bounded legacy map or append-only dense generated two-layer map",
+    help="Historical point-map implementation used for generated-memory writes",
 )
 parser.add_argument("--memory_da3_model_path", type=str, default="./checkpoints/DA3", help="DA3 checkpoint used for generated keyframe depth")
 parser.add_argument("--memory_depth_device", type=str, default=None, help="Logical CUDA device for DA3 depth (default: DiT device)")
@@ -71,6 +74,12 @@ parser.add_argument(
     ),
 )
 parser.add_argument("--memory_voxel_size", type=float, default=0.02, help="Historical point-cloud voxel size")
+parser.add_argument(
+    "--memory_voxel_target_pixels",
+    type=float,
+    default=3.0,
+    help="V3.1 target voxel spacing in pixels at the median reference depth",
+)
 parser.add_argument("--memory_max_points", type=int, default=500000, help="Maximum historical point count")
 parser.add_argument("--memory_point_size", type=int, default=1, help="Historical point splat size")
 parser.add_argument(
@@ -492,6 +501,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             DenseGeneratedPointMemory,
             IncrementalVoxelSurfelMemory,
             RGBPointMemory,
+            scale_adaptive_voxel_size,
         )
 
         target_c2w = batch["target_c2w"].to(device=device, dtype=torch.float32)
@@ -503,7 +513,10 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             "K": target_intrinsic[0],
             "point_size": args.memory_point_size,
         }
-        if args.memory_map_mode in {"dense_two_layer", "overlap_voxel_v3"}:
+        adaptive_voxel_details = None
+        if args.memory_map_mode in {
+            "dense_two_layer", "overlap_voxel_v3", "overlap_voxel_v3_1"
+        }:
             if "reference_depth" not in batch:
                 raise RuntimeError(
                     "Aligned reference depth is missing. Re-run Step 2b to generate "
@@ -512,9 +525,21 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             if args.memory_map_mode == "dense_two_layer":
                 memory = DenseGeneratedPointMemory(**memory_kwargs)
             else:
+                voxel_size = args.memory_voxel_size
+                if args.memory_map_mode == "overlap_voxel_v3_1":
+                    voxel_size, adaptive_voxel_details = scale_adaptive_voxel_size(
+                        batch["reference_depth"],
+                        target_intrinsic,
+                        mask_videos_ori,
+                        target_pixel_spacing=args.memory_voxel_target_pixels,
+                    )
+                    print(
+                        f"[Rank {rank}] V3.1 adaptive voxel: "
+                        f"{json.dumps(adaptive_voxel_details, sort_keys=True)}"
+                    )
                 memory = IncrementalVoxelSurfelMemory(
                     **memory_kwargs,
-                    voxel_size=args.memory_voxel_size,
+                    voxel_size=voxel_size,
                     max_points=args.memory_max_points,
                 )
         else:
@@ -550,6 +575,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             memory_map_mode=args.memory_map_mode,
             reference_depth_thw=batch.get("reference_depth"),
             memory_anchor_count=args.memory_anchor_count,
+            adaptive_voxel_details=adaptive_voxel_details,
             save_diagnostics=not args.disable_memory_diagnostics,
         )
         block_condition_provider = memory_controller.condition_provider
