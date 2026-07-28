@@ -7,10 +7,12 @@ import os
 import time
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 from utils.historical_point_memory import (
     DenseGeneratedPointMemory,
+    IncrementalVoxelSurfelMemory,
     RGBPointMemory,
     VideoStreamWriter,
     calibrate_depth_scale,
@@ -18,6 +20,13 @@ from utils.historical_point_memory import (
     fuse_reference_and_history,
     latent_block_to_pixel_span,
     latent_keyframe_indices,
+)
+from utils.overlap_da3_registration import (
+    apply_similarity,
+    backproject_world_grid,
+    estimate_similarity_registration,
+    pose_residual,
+    transform_da3_c2w,
 )
 from utils.render_warper import convert_mask_video
 
@@ -94,7 +103,7 @@ class HistoricalMemoryController:
         encode_video: Callable[[torch.Tensor], torch.Tensor],
         block_decoder,
         depth_estimator,
-        memory: RGBPointMemory | DenseGeneratedPointMemory,
+        memory: RGBPointMemory | DenseGeneratedPointMemory | IncrementalVoxelSurfelMemory,
         output_dir: str,
         output_prefix: str,
         rank: int,
@@ -102,6 +111,7 @@ class HistoricalMemoryController:
         memory_update_mode: str = "keyframe",
         memory_map_mode: str = "bounded_voxel",
         reference_depth_thw: Optional[torch.Tensor] = None,
+        memory_anchor_count: int = 1,
         fps: int = 24,
         save_diagnostics: bool = True,
     ):
@@ -141,7 +151,9 @@ class HistoricalMemoryController:
         self.reference_map_path = reference_map_path
         if memory_update_mode not in {"keyframe", "latent_keyframe", "full_block"}:
             raise ValueError(f"Unsupported memory update mode: {memory_update_mode}")
-        if memory_map_mode not in {"bounded_voxel", "dense_two_layer"}:
+        if memory_map_mode not in {
+            "bounded_voxel", "dense_two_layer", "overlap_voxel_v3"
+        }:
             raise ValueError(f"Unsupported memory map mode: {memory_map_mode}")
         if memory_map_mode == "dense_two_layer" and memory_update_mode not in {
             "latent_keyframe", "full_block"
@@ -149,10 +161,24 @@ class HistoricalMemoryController:
             raise ValueError(
                 "dense_two_layer requires memory_update_mode=latent_keyframe or full_block"
             )
-        if memory_update_mode == "latent_keyframe" and memory_map_mode != "dense_two_layer":
-            raise ValueError("latent_keyframe currently requires memory_map_mode=dense_two_layer")
-        if memory_map_mode == "dense_two_layer" and self.reference_depth is None:
-            raise ValueError("dense_two_layer requires aligned reference_depth_thw")
+        if memory_update_mode == "latent_keyframe" and memory_map_mode not in {
+            "dense_two_layer", "overlap_voxel_v3"
+        }:
+            raise ValueError(
+                "latent_keyframe requires dense_two_layer or overlap_voxel_v3"
+            )
+        if memory_map_mode in {"dense_two_layer", "overlap_voxel_v3"} \
+                and self.reference_depth is None:
+            raise ValueError(f"{memory_map_mode} requires aligned reference_depth_thw")
+        if memory_map_mode == "overlap_voxel_v3":
+            if memory_update_mode != "latent_keyframe":
+                raise ValueError("overlap_voxel_v3 requires latent_keyframe updates")
+            if self.depth_backend != "da3":
+                raise ValueError("overlap_voxel_v3 currently requires the DA3 backend")
+            if memory_anchor_count != 1:
+                raise NotImplementedError(
+                    "Multi-anchor DA3 windows are reserved but not implemented"
+                )
         self.memory_update_mode = memory_update_mode
         self.memory_map_mode = memory_map_mode
         self.save_diagnostics = save_diagnostics
@@ -160,6 +186,14 @@ class HistoricalMemoryController:
         self.closed = False
         self.previous_depth_scale = None
         self._historical_depth_by_block = {}
+        self.memory_anchor_count = int(memory_anchor_count)
+        self.anchor_rgb = None
+        self.anchor_world_points = None
+        self.anchor_valid = None
+        self.anchor_frame_index = None
+        self.previous_registration_scale = None
+        self.previous_da3_focal = None
+        self.observed_keyframes = {}
 
         _, _, _, height, width = reference_rgb_bcthw.shape
         self.height = height
@@ -309,6 +343,19 @@ class HistoricalMemoryController:
             )
 
         self.writers["pred"].write(block_rgb[0])
+
+        if self.memory_map_mode == "overlap_voxel_v3":
+            self._output_callback_overlap_v3(
+                block_index=block_index,
+                latent_start=latent_start,
+                denoised_latent=denoised_latent,
+                block_rgb=block_rgb,
+                pixel_start=pixel_start,
+                pixel_end=pixel_end,
+                decode_ms=decode_ms,
+                dit_ms=dit_ms,
+            )
+            return
 
         _synchronize(self.depth_estimator.device)
         t_depth = time.perf_counter()
@@ -500,12 +547,286 @@ class HistoricalMemoryController:
             **update_details,
         })
 
+    @torch.inference_mode()
+    def _output_callback_overlap_v3(
+        self,
+        *,
+        block_index: int,
+        latent_start: int,
+        denoised_latent: torch.Tensor,
+        block_rgb: torch.Tensor,
+        pixel_start: int,
+        pixel_end: int,
+        decode_ms: float,
+        dit_ms: float,
+    ) -> None:
+        update_frame_indices = latent_keyframe_indices(
+            latent_start, denoised_latent.shape[1]
+        )
+        update_local_indices = tuple(
+            frame_index - pixel_start for frame_index in update_frame_indices
+        )
+        new_rgb = block_rgb[0, list(update_local_indices)]
+        anchor_input_index = self.anchor_frame_index
+        anchor_count = 0 if self.anchor_rgb is None else 1
+        if anchor_count:
+            window_rgb = torch.cat((self.anchor_rgb.unsqueeze(0), new_rgb), dim=0)
+        else:
+            window_rgb = new_rgb
+
+        _synchronize(self.depth_estimator.device)
+        t_da3 = time.perf_counter()
+        (
+            window_reconstruction_rgb,
+            window_depth,
+            window_intrinsics,
+            window_w2c,
+        ) = self.depth_estimator.estimate_block(
+            window_rgb,
+            output_size=(self.height, self.width),
+            output_device=self.memory.device,
+        )
+        _synchronize(self.depth_estimator.device)
+        _synchronize(self.memory.device)
+        da3_ms = (time.perf_counter() - t_da3) * 1000.0
+
+        t_build = time.perf_counter()
+        local_point_grids = []
+        local_valid_grids = []
+        for depth, intrinsic, extrinsic in zip(
+            window_depth, window_intrinsics, window_w2c
+        ):
+            points, valid = backproject_world_grid(
+                depth, intrinsic, w2c=extrinsic
+            )
+            local_point_grids.append(points)
+            local_valid_grids.append(valid)
+
+        if anchor_count:
+            registration_source = local_point_grids[0]
+            registration_target = self.anchor_world_points
+            registration_valid = local_valid_grids[0] & self.anchor_valid
+            registration_source_name = "previous_block_last_latent"
+        else:
+            source_parts, target_parts, valid_parts = [], [], []
+            for local_index, frame_index in enumerate(update_frame_indices):
+                reference_points, reference_valid = backproject_world_grid(
+                    self.reference_depth[frame_index].to(
+                        self.memory.device, dtype=torch.float32
+                    ),
+                    self.K,
+                    c2w=self.target_c2w[frame_index],
+                )
+                source_parts.append(local_point_grids[local_index].reshape(-1, 3))
+                target_parts.append(reference_points.reshape(-1, 3))
+                valid_parts.append(
+                    (
+                        local_valid_grids[local_index]
+                        & reference_valid
+                        & (self.reference_mask[0, 0, frame_index].to(
+                            self.memory.device
+                        ) > 0)
+                    ).reshape(-1)
+                )
+            registration_source = torch.cat(source_parts, dim=0)
+            registration_target = torch.cat(target_parts, dim=0)
+            registration_valid = torch.cat(valid_parts, dim=0)
+            registration_source_name = "immutable_reference_depth"
+        _synchronize(self.memory.device)
+        pointcloud_prebuild_ms = (time.perf_counter() - t_build) * 1000.0
+
+        registration_error = None
+        registration = None
+        _synchronize(self.memory.device)
+        t_registration = time.perf_counter()
+        try:
+            registration = estimate_similarity_registration(
+                registration_source,
+                registration_target,
+                registration_valid,
+                min_correspondences=min(
+                    4096, max(128, int(self.height * self.width * 0.01))
+                ),
+            )
+        except (RuntimeError, ValueError) as error:
+            registration_error = str(error)
+        _synchronize(self.memory.device)
+        registration_ms = (time.perf_counter() - t_registration) * 1000.0
+
+        scale_jump = None
+        accepted = registration is not None
+        if accepted and self.previous_registration_scale is not None:
+            scale_jump = abs(
+                registration.scale / self.previous_registration_scale - 1.0
+            )
+        if accepted and registration.normalized_rmse > 0.15:
+            accepted = False
+            registration_error = (
+                f"normalized RMSE {registration.normalized_rmse:.6f} exceeds 0.15"
+            )
+        if accepted and scale_jump is not None and scale_jump > 0.30:
+            accepted = False
+            registration_error = f"scale jump {scale_jump:.6f} exceeds 0.30"
+
+        observed_residuals = []
+        update_stats = {
+            "raw_valid_points": 0,
+            "batch_voxels": 0,
+            "points_before": self.memory.point_count,
+            "points_after": self.memory.point_count,
+            "evicted_voxels": 0,
+        }
+        pointcloud_postbuild_ms = 0.0
+        voxel_fusion_ms = 0.0
+        if accepted:
+            new_offset = anchor_count
+            t_build = time.perf_counter()
+            new_world_grids = []
+            new_valid_grids = []
+            observed_poses = []
+            for new_index, frame_index in enumerate(update_frame_indices):
+                window_index = new_offset + new_index
+                world_points = apply_similarity(
+                    local_point_grids[window_index],
+                    registration.scale,
+                    registration.rotation,
+                    registration.translation,
+                )
+                valid = local_valid_grids[window_index] & torch.isfinite(
+                    world_points
+                ).all(dim=-1)
+                observed_pose = transform_da3_c2w(
+                    window_w2c[window_index],
+                    registration.scale,
+                    registration.rotation,
+                    registration.translation,
+                )
+                residual = pose_residual(
+                    self.target_c2w[frame_index], observed_pose
+                )
+                residual["frame_index"] = int(frame_index)
+                observed_residuals.append(residual)
+                self.observed_keyframes[int(frame_index)] = observed_pose.detach().cpu()
+                new_world_grids.append(world_points)
+                new_valid_grids.append(valid)
+                observed_poses.append(observed_pose)
+
+            fused_points = torch.stack(new_world_grids, dim=0)
+            fused_colors = window_reconstruction_rgb[new_offset:].permute(0, 2, 3, 1)
+            fused_valid = torch.stack(new_valid_grids, dim=0)
+            _synchronize(self.memory.device)
+            pointcloud_postbuild_ms = (time.perf_counter() - t_build) * 1000.0
+
+            _synchronize(self.memory.device)
+            t_fusion = time.perf_counter()
+            update_stats = self.memory.update_points(
+                fused_points, fused_colors, fused_valid
+            )
+            _synchronize(self.memory.device)
+            voxel_fusion_ms = (time.perf_counter() - t_fusion) * 1000.0
+
+            self.anchor_rgb = new_rgb[-1].detach().to(self.memory.device)
+            self.anchor_world_points = new_world_grids[-1].detach()
+            self.anchor_valid = new_valid_grids[-1].detach()
+            self.anchor_frame_index = int(update_frame_indices[-1])
+            self.previous_registration_scale = registration.scale
+
+        focal = float(window_intrinsics[anchor_count:, 0, 0].mean().item())
+        focal_jump = None
+        if self.previous_da3_focal is not None:
+            focal_jump = abs(focal / self.previous_da3_focal - 1.0)
+        if accepted:
+            self.previous_da3_focal = focal
+
+        pointcloud_build_ms = pointcloud_prebuild_ms + pointcloud_postbuild_ms
+        memory_update_ms = registration_ms + pointcloud_build_ms + voxel_fusion_ms
+        pointcloud_total_ms = da3_ms + memory_update_ms
+        max_rotation_residual = max(
+            (item["rotation_degrees"] for item in observed_residuals), default=None
+        )
+        max_translation_residual = max(
+            (item["translation"] for item in observed_residuals), default=None
+        )
+        registration_details = {
+            "registration_source": registration_source_name,
+            "registration_accepted": bool(accepted),
+            "registration_error": registration_error,
+            "registration_scale": None if registration is None else registration.scale,
+            "registration_rmse": None if registration is None else registration.rmse,
+            "registration_normalized_rmse": (
+                None if registration is None else registration.normalized_rmse
+            ),
+            "registration_correspondences": (
+                0 if registration is None else registration.correspondence_count
+            ),
+            "registration_inliers": 0 if registration is None else registration.inlier_count,
+            "registration_inlier_ratio": (
+                0.0 if registration is None else registration.inlier_ratio
+            ),
+            "registration_scale_jump": scale_jump,
+        }
+        metric = self._metric_for_block(block_index)
+        cuda_allocated_peak_gb, cuda_reserved_peak_gb = _cuda_peak_gb(
+            self.memory.device
+        )
+        metric.update({
+            "dit_ms": float(dit_ms),
+            "decode_ms": decode_ms,
+            "depth_backend": self.depth_backend,
+            "depth_estimation_ms": da3_ms,
+            "da3_ms": da3_ms,
+            "registration_ms": registration_ms,
+            "pointcloud_build_ms": pointcloud_build_ms,
+            "voxel_fusion_ms": voxel_fusion_ms,
+            "memory_update_ms": memory_update_ms,
+            "pointcloud_total_ms": pointcloud_total_ms,
+            "memory_update_mode": self.memory_update_mode,
+            "memory_map_mode": self.memory_map_mode,
+            "update_frame_indices": list(update_frame_indices),
+            "update_frames": len(update_frame_indices),
+            "anchor_count": anchor_count,
+            "anchor_frame_index_input": anchor_input_index,
+            "anchor_frame_index_output": self.anchor_frame_index,
+            "multi_anchor_retry_implemented": False,
+            "da3_window_frames": int(window_rgb.shape[0]),
+            "da3_focal_mean": focal,
+            "da3_focal_jump": focal_jump,
+            "observed_pose_residuals": observed_residuals,
+            "max_plan_observed_rotation_degrees": max_rotation_residual,
+            "max_plan_observed_translation": max_translation_residual,
+            "depth_native_shape": self.depth_estimator.last_native_shape,
+            "da3_peak_memory_gb": float(
+                getattr(self.depth_estimator, "last_peak_memory_gb", 0.0)
+            ),
+            "cuda_allocated_peak_gb": cuda_allocated_peak_gb,
+            "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
+            **registration_details,
+            **update_stats,
+        })
+
     def close(self) -> dict:
         if self.closed:
             return self.summary()
         self.closed = True
         for writer in self.writers.values():
             writer.close()
+
+        if self.memory_map_mode == "overlap_voxel_v3":
+            camera_indices = sorted(self.observed_keyframes)
+            observed = np.stack([
+                self.observed_keyframes[index].numpy() for index in camera_indices
+            ]) if camera_indices else np.empty((0, 4, 4), dtype=np.float32)
+            planned = self.target_c2w[camera_indices].detach().cpu().numpy() \
+                if camera_indices else np.empty((0, 4, 4), dtype=np.float32)
+            np.savez_compressed(
+                os.path.join(
+                    self.output_dir,
+                    f"{self.output_prefix}-v3_keyframe_cameras_rank{self.rank}.npz",
+                ),
+                frame_indices=np.asarray(camera_indices, dtype=np.int64),
+                planned_c2w=planned.astype(np.float32),
+                observed_c2w=observed.astype(np.float32),
+            )
 
         map_prefix = os.path.join(
             self.output_dir,
@@ -550,6 +871,13 @@ class HistoricalMemoryController:
         }
         online_ms = sum(stage_totals.values())
         output_frames = int(sum(int(block.get("pixel_frames", 0)) for block in self.metrics))
+        extra_v3_totals = {
+            name: float(sum(float(block.get(name, 0.0)) for block in self.metrics))
+            for name in (
+                "registration_ms", "pointcloud_build_ms", "voxel_fusion_ms",
+                "pointcloud_total_ms",
+            )
+        }
         return {
             "depth_backend": self.depth_backend,
             "memory_update_mode": self.memory_update_mode,
@@ -582,5 +910,10 @@ class HistoricalMemoryController:
             ),
             "online_total_ms": online_ms,
             "online_fps": output_frames / (online_ms / 1000.0) if online_ms > 0 else 0.0,
+            "accepted_blocks": int(sum(
+                bool(block.get("registration_accepted", False))
+                for block in self.metrics
+            )),
             **stage_totals,
+            **extra_v3_totals,
         }

@@ -6,6 +6,7 @@ import torch
 
 from utils.historical_point_memory import (
     DenseGeneratedPointMemory,
+    IncrementalVoxelSurfelMemory,
     RGBPointMemory,
     calibrate_depth_scale,
     compute_depth_confidence,
@@ -40,6 +41,7 @@ class FakeDepthEstimator:
         self.last_extrinsics_shape = None
         self.last_peak_memory_gb = 0.0
         self.block_calls = 0
+        self.block_frame_counts = []
 
     def estimate(self, rgb, output_size, output_device):
         self.last_native_shape = output_size
@@ -48,6 +50,7 @@ class FakeDepthEstimator:
     def estimate_block(self, rgb, output_size, output_device):
         self.block_calls += 1
         frames = rgb.shape[0]
+        self.block_frame_counts.append(frames)
         height, width = output_size
         self.last_native_shape = (frames, height, width)
         self.last_processed_shape = (frames, height, width, 3)
@@ -59,7 +62,7 @@ class FakeDepthEstimator:
             [0.0, 30.0, (height - 1) / 2.0],
             [0.0, 0.0, 1.0],
         ], device=output_device).repeat(frames, 1, 1)
-        extrinsics = torch.zeros((frames, 3, 4), device=output_device)
+        extrinsics = torch.eye(4, device=output_device)[:3].repeat(frames, 1, 1)
         return rgb.to(output_device), depths, K, extrinsics
 
 
@@ -100,6 +103,18 @@ class HistoricalPointMemoryTest(unittest.TestCase):
             width=self.width,
             device=torch.device("cpu"),
             K=self.K,
+        )
+
+    def make_voxel_surfel_memory(self, **kwargs):
+        return IncrementalVoxelSurfelMemory(
+            height=self.height,
+            width=self.width,
+            device=torch.device("cpu"),
+            K=self.K,
+            voxel_size=kwargs.pop("voxel_size", 0.1),
+            max_points=kwargs.pop("max_points", 5000),
+            point_size=kwargs.pop("point_size", 2),
+            **kwargs,
         )
 
     def test_temporal_mapping(self):
@@ -216,6 +231,41 @@ class HistoricalPointMemoryTest(unittest.TestCase):
         self.assertEqual(stats["added_pixels"], frame_count * self.height * self.width)
         self.assertEqual(memory.num_updates, frame_count)
         self.assertEqual(memory.point_count, self.height * self.width)
+
+    def test_incremental_voxel_surfel_preserves_observation_counts(self):
+        memory = self.make_voxel_surfel_memory(voxel_size=1.0)
+        points0 = torch.tensor([[0.1, 0.1, 1.1], [0.2, 0.2, 1.2]])
+        colors0 = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        stats0 = memory.update_points(points0, colors0)
+        self.assertEqual(stats0["batch_voxels"], 1)
+        self.assertEqual(memory.observation_counts.tolist(), [2])
+
+        points1 = torch.tensor([[0.3, 0.3, 1.3]])
+        colors1 = torch.tensor([[0.0, 0.0, 1.0]])
+        stats1 = memory.update_points(points1, colors1)
+        self.assertEqual(stats1["points_after"], 1)
+        self.assertEqual(memory.observation_counts.tolist(), [3])
+        torch.testing.assert_close(
+            memory.points[0], torch.tensor([0.2, 0.2, 1.2]), atol=1e-6, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            memory.colors[0], torch.tensor([1 / 3, 1 / 3, 1 / 3]),
+            atol=1e-6, rtol=1e-6,
+        )
+
+    def test_incremental_voxel_surfel_splat_and_save(self):
+        memory = self.make_voxel_surfel_memory(voxel_size=0.01, point_size=2)
+        memory.update_points(
+            torch.tensor([[0.0, 0.0, 1.0]]),
+            torch.tensor([[1.0, 0.0, 0.0]]),
+        )
+        rendered, mask = memory.render(self.pose, self.K)
+        self.assertEqual(int(mask.sum().item()), 9)
+        self.assertTrue((rendered[0, 0][mask[0, 0]] == 1.0).all())
+        with tempfile.TemporaryDirectory() as output_dir:
+            npz_path, ply_path = memory.save(os.path.join(output_dir, "map"))
+            self.assertTrue(os.path.exists(npz_path))
+            self.assertTrue(os.path.exists(ply_path))
 
     def test_dense_upper_bound_and_append_only_storage(self):
         self.assertEqual(dense_point_count(117, 480, 832), 46_725_120)
@@ -590,6 +640,66 @@ class HistoricalPointMemoryTest(unittest.TestCase):
             self.assertEqual(controller.metrics[1]["update_frames"], 3)
             self.assertEqual(memory.point_count, 6 * self.height * self.width)
             self.assertEqual(summary["memory_update_mode"], "latent_keyframe")
+
+    def test_v3_controller_uses_one_anchor_and_fuses_only_new_keyframes(self):
+        try:
+            from pipeline.historical_memory_controller import HistoricalMemoryController
+        except ModuleNotFoundError as error:
+            if error.name == "einops":
+                self.skipTest("local lightweight torch environment does not include einops")
+            raise
+
+        num_frames = 21
+        reference_rgb = torch.zeros((1, 3, num_frames, self.height, self.width))
+        reference_mask = torch.ones_like(reference_rgb)
+        reference_depth = torch.ones((1, num_frames, self.height, self.width))
+        target_c2w = self.pose.repeat(num_frames, 1, 1).unsqueeze(0)
+        memory = self.make_voxel_surfel_memory(voxel_size=0.01)
+        depth_estimator = FakeDepthEstimator()
+
+        def fake_encode(video):
+            latent_frames = (video.shape[2] + 3) // 4
+            return torch.zeros((1, latent_frames, 16, self.height // 8, self.width // 8))
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            controller = HistoricalMemoryController(
+                reference_rgb_bcthw=reference_rgb,
+                reference_mask_bcthw=reference_mask,
+                reference_depth_thw=reference_depth,
+                target_c2w=target_c2w,
+                K=self.K.unsqueeze(0),
+                encode_video=fake_encode,
+                block_decoder=FakeBlockDecoder(self.height, self.width),
+                depth_estimator=depth_estimator,
+                memory=memory,
+                output_dir=output_dir,
+                output_prefix="v3",
+                rank=0,
+                reference_map_path="reference/frames_pcd",
+                memory_update_mode="latent_keyframe",
+                memory_map_mode="overlap_voxel_v3",
+                save_diagnostics=False,
+            )
+            for block_index, latent_start in enumerate((0, 3)):
+                controller.condition_provider(block_index, latent_start, 3)
+                controller.output_callback(
+                    block_index=block_index,
+                    latent_start=latent_start,
+                    denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                    dit_ms=1.0,
+                )
+            summary = controller.close()
+
+            self.assertEqual(depth_estimator.block_frame_counts, [3, 4])
+            self.assertEqual(controller.metrics[0]["anchor_count"], 0)
+            self.assertEqual(controller.metrics[1]["anchor_count"], 1)
+            self.assertEqual(controller.metrics[1]["anchor_frame_index_input"], 8)
+            self.assertEqual(controller.metrics[1]["update_frame_indices"], [12, 16, 20])
+            self.assertEqual(controller.metrics[1]["update_frames"], 3)
+            self.assertFalse(controller.metrics[1]["multi_anchor_retry_implemented"])
+            self.assertTrue(controller.metrics[0]["registration_accepted"])
+            self.assertTrue(controller.metrics[1]["registration_accepted"])
+            self.assertEqual(summary["accepted_blocks"], 2)
 
 
 if __name__ == "__main__":

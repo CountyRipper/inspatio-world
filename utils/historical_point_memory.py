@@ -500,8 +500,8 @@ class RGBPointMemory:
             dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
             dx = dx.flatten()
             dy = dy.flatten()
-            u = torch.round(u[:, None] + dx[None, :]).long().flatten()
-            v = torch.round(v[:, None] + dy[None, :]).long().flatten()
+            u = (torch.round(u).long()[:, None] + dx[None, :]).flatten()
+            v = (torch.round(v).long()[:, None] + dy[None, :]).flatten()
             z = z[:, None].expand(-1, dx.numel()).flatten()
             colors = colors[:, None, :].expand(-1, dx.numel(), -1).reshape(-1, 3)
         else:
@@ -534,6 +534,173 @@ class RGBPointMemory:
 
         npz_path = path_prefix + ".npz"
         np.savez_compressed(npz_path, points=points, colors=colors)
+
+        ply_path = path_prefix + ".ply"
+        vertices = np.empty(
+            points.shape[0],
+            dtype=[
+                ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+            ],
+        )
+        if points.shape[0] > 0:
+            vertices["x"], vertices["y"], vertices["z"] = points.T
+            vertices["red"], vertices["green"], vertices["blue"] = colors.T
+        header = (
+            "ply\nformat binary_little_endian 1.0\n"
+            f"element vertex {points.shape[0]}\n"
+            "property float x\nproperty float y\nproperty float z\n"
+            "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n"
+        )
+        with open(ply_path, "wb") as handle:
+            handle.write(header.encode("ascii"))
+            vertices.tofile(handle)
+        return npz_path, ply_path
+
+
+class IncrementalVoxelSurfelMemory(RGBPointMemory):
+    """Bounded voxel surfels with persistent observation counts."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.voxel_size <= 0:
+            raise ValueError("Incremental voxel surfels require voxel_size > 0")
+        self.voxel_coords = torch.empty(
+            (0, 3), device=self.device, dtype=torch.int64
+        )
+        self.observation_counts = torch.empty(
+            (0,), device=self.device, dtype=torch.int64
+        )
+
+    def update_points(
+        self,
+        points: torch.Tensor,
+        colors: torch.Tensor,
+        valid: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Fuse canonical world points into one counted surfel per voxel."""
+        points = points.detach().to(self.device, dtype=torch.float32).reshape(-1, 3)
+        colors = colors.detach().to(self.device, dtype=torch.float32).reshape(-1, 3)
+        if points.shape != colors.shape:
+            raise ValueError(
+                f"Point/color shapes differ: {tuple(points.shape)} vs {tuple(colors.shape)}"
+            )
+        if valid is None:
+            valid = torch.ones(points.shape[0], device=self.device, dtype=torch.bool)
+        else:
+            valid = valid.detach().to(self.device).bool().reshape(-1)
+        if valid.shape[0] != points.shape[0]:
+            raise ValueError("Validity mask length does not match point count")
+        valid &= torch.isfinite(points).all(dim=1) & torch.isfinite(colors).all(dim=1)
+        points = points[valid]
+        colors = colors[valid].clamp(0, 1)
+        raw_valid_points = int(points.shape[0])
+        points_before = self.point_count
+        if raw_valid_points == 0:
+            return {
+                "raw_valid_points": 0,
+                "batch_voxels": 0,
+                "points_before": points_before,
+                "points_after": points_before,
+                "evicted_voxels": 0,
+            }
+
+        new_coords = torch.floor(points / self.voxel_size).to(torch.int64)
+        batch_coords, batch_inverse = torch.unique(
+            new_coords, dim=0, return_inverse=True
+        )
+        batch_count = int(batch_coords.shape[0])
+        batch_point_sums = torch.zeros(
+            (batch_count, 3), device=self.device, dtype=torch.float32
+        )
+        batch_color_sums = torch.zeros_like(batch_point_sums)
+        batch_counts = torch.zeros(
+            (batch_count,), device=self.device, dtype=torch.int64
+        )
+        batch_point_sums.index_add_(0, batch_inverse, points)
+        batch_color_sums.index_add_(0, batch_inverse, colors)
+        batch_counts.index_add_(
+            0,
+            batch_inverse,
+            torch.ones(batch_inverse.shape[0], device=self.device, dtype=torch.int64),
+        )
+
+        if self.point_count:
+            old_counts_float = self.observation_counts.float().unsqueeze(1)
+            all_coords = torch.cat((self.voxel_coords, batch_coords), dim=0)
+            all_point_sums = torch.cat(
+                (self.points * old_counts_float, batch_point_sums), dim=0
+            )
+            all_color_sums = torch.cat(
+                (self.colors * old_counts_float, batch_color_sums), dim=0
+            )
+            all_counts = torch.cat((self.observation_counts, batch_counts), dim=0)
+        else:
+            all_coords = batch_coords
+            all_point_sums = batch_point_sums
+            all_color_sums = batch_color_sums
+            all_counts = batch_counts
+
+        merged_coords, merged_inverse = torch.unique(
+            all_coords, dim=0, return_inverse=True
+        )
+        merged_count = int(merged_coords.shape[0])
+        merged_point_sums = torch.zeros(
+            (merged_count, 3), device=self.device, dtype=torch.float32
+        )
+        merged_color_sums = torch.zeros_like(merged_point_sums)
+        merged_counts = torch.zeros(
+            (merged_count,), device=self.device, dtype=torch.int64
+        )
+        merged_point_sums.index_add_(0, merged_inverse, all_point_sums)
+        merged_color_sums.index_add_(0, merged_inverse, all_color_sums)
+        merged_counts.index_add_(0, merged_inverse, all_counts)
+
+        evicted = max(0, merged_count - self.max_points)
+        if evicted:
+            keep = torch.linspace(
+                0,
+                merged_count - 1,
+                self.max_points,
+                device=self.device,
+            ).round().long()
+            merged_coords = merged_coords[keep]
+            merged_point_sums = merged_point_sums[keep]
+            merged_color_sums = merged_color_sums[keep]
+            merged_counts = merged_counts[keep]
+
+        counts_float = merged_counts.float().unsqueeze(1).clamp_min(1)
+        self.voxel_coords = merged_coords
+        self.observation_counts = merged_counts
+        self.points = merged_point_sums / counts_float
+        self.colors = merged_color_sums / counts_float
+        self.num_updates += 1
+        return {
+            "raw_valid_points": raw_valid_points,
+            "batch_voxels": batch_count,
+            "points_before": points_before,
+            "points_after": self.point_count,
+            "evicted_voxels": evicted,
+            "observation_count_total": int(self.observation_counts.sum().item()),
+        }
+
+    def save(self, path_prefix: str) -> Tuple[str, str]:
+        os.makedirs(os.path.dirname(path_prefix), exist_ok=True)
+        points = self.points.detach().cpu().numpy().astype(np.float32)
+        colors_float = self.colors.detach().cpu().numpy().astype(np.float32)
+        colors = (colors_float.clip(0, 1) * 255).round().astype(np.uint8)
+        counts = self.observation_counts.detach().cpu().numpy().astype(np.int64)
+        coords = self.voxel_coords.detach().cpu().numpy().astype(np.int64)
+
+        npz_path = path_prefix + ".npz"
+        np.savez_compressed(
+            npz_path,
+            points=points,
+            colors=colors_float,
+            observation_counts=counts,
+            voxel_coords=coords,
+            voxel_size=np.float32(self.voxel_size),
+        )
 
         ply_path = path_prefix + ".ply"
         vertices = np.empty(

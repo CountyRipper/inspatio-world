@@ -38,12 +38,13 @@ set -e
 #   --compile_dit         (optional) Apply torch.compile to the DiT model
 #   --historical_memory   (optional) Enable training-free historical RGB point memory
 #   --memory_depth_backend (optional) da3 or align3r (default: da3)
-#   --memory_map_mode     (optional) bounded_voxel or dense_two_layer (default: bounded_voxel)
+#   --memory_map_mode     (optional) bounded_voxel, dense_two_layer, or overlap_voxel_v3
 #   --memory_depth_device (optional) Logical CUDA device for memory DA3
 #   --memory_update_mode  (optional) keyframe, latent_keyframe, or full_block (default: keyframe)
 #   --memory_voxel_size   (optional) Historical point voxel size (default: 0.02)
 #   --memory_max_points   (optional) Maximum historical point count (default: 500000)
 #   --memory_point_size   (optional) Historical point splat size (default: 1)
+#   --memory_anchor_count (optional) V3 DA3 anchor count; only 1 is implemented
 #   --disable_memory_diagnostics (optional) Disable historical/fused diagnostic videos
 #   --profile_blocks      (optional) Save per-block DiT timing
 #   --save_denoised_latents (optional) Save final denoised latent tensor
@@ -93,6 +94,7 @@ MEMORY_UPDATE_MODE="keyframe"
 MEMORY_VOXEL_SIZE="0.02"
 MEMORY_MAX_POINTS="500000"
 MEMORY_POINT_SIZE="1"
+MEMORY_ANCHOR_COUNT="1"
 MEMORY_DIAGNOSTICS=true
 PROFILE_BLOCKS=false
 SAVE_DENOISED_LATENTS=false
@@ -256,6 +258,10 @@ while [[ $# -gt 0 ]]; do
             MEMORY_POINT_SIZE="$2"
             shift 2
             ;;
+        --memory_anchor_count)
+            MEMORY_ANCHOR_COUNT="$2"
+            shift 2
+            ;;
         --disable_memory_diagnostics)
             MEMORY_DIAGNOSTICS=false
             shift
@@ -288,8 +294,10 @@ if [ -z "$TRAJ_TXT_PATH" ]; then
     echo "Error: --traj_txt_path is required"
     exit 1
 fi
-if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ]; then
-    echo "Error: --memory_map_mode must be 'bounded_voxel' or 'dense_two_layer'"
+if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] \
+        && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ] \
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3" ]; then
+    echo "Error: invalid --memory_map_mode"
     exit 1
 fi
 if [ "$MEMORY_DEPTH_BACKEND" != "da3" ] && [ "$MEMORY_DEPTH_BACKEND" != "align3r" ]; then
@@ -316,6 +324,21 @@ if [ "$MEMORY_MAP_MODE" = "dense_two_layer" ]; then
     fi
     # Dense reference depth is the visible PLY z-buffer. Legacy runs retain
     # the latest upstream fast-warper default.
+    RENDER_BACKEND="ply"
+fi
+if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3" ]; then
+    if [ "$MEMORY_UPDATE_MODE" != "latent_keyframe" ]; then
+        echo "Error: overlap_voxel_v3 requires --memory_update_mode latent_keyframe"
+        exit 1
+    fi
+    if [ "$MEMORY_DEPTH_BACKEND" != "da3" ]; then
+        echo "Error: overlap_voxel_v3 currently requires DA3"
+        exit 1
+    fi
+    if [ "$MEMORY_ANCHOR_COUNT" != "1" ]; then
+        echo "Error: multi-anchor V3 is reserved but not implemented"
+        exit 1
+    fi
     RENDER_BACKEND="ply"
 fi
 if [ "$RENDER_BACKEND" != "warper" ] && [ "$RENDER_BACKEND" != "ply" ]; then
@@ -365,6 +388,7 @@ echo "  Memory depth device: ${MEMORY_DEPTH_DEVICE:-same as DiT}"
 echo "  Align3R memory GPU: ${MEMORY_ALIGN3R_GPU:-N/A}"
 echo "  Align3R memory work dir: ${MEMORY_ALIGN3R_WORK_DIR:-N/A}"
 echo "  Memory update mode: $MEMORY_UPDATE_MODE"
+echo "  Memory anchor count: $MEMORY_ANCHOR_COUNT (multi-anchor reserved)"
 echo "  Memory voxel/max points/splat: $MEMORY_VOXEL_SIZE / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
 echo "  Memory diagnostics: $MEMORY_DIAGNOSTICS"
 echo "  Profile blocks: $PROFILE_BLOCKS"
@@ -555,6 +579,7 @@ if [ "$SKIP_STEP3" = false ]; then
         --memory_voxel_size "$MEMORY_VOXEL_SIZE" \
         --memory_max_points "$MEMORY_MAX_POINTS" \
         --memory_point_size "$MEMORY_POINT_SIZE" \
+        --memory_anchor_count "$MEMORY_ANCHOR_COUNT" \
         $([ "$MEMORY_DIAGNOSTICS" = false ] && echo "--disable_memory_diagnostics") \
         $([ "$PROFILE_BLOCKS" = true ] && echo "--profile_blocks") \
         $([ "$SAVE_DENOISED_LATENTS" = true ] && echo "--save_denoised_latents")

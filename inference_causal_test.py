@@ -47,7 +47,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--memory_map_mode",
-    choices=["bounded_voxel", "dense_two_layer"],
+    choices=["bounded_voxel", "dense_two_layer", "overlap_voxel_v3"],
     default="bounded_voxel",
     help="Bounded legacy map or append-only dense generated two-layer map",
 )
@@ -73,6 +73,12 @@ parser.add_argument(
 parser.add_argument("--memory_voxel_size", type=float, default=0.02, help="Historical point-cloud voxel size")
 parser.add_argument("--memory_max_points", type=int, default=500000, help="Maximum historical point count")
 parser.add_argument("--memory_point_size", type=int, default=1, help="Historical point splat size")
+parser.add_argument(
+    "--memory_anchor_count",
+    type=int,
+    default=1,
+    help="Overlapping DA3 anchors. Only one is implemented; larger values are reserved.",
+)
 parser.add_argument("--disable_memory_diagnostics", action="store_true", help="Disable historical/fused diagnostic videos")
 parser.add_argument("--profile_blocks", action="store_true", help="Record per-block DiT timing")
 parser.add_argument("--save_denoised_latents", action="store_true", help="Save final denoised latent tensor for regression checks")
@@ -285,6 +291,15 @@ if args.historical_memory:
             "--memory_map_mode dense_two_layer requires "
             "--memory_update_mode latent_keyframe or full_block"
         )
+    if args.memory_map_mode == "overlap_voxel_v3":
+        if args.memory_update_mode != "latent_keyframe":
+            raise ValueError("overlap_voxel_v3 requires latent_keyframe updates")
+        if args.memory_depth_backend != "da3":
+            raise ValueError("overlap_voxel_v3 currently requires DA3")
+        if args.memory_anchor_count != 1:
+            raise NotImplementedError(
+                "Multi-anchor DA3 windows are reserved but not implemented"
+            )
     from utils.wan_wrapper import WanVAEWrapper
 
     if args.memory_depth_backend == "da3":
@@ -473,7 +488,11 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             TAEBlockDecoder,
             WanVAEBlockDecoder,
         )
-        from utils.historical_point_memory import DenseGeneratedPointMemory, RGBPointMemory
+        from utils.historical_point_memory import (
+            DenseGeneratedPointMemory,
+            IncrementalVoxelSurfelMemory,
+            RGBPointMemory,
+        )
 
         target_c2w = batch["target_c2w"].to(device=device, dtype=torch.float32)
         target_intrinsic = batch["target_intrinsic"].to(device=device, dtype=torch.float32)
@@ -484,13 +503,20 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             "K": target_intrinsic[0],
             "point_size": args.memory_point_size,
         }
-        if args.memory_map_mode == "dense_two_layer":
+        if args.memory_map_mode in {"dense_two_layer", "overlap_voxel_v3"}:
             if "reference_depth" not in batch:
                 raise RuntimeError(
                     "Aligned reference depth is missing. Re-run Step 2b to generate "
                     "render/depth_offline.npy before using dense_two_layer."
                 )
-            memory = DenseGeneratedPointMemory(**memory_kwargs)
+            if args.memory_map_mode == "dense_two_layer":
+                memory = DenseGeneratedPointMemory(**memory_kwargs)
+            else:
+                memory = IncrementalVoxelSurfelMemory(
+                    **memory_kwargs,
+                    voxel_size=args.memory_voxel_size,
+                    max_points=args.memory_max_points,
+                )
         else:
             memory = RGBPointMemory(
                 **memory_kwargs,
@@ -523,6 +549,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             memory_update_mode=args.memory_update_mode,
             memory_map_mode=args.memory_map_mode,
             reference_depth_thw=batch.get("reference_depth"),
+            memory_anchor_count=args.memory_anchor_count,
             save_diagnostics=not args.disable_memory_diagnostics,
         )
         block_condition_provider = memory_controller.condition_provider
