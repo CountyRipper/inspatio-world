@@ -8,6 +8,7 @@ from utils.overlap_da3_registration import (
     backproject_world_grid,
     estimate_similarity_registration,
     pose_residual,
+    select_v4_runtime_points,
     transform_da3_c2w,
 )
 
@@ -65,6 +66,47 @@ class OverlapDA3RegistrationTest(unittest.TestCase):
         valid = torch.ones((4, 4), dtype=torch.bool)
         with self.assertRaisesRegex(ValueError, "valid correspondences"):
             estimate_similarity_registration(source, target, valid)
+
+    def test_uniform_sampling_and_exact_trim_count(self):
+        source = torch.randn(1000, 3)
+        target = 1.5 * source + torch.tensor([0.2, -0.3, 0.4])
+        result = estimate_similarity_registration(
+            source,
+            target,
+            torch.ones(1000, dtype=torch.bool),
+            min_correspondences=100,
+            max_correspondences=100,
+            iterations=2,
+        )
+        self.assertEqual(result.correspondence_count, 1000)
+        self.assertEqual(result.sampled_count, 100)
+        self.assertEqual(result.inlier_count, 80)
+        self.assertAlmostEqual(result.inlier_ratio, 0.8)
+
+    def test_v4_reference_aware_point_filter(self):
+        reference = torch.zeros((1, 2, 2, 3))
+        da3 = reference.clone()
+        da3[0, 0, 1, 0] = 0.5
+        valid = torch.ones((1, 2, 2), dtype=torch.bool)
+        depth = torch.ones((1, 2, 2))
+        depth_valid = torch.ones_like(valid)
+        depth_valid[0, 1, 1] = False
+        reference_mask = torch.tensor([[[True, True], [False, True]]])
+        keep, stats = select_v4_runtime_points(
+            da3,
+            reference,
+            valid,
+            depth,
+            depth_valid,
+            reference_mask,
+            voxel_size=0.01,
+        )
+        expected = torch.tensor([[[True, False], [True, False]]])
+        self.assertTrue(torch.equal(keep, expected))
+        self.assertEqual(stats["reference_uncovered_points"], 1)
+        self.assertEqual(stats["reference_covered_points"], 3)
+        self.assertEqual(stats["reference_geometry_consistent_points"], 1)
+        self.assertEqual(stats["reference_geometry_rejected_points"], 2)
 
 
 if __name__ == "__main__":

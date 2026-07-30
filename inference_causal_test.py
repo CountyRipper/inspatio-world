@@ -49,7 +49,7 @@ parser.add_argument(
     "--memory_map_mode",
     choices=[
         "bounded_voxel", "dense_two_layer", "overlap_voxel_v3",
-        "overlap_voxel_v3_1",
+        "overlap_voxel_v3_1", "overlap_voxel_v4",
     ],
     default="bounded_voxel",
     help="Historical point-map implementation used for generated-memory writes",
@@ -80,8 +80,16 @@ parser.add_argument(
     default=3.0,
     help="V3.1 target voxel spacing in pixels at the median reference depth",
 )
-parser.add_argument("--memory_max_points", type=int, default=500000, help="Maximum historical point count")
-parser.add_argument("--memory_point_size", type=int, default=1, help="Historical point splat size")
+parser.add_argument("--memory_max_points", type=int, default=None, help="Maximum historical point count")
+parser.add_argument("--memory_point_size", type=int, default=None, help="Historical point splat size")
+parser.add_argument(
+    "--memory_geometry_voxel_factor", type=float, default=2.0,
+    help="V4 geometry tolerance in voxel-size multiples",
+)
+parser.add_argument(
+    "--memory_geometry_depth_ratio", type=float, default=0.03,
+    help="V4 geometry tolerance relative to immutable reference depth",
+)
 parser.add_argument(
     "--memory_anchor_count",
     type=int,
@@ -93,6 +101,16 @@ parser.add_argument("--profile_blocks", action="store_true", help="Record per-bl
 parser.add_argument("--save_denoised_latents", action="store_true", help="Save final denoised latent tensor for regression checks")
 
 args = parser.parse_args()
+if args.memory_max_points is None:
+    args.memory_max_points = (
+        3_000_000
+        if args.memory_map_mode == "overlap_voxel_v4"
+        else 500_000
+    )
+if args.memory_point_size is None:
+    args.memory_point_size = (
+        3 if args.memory_map_mode == "overlap_voxel_v4" else 1
+    )
 
 # ============================================================================
 # Distributed setup
@@ -300,15 +318,21 @@ if args.historical_memory:
             "--memory_map_mode dense_two_layer requires "
             "--memory_update_mode latent_keyframe or full_block"
         )
-    if args.memory_map_mode == "overlap_voxel_v3":
+    if args.memory_map_mode in {
+        "overlap_voxel_v3", "overlap_voxel_v3_1", "overlap_voxel_v4",
+    }:
         if args.memory_update_mode != "latent_keyframe":
-            raise ValueError("overlap_voxel_v3 requires latent_keyframe updates")
+            raise ValueError("overlap-voxel modes require latent_keyframe updates")
         if args.memory_depth_backend != "da3":
-            raise ValueError("overlap_voxel_v3 currently requires DA3")
-        if args.memory_anchor_count != 1:
+            raise ValueError("overlap_voxel_v3/v4 currently requires DA3")
+        if args.memory_map_mode in {"overlap_voxel_v3", "overlap_voxel_v3_1"} \
+                and args.memory_anchor_count != 1:
             raise NotImplementedError(
                 "Multi-anchor DA3 windows are reserved but not implemented"
             )
+        if args.memory_map_mode == "overlap_voxel_v4" \
+                and args.memory_point_size != 3:
+            raise ValueError("overlap_voxel_v4 requires --memory_point_size 3")
     from utils.wan_wrapper import WanVAEWrapper
 
     if args.memory_depth_backend == "da3":
@@ -515,7 +539,8 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
         }
         adaptive_voxel_details = None
         if args.memory_map_mode in {
-            "dense_two_layer", "overlap_voxel_v3", "overlap_voxel_v3_1"
+            "dense_two_layer", "overlap_voxel_v3", "overlap_voxel_v3_1",
+            "overlap_voxel_v4",
         }:
             if "reference_depth" not in batch:
                 raise RuntimeError(
@@ -526,7 +551,9 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
                 memory = DenseGeneratedPointMemory(**memory_kwargs)
             else:
                 voxel_size = args.memory_voxel_size
-                if args.memory_map_mode == "overlap_voxel_v3_1":
+                if args.memory_map_mode in {
+                    "overlap_voxel_v3_1", "overlap_voxel_v4"
+                }:
                     voxel_size, adaptive_voxel_details = scale_adaptive_voxel_size(
                         batch["reference_depth"],
                         target_intrinsic,
@@ -534,7 +561,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
                         target_pixel_spacing=args.memory_voxel_target_pixels,
                     )
                     print(
-                        f"[Rank {rank}] V3.1 adaptive voxel: "
+                        f"[Rank {rank}] {args.memory_map_mode} adaptive voxel: "
                         f"{json.dumps(adaptive_voxel_details, sort_keys=True)}"
                     )
                 memory = IncrementalVoxelSurfelMemory(
@@ -576,6 +603,8 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             reference_depth_thw=batch.get("reference_depth"),
             memory_anchor_count=args.memory_anchor_count,
             adaptive_voxel_details=adaptive_voxel_details,
+            geometry_voxel_factor=args.memory_geometry_voxel_factor,
+            geometry_depth_ratio=args.memory_geometry_depth_ratio,
             save_diagnostics=not args.disable_memory_diagnostics,
         )
         block_condition_provider = memory_controller.condition_provider

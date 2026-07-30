@@ -1,4 +1,4 @@
-"""Geometry utilities for single-anchor overlapping DA3 windows."""
+"""Geometry utilities for registering DA3 reconstructions."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ class SimilarityRegistration:
     rotation: torch.Tensor
     translation: torch.Tensor
     correspondence_count: int
+    sampled_count: int
     inlier_count: int
     inlier_ratio: float
     rmse: float
@@ -145,6 +146,8 @@ def estimate_similarity_registration(
         raise ValueError("Validity mask must match the point-grid dimensions")
     if not 0.5 <= trim_quantile <= 1.0:
         raise ValueError("trim_quantile must be in [0.5, 1.0]")
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
 
     flat_valid = (
         valid.bool().reshape(-1)
@@ -160,9 +163,14 @@ def estimate_similarity_registration(
             f"need {min_correspondences}"
         )
     if correspondence_count > max_correspondences:
-        stride = max(1, correspondence_count // max_correspondences)
-        source = source[::stride][:max_correspondences]
-        target = target[::stride][:max_correspondences]
+        sample_indices = torch.linspace(
+            0,
+            correspondence_count - 1,
+            max_correspondences,
+            device=source.device,
+        ).round().long()
+        source = source[sample_indices]
+        target = target[sample_indices]
 
     keep = torch.ones(source.shape[0], device=source.device, dtype=torch.bool)
     for _ in range(iterations):
@@ -171,8 +179,10 @@ def estimate_similarity_registration(
             apply_similarity(source, scale, rotation, translation) - target, dim=1
         )
         if trim_quantile < 1.0:
-            cutoff = torch.quantile(residual, trim_quantile)
-            keep = residual <= cutoff
+            keep_count = max(3, int(trim_quantile * residual.shape[0]))
+            keep_indices = torch.argsort(residual)[:keep_count]
+            keep = torch.zeros_like(keep)
+            keep[keep_indices] = True
 
     scale, rotation, translation = _solve_similarity(source[keep], target[keep])
     residual = torch.linalg.norm(
@@ -187,8 +197,77 @@ def estimate_similarity_registration(
         rotation=rotation,
         translation=translation,
         correspondence_count=correspondence_count,
+        sampled_count=int(source.shape[0]),
         inlier_count=int(keep.sum().item()),
         inlier_ratio=float(keep.float().mean().item()),
         rmse=float(rmse.item()),
         normalized_rmse=float((rmse / target_radius).item()),
     )
+
+
+def select_v4_runtime_points(
+    canonical_da3_points: torch.Tensor,
+    canonical_reference_points: torch.Tensor,
+    da3_valid: torch.Tensor,
+    reference_depth: torch.Tensor,
+    reference_depth_valid: torch.Tensor,
+    reference_mask: torch.Tensor,
+    *,
+    voxel_size: float,
+    voxel_factor: float = 2.0,
+    relative_depth_ratio: float = 0.03,
+) -> tuple[torch.Tensor, dict]:
+    """Apply V4's reference-aware point admission rule."""
+    if canonical_da3_points.shape != canonical_reference_points.shape:
+        raise ValueError("DA3 and reference point grids must have matching shapes")
+    if canonical_da3_points.shape[-1] != 3:
+        raise ValueError("Point grids must end in XYZ")
+    expected_shape = canonical_da3_points.shape[:-1]
+    for name, value in (
+        ("da3_valid", da3_valid),
+        ("reference_depth", reference_depth),
+        ("reference_depth_valid", reference_depth_valid),
+        ("reference_mask", reference_mask),
+    ):
+        if value.shape != expected_shape:
+            raise ValueError(f"{name} must have shape {tuple(expected_shape)}")
+    if voxel_size <= 0 or voxel_factor <= 0 or relative_depth_ratio <= 0:
+        raise ValueError("Geometry threshold parameters must be positive")
+
+    da3_valid = da3_valid.bool() & torch.isfinite(canonical_da3_points).all(dim=-1)
+    reference_depth_valid = (
+        reference_depth_valid.bool()
+        & torch.isfinite(reference_depth)
+        & (reference_depth > 0)
+        & torch.isfinite(canonical_reference_points).all(dim=-1)
+    )
+    reference_mask = reference_mask.bool()
+    geometry_error = torch.linalg.norm(
+        canonical_da3_points - canonical_reference_points,
+        dim=-1,
+    )
+    geometry_threshold = torch.maximum(
+        torch.full_like(reference_depth, float(voxel_factor * voxel_size)),
+        float(relative_depth_ratio) * reference_depth,
+    )
+    geometry_consistent = (
+        reference_depth_valid
+        & torch.isfinite(geometry_error)
+        & (geometry_error <= geometry_threshold)
+    )
+
+    novel_keep = da3_valid & ~reference_mask
+    reference_covered = da3_valid & reference_mask
+    reference_keep = reference_covered & geometry_consistent
+    point_keep = novel_keep | reference_keep
+    stats = {
+        "da3_valid_points": int(da3_valid.sum().item()),
+        "reference_uncovered_points": int(novel_keep.sum().item()),
+        "reference_covered_points": int(reference_covered.sum().item()),
+        "reference_geometry_consistent_points": int(reference_keep.sum().item()),
+        "reference_geometry_rejected_points": int(
+            (reference_covered & ~reference_keep).sum().item()
+        ),
+        "kept_points": int(point_keep.sum().item()),
+    }
+    return point_keep, stats

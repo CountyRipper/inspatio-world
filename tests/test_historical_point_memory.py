@@ -12,6 +12,7 @@ from utils.historical_point_memory import (
     compute_depth_confidence,
     dense_point_count,
     fuse_reference_and_history,
+    fuse_reference_and_history_v4,
     latent_block_to_pixel_span,
     latent_keyframe_indices,
     scale_adaptive_voxel_size,
@@ -29,6 +30,10 @@ class FakeBlockDecoder:
     def decode(self, latent):
         frames = 9 if self.calls == 0 else 12
         self.calls += 1
+        return torch.full((1, frames, 3, self.height, self.width), 0.75)
+
+    def decode_prefix(self, latent):
+        frames = 1 + 4 * (latent.shape[1] - 1)
         return torch.full((1, frames, 3, self.height, self.width), 0.75)
 
 
@@ -65,6 +70,14 @@ class FakeDepthEstimator:
         ], device=output_device).repeat(frames, 1, 1)
         extrinsics = torch.eye(4, device=output_device)[:3].repeat(frames, 1, 1)
         return rgb.to(output_device), depths, K, extrinsics
+
+
+class InvalidDepthEstimator(FakeDepthEstimator):
+    def estimate_block(self, rgb, output_size, output_device):
+        reconstruction, depths, K, extrinsics = super().estimate_block(
+            rgb, output_size, output_device
+        )
+        return reconstruction, torch.zeros_like(depths), K, extrinsics
 
 
 class HistoricalPointMemoryTest(unittest.TestCase):
@@ -226,6 +239,35 @@ class HistoricalPointMemoryTest(unittest.TestCase):
         self.assertTrue(torch.equal(hist_only, ~ref_mask))
         self.assertTrue(torch.equal(fused_rgb[:, :, ref_mask[0, 0]], ref_rgb[:, :, ref_mask[0, 0]]))
         self.assertTrue(fused_mask.all())
+
+    def test_v4_reference_priority_uses_black_empty_pixels(self):
+        ref_rgb = torch.zeros((1, 3, 2, 2))
+        hist_rgb = torch.ones_like(ref_rgb)
+        ref_mask = torch.tensor([[[[True, False], [False, False]]]])
+        hist_mask = torch.tensor([[[[True, True], [False, False]]]])
+        fused_rgb, fused_mask, historical_add = fuse_reference_and_history_v4(
+            ref_rgb, ref_mask, hist_rgb, hist_mask
+        )
+        self.assertTrue(torch.equal(fused_mask, ref_mask | hist_mask))
+        self.assertTrue(torch.equal(historical_add, hist_mask & ~ref_mask))
+        self.assertTrue((fused_rgb[0, :, 0, 0] == 0).all())
+        self.assertTrue((fused_rgb[0, :, 0, 1] == 1).all())
+        self.assertTrue((fused_rgb[0, :, 1, 0] == -1).all())
+
+    def test_empty_voxel_memory_preserves_immutable_configuration(self):
+        memory = self.make_voxel_surfel_memory(
+            voxel_size=0.007, max_points=1234, point_size=3
+        )
+        memory.update_points(
+            torch.tensor([[0.0, 0.0, 1.0]]),
+            torch.tensor([[1.0, 0.0, 0.0]]),
+        )
+        empty = memory.empty_like()
+        self.assertIsNot(empty, memory)
+        self.assertEqual(empty.point_count, 0)
+        self.assertEqual(empty.voxel_size, memory.voxel_size)
+        self.assertEqual(empty.max_points, memory.max_points)
+        self.assertEqual(empty.splat_diameter, 3)
 
     def test_fixed_max_points(self):
         memory = self.make_memory(max_points=100)
@@ -797,6 +839,170 @@ class HistoricalPointMemoryTest(unittest.TestCase):
         self.assertFalse(controller.metrics[1]["memory_ply_roundtrip"])
         self.assertEqual(summary["splat_diameter"], 3)
         self.assertEqual(summary["adaptive_voxel"], adaptive_details)
+
+    def test_v4_rebuilds_from_all_historical_keyframes(self):
+        try:
+            from pipeline.historical_memory_controller import HistoricalMemoryController
+        except ModuleNotFoundError as error:
+            if error.name in {"einops", "easydict"}:
+                self.skipTest(f"local lightweight environment lacks {error.name}")
+            raise
+
+        num_frames = 21
+        reference_rgb = torch.zeros((1, 3, num_frames, self.height, self.width))
+        reference_mask = torch.ones_like(reference_rgb)
+        reference_mask[:, :, :, :, self.width // 2:] = -1
+        reference_depth = torch.ones((1, num_frames, self.height, self.width))
+        target_c2w = self.pose.repeat(num_frames, 1, 1).unsqueeze(0)
+        initial_memory = self.make_voxel_surfel_memory(
+            voxel_size=0.01, max_points=5000, point_size=3
+        )
+        depth_estimator = FakeDepthEstimator()
+        encoded_frame_counts = []
+
+        def recording_encode(video):
+            encoded_frame_counts.append(video.shape[2])
+            latent_frames = (video.shape[2] + 3) // 4
+            return torch.zeros(
+                (1, latent_frames, 16, self.height // 8, self.width // 8)
+            )
+
+        adaptive_details = {
+            "adaptive_voxel": True,
+            "voxel_size": 0.01,
+            "projected_pixel_spacing": 3.0,
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            controller = HistoricalMemoryController(
+                reference_rgb_bcthw=reference_rgb,
+                reference_mask_bcthw=reference_mask,
+                reference_depth_thw=reference_depth,
+                target_c2w=target_c2w,
+                K=self.K.unsqueeze(0),
+                encode_video=recording_encode,
+                block_decoder=FakeBlockDecoder(self.height, self.width),
+                depth_estimator=depth_estimator,
+                memory=initial_memory,
+                output_dir=output_dir,
+                output_prefix="v4",
+                rank=0,
+                reference_map_path="reference/frames_pcd",
+                memory_update_mode="latent_keyframe",
+                memory_map_mode="overlap_voxel_v4",
+                adaptive_voxel_details=adaptive_details,
+                save_diagnostics=True,
+            )
+            controller.condition_provider(0, 0, 3)
+            controller.output_callback(
+                block_index=0,
+                latent_start=0,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            first_rebuild = controller.memory
+            controller.condition_provider(1, 3, 3)
+            controller.output_callback(
+                block_index=1,
+                latent_start=3,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            second_rebuild = controller.memory
+            summary = controller.close()
+
+            block_dir = os.path.join(
+                output_dir, "v4-overlap_voxel_v4-rank0", "block_001"
+            )
+            expected_artifacts = {
+                "pre_reference.mp4",
+                "pre_historical.mp4",
+                "pre_fused.mp4",
+                "pre_reference_mask.mp4",
+                "pre_historical_mask.mp4",
+                "pre_fused_mask.mp4",
+                "post_keyframes.mp4",
+                "post_point_map.ply",
+                "post_da3_cameras.npz",
+                "metrics.json",
+            }
+            self.assertTrue(expected_artifacts.issubset(set(os.listdir(block_dir))))
+            from scripts.summarize_overlap_voxel_v4 import load_and_validate
+            validated_blocks = load_and_validate(os.path.dirname(block_dir))
+            self.assertEqual(len(validated_blocks), 2)
+
+        self.assertEqual(encoded_frame_counts, [9, 21])
+        self.assertEqual(depth_estimator.block_frame_counts, [3, 6])
+        self.assertIsNot(first_rebuild, initial_memory)
+        self.assertIsNot(second_rebuild, first_rebuild)
+        self.assertEqual(controller.metrics[0]["historical_keyframe_count"], 3)
+        self.assertEqual(controller.metrics[1]["historical_keyframe_count"], 6)
+        self.assertTrue(controller.metrics[0]["rebuild_succeeded"])
+        self.assertTrue(controller.metrics[1]["rebuild_succeeded"])
+        self.assertEqual(controller.metrics[0]["voxel_size"], 0.01)
+        self.assertEqual(controller.metrics[1]["voxel_size"], 0.01)
+        self.assertEqual(summary["memory_map_mode"], "overlap_voxel_v4")
+
+    def test_v4_failed_rebuild_preserves_previous_map(self):
+        try:
+            from pipeline.historical_memory_controller import HistoricalMemoryController
+        except ModuleNotFoundError as error:
+            if error.name in {"einops", "easydict"}:
+                self.skipTest(f"local lightweight environment lacks {error.name}")
+            raise
+
+        num_frames = 9
+        reference_rgb = torch.zeros((1, 3, num_frames, self.height, self.width))
+        reference_mask = torch.ones_like(reference_rgb)
+        reference_depth = torch.ones((1, num_frames, self.height, self.width))
+        target_c2w = self.pose.repeat(num_frames, 1, 1).unsqueeze(0)
+        memory = self.make_voxel_surfel_memory(
+            voxel_size=0.01, max_points=5000, point_size=3
+        )
+        memory.update_points(
+            torch.tensor([[0.0, 0.0, 1.0]]),
+            torch.tensor([[1.0, 0.0, 0.0]]),
+        )
+        point_count = memory.point_count
+
+        def fake_encode(video):
+            latent_frames = (video.shape[2] + 3) // 4
+            return torch.zeros(
+                (1, latent_frames, 16, self.height // 8, self.width // 8)
+            )
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            controller = HistoricalMemoryController(
+                reference_rgb_bcthw=reference_rgb,
+                reference_mask_bcthw=reference_mask,
+                reference_depth_thw=reference_depth,
+                target_c2w=target_c2w,
+                K=self.K.unsqueeze(0),
+                encode_video=fake_encode,
+                block_decoder=FakeBlockDecoder(self.height, self.width),
+                depth_estimator=InvalidDepthEstimator(),
+                memory=memory,
+                output_dir=output_dir,
+                output_prefix="v4-failure",
+                rank=0,
+                reference_map_path="reference/frames_pcd",
+                memory_update_mode="latent_keyframe",
+                memory_map_mode="overlap_voxel_v4",
+                adaptive_voxel_details={"adaptive_voxel": True, "voxel_size": 0.01},
+                save_diagnostics=False,
+            )
+            controller.condition_provider(0, 0, 3)
+            controller.output_callback(
+                block_index=0,
+                latent_start=0,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            controller.close()
+
+        self.assertIs(controller.memory, memory)
+        self.assertEqual(controller.memory.point_count, point_count)
+        self.assertFalse(controller.metrics[0]["rebuild_succeeded"])
+        self.assertIn("valid correspondences", controller.metrics[0]["rebuild_error"])
 
 
 if __name__ == "__main__":

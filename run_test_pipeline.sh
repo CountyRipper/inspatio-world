@@ -37,14 +37,16 @@ set -e
 #   --tae_checkpoint_path (optional) Path to TAE checkpoint file (required when --use_tae is set)
 #   --compile_dit         (optional) Apply torch.compile to the DiT model
 #   --historical_memory   (optional) Enable training-free historical RGB point memory
-#   --memory_depth_backend (optional) da3 or align3r (default: da3)
-#   --memory_map_mode     (optional) bounded_voxel, dense_two_layer, overlap_voxel_v3, or overlap_voxel_v3_1
+#   --memory_depth_backend (optional) da3, align3r (default: da3)
+#   --memory_map_mode     (optional) also supports overlap_voxel_v4
 #   --memory_depth_device (optional) Logical CUDA device for memory DA3
 #   --memory_update_mode  (optional) keyframe, latent_keyframe, or full_block (default: keyframe)
 #   --memory_voxel_size   (optional) Historical point voxel size (default: 0.02)
 #   --memory_voxel_target_pixels (optional) V3.1 median-depth projected spacing (default: 3.0)
-#   --memory_max_points   (optional) Maximum historical point count (default: 500000)
-#   --memory_point_size   (optional) Historical point splat size (default: 1)
+#   --memory_max_points   (optional) Maximum historical point count (V4: 3000000; otherwise: 500000)
+#   --memory_point_size   (optional) Historical point splat size (V4: 3; otherwise: 1)
+#   --memory_geometry_voxel_factor (optional) V4 voxel tolerance multiplier (default: 2.0)
+#   --memory_geometry_depth_ratio (optional) V4 relative-depth tolerance (default: 0.03)
 #   --memory_anchor_count (optional) V3 DA3 anchor count; only 1 is implemented
 #   --disable_memory_diagnostics (optional) Disable historical/fused diagnostic videos
 #   --profile_blocks      (optional) Save per-block DiT timing
@@ -94,9 +96,11 @@ MEMORY_ALIGN3R_DISABLE_CUROPE=false
 MEMORY_UPDATE_MODE="keyframe"
 MEMORY_VOXEL_SIZE="0.02"
 MEMORY_VOXEL_TARGET_PIXELS="3.0"
-MEMORY_MAX_POINTS="500000"
-MEMORY_POINT_SIZE="1"
+MEMORY_MAX_POINTS=""
+MEMORY_POINT_SIZE=""
 MEMORY_ANCHOR_COUNT="1"
+MEMORY_GEOMETRY_VOXEL_FACTOR="2.0"
+MEMORY_GEOMETRY_DEPTH_RATIO="0.03"
 MEMORY_DIAGNOSTICS=true
 PROFILE_BLOCKS=false
 SAVE_DENOISED_LATENTS=false
@@ -264,6 +268,14 @@ while [[ $# -gt 0 ]]; do
             MEMORY_POINT_SIZE="$2"
             shift 2
             ;;
+        --memory_geometry_voxel_factor)
+            MEMORY_GEOMETRY_VOXEL_FACTOR="$2"
+            shift 2
+            ;;
+        --memory_geometry_depth_ratio)
+            MEMORY_GEOMETRY_DEPTH_RATIO="$2"
+            shift 2
+            ;;
         --memory_anchor_count)
             MEMORY_ANCHOR_COUNT="$2"
             shift 2
@@ -300,15 +312,30 @@ if [ -z "$TRAJ_TXT_PATH" ]; then
     echo "Error: --traj_txt_path is required"
     exit 1
 fi
+if [ -z "$MEMORY_MAX_POINTS" ]; then
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
+        MEMORY_MAX_POINTS="3000000"
+    else
+        MEMORY_MAX_POINTS="500000"
+    fi
+fi
+if [ -z "$MEMORY_POINT_SIZE" ]; then
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
+        MEMORY_POINT_SIZE="3"
+    else
+        MEMORY_POINT_SIZE="1"
+    fi
+fi
 if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] \
         && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3" ] \
-        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3_1" ]; then
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3_1" ] \
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v4" ]; then
     echo "Error: invalid --memory_map_mode"
     exit 1
 fi
 if [ "$MEMORY_DEPTH_BACKEND" != "da3" ] && [ "$MEMORY_DEPTH_BACKEND" != "align3r" ]; then
-    echo "Error: --memory_depth_backend must be 'da3' or 'align3r'"
+    echo "Error: invalid --memory_depth_backend"
     exit 1
 fi
 if [ "$HISTORICAL_MEMORY" = true ] && [ "$MEMORY_DEPTH_BACKEND" = "align3r" ]; then
@@ -334,17 +361,24 @@ if [ "$MEMORY_MAP_MODE" = "dense_two_layer" ]; then
     RENDER_BACKEND="ply"
 fi
 if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3" ] \
-        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ]; then
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
     if [ "$MEMORY_UPDATE_MODE" != "latent_keyframe" ]; then
         echo "Error: overlap-voxel modes require --memory_update_mode latent_keyframe"
         exit 1
     fi
     if [ "$MEMORY_DEPTH_BACKEND" != "da3" ]; then
-        echo "Error: overlap-voxel modes currently require DA3"
+        echo "Error: overlap_voxel_v3/v4 require DA3"
         exit 1
     fi
-    if [ "$MEMORY_ANCHOR_COUNT" != "1" ]; then
+    if [ "$MEMORY_MAP_MODE" != "overlap_voxel_v4" ] \
+            && [ "$MEMORY_ANCHOR_COUNT" != "1" ]; then
         echo "Error: multi-anchor V3 is reserved but not implemented"
+        exit 1
+    fi
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
+            && [ "$MEMORY_POINT_SIZE" != "3" ]; then
+        echo "Error: overlap_voxel_v4 requires --memory_point_size 3"
         exit 1
     fi
     RENDER_BACKEND="ply"
@@ -397,12 +431,14 @@ echo "  Align3R memory GPU: ${MEMORY_ALIGN3R_GPU:-N/A}"
 echo "  Align3R memory work dir: ${MEMORY_ALIGN3R_WORK_DIR:-N/A}"
 echo "  Memory update mode: $MEMORY_UPDATE_MODE"
 echo "  Memory anchor count: $MEMORY_ANCHOR_COUNT (multi-anchor reserved)"
-if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ]; then
+if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
     echo "  Memory voxel/max points/splat: adaptive / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
 else
     echo "  Memory voxel/max points/splat: $MEMORY_VOXEL_SIZE / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
 fi
 echo "  Memory voxel target pixels: $MEMORY_VOXEL_TARGET_PIXELS"
+echo "  V4 geometry voxel/depth tolerance: $MEMORY_GEOMETRY_VOXEL_FACTOR / $MEMORY_GEOMETRY_DEPTH_RATIO"
 echo "  Memory diagnostics: $MEMORY_DIAGNOSTICS"
 echo "  Profile blocks: $PROFILE_BLOCKS"
 echo "  Save denoised latents: $SAVE_DENOISED_LATENTS"
@@ -594,6 +630,8 @@ if [ "$SKIP_STEP3" = false ]; then
         --memory_max_points "$MEMORY_MAX_POINTS" \
         --memory_point_size "$MEMORY_POINT_SIZE" \
         --memory_anchor_count "$MEMORY_ANCHOR_COUNT" \
+        --memory_geometry_voxel_factor "$MEMORY_GEOMETRY_VOXEL_FACTOR" \
+        --memory_geometry_depth_ratio "$MEMORY_GEOMETRY_DEPTH_RATIO" \
         $([ "$MEMORY_DIAGNOSTICS" = false ] && echo "--disable_memory_diagnostics") \
         $([ "$PROFILE_BLOCKS" = true ] && echo "--profile_blocks") \
         $([ "$SAVE_DENOISED_LATENTS" = true ] && echo "--save_denoised_latents")

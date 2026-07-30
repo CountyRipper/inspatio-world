@@ -75,6 +75,27 @@ def fuse_reference_and_history(
     return fused_rgb, fused_mask, hist_only
 
 
+def fuse_reference_and_history_v4(
+    reference_rgb: torch.Tensor,
+    reference_mask: torch.Tensor,
+    historical_rgb: torch.Tensor,
+    historical_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse [-1,1] conditions with strict reference priority and black holes."""
+    reference_mask = reference_mask.bool()
+    historical_mask = historical_mask.bool()
+    historical_add = historical_mask & ~reference_mask
+    fused_mask = reference_mask | historical_add
+    fused_rgb = torch.full_like(reference_rgb, -1.0)
+    fused_rgb = torch.where(
+        reference_mask.expand_as(fused_rgb), reference_rgb, fused_rgb
+    )
+    fused_rgb = torch.where(
+        historical_add.expand_as(fused_rgb), historical_rgb, fused_rgb
+    )
+    return fused_rgb, fused_mask, historical_add
+
+
 def dense_point_count(frame_count: int, height: int, width: int) -> int:
     """Return the exact upper-bound point count for an all-valid dense map."""
     if frame_count < 0 or height <= 0 or width <= 0:
@@ -644,6 +665,19 @@ class IncrementalVoxelSurfelMemory(RGBPointMemory):
     def splat_diameter(self) -> int:
         return 1 if self.point_size <= 1 else 2 * (self.point_size // 2) + 1
 
+    def empty_like(self) -> "IncrementalVoxelSurfelMemory":
+        """Create an empty map with identical immutable rendering parameters."""
+        return type(self)(
+            height=self.height,
+            width=self.width,
+            device=self.device,
+            K=self.K,
+            voxel_size=self.voxel_size,
+            max_points=self.max_points,
+            point_size=self.point_size,
+            min_depth=self.min_depth,
+        )
+
     def update_points(
         self,
         points: torch.Tensor,
@@ -775,7 +809,16 @@ class IncrementalVoxelSurfelMemory(RGBPointMemory):
             splat_diameter=np.int32(self.splat_diameter),
         )
 
-        ply_path = path_prefix + ".ply"
+        ply_path = self.save_ply(path_prefix + ".ply")
+        return npz_path, ply_path
+
+    def save_ply(self, ply_path: str) -> str:
+        """Save only the renderable voxel surfels to a binary PLY."""
+        os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+        points = self.points.detach().cpu().numpy().astype(np.float32)
+        colors = (
+            self.colors.detach().cpu().numpy().clip(0, 1) * 255
+        ).round().astype(np.uint8)
         vertices = np.empty(
             points.shape[0],
             dtype=[
@@ -795,7 +838,7 @@ class IncrementalVoxelSurfelMemory(RGBPointMemory):
         with open(ply_path, "wb") as handle:
             handle.write(header.encode("ascii"))
             vertices.tofile(handle)
-        return npz_path, ply_path
+        return ply_path
 
 
 class DenseGeneratedPointMemory:

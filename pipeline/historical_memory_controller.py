@@ -18,6 +18,7 @@ from utils.historical_point_memory import (
     calibrate_depth_scale,
     compute_depth_confidence,
     fuse_reference_and_history,
+    fuse_reference_and_history_v4,
     latent_block_to_pixel_span,
     latent_keyframe_indices,
 )
@@ -26,12 +27,14 @@ from utils.overlap_da3_registration import (
     backproject_world_grid,
     estimate_similarity_registration,
     pose_residual,
+    select_v4_runtime_points,
     transform_da3_c2w,
 )
 from utils.render_warper import convert_mask_video
 
 
-_OVERLAP_VOXEL_MODES = {"overlap_voxel_v3", "overlap_voxel_v3_1"}
+_OVERLAP_VOXEL_V3_MODES = {"overlap_voxel_v3", "overlap_voxel_v3_1"}
+_OVERLAP_VOXEL_MODES = {*_OVERLAP_VOXEL_V3_MODES, "overlap_voxel_v4"}
 
 
 def _synchronize(device: torch.device) -> None:
@@ -71,6 +74,13 @@ class WanVAEBlockDecoder:
         video = video.float().clamp_(-1, 1).permute(0, 2, 1, 3, 4)
         return (video * 0.5 + 0.5).clamp_(0, 1)
 
+    @torch.inference_mode()
+    def decode_prefix(self, latent_btchw: torch.Tensor) -> torch.Tensor:
+        video = self.vae.decode_to_pixel(
+            latent_btchw.to(self.device), use_cache=False
+        )
+        return (video * 0.5 + 0.5).clamp_(0, 1)
+
 
 class TAEBlockDecoder:
     """Stateful block decoder using the repository's StreamingTAEHV helper."""
@@ -79,6 +89,7 @@ class TAEBlockDecoder:
         from utils.taehv import StreamingTAEHV
 
         self.streaming = StreamingTAEHV(tae_model)
+        self.tae_model = tae_model
         self.device = next(tae_model.parameters()).device
 
     @torch.inference_mode()
@@ -92,6 +103,13 @@ class TAEBlockDecoder:
         if not frames:
             raise RuntimeError("Streaming TAE produced no RGB frames for a latent block")
         return torch.cat(frames, dim=1)
+
+    @torch.inference_mode()
+    def decode_prefix(self, latent_btchw: torch.Tensor) -> torch.Tensor:
+        return self.tae_model.decode_video(
+            latent_btchw.to(self.device, dtype=torch.float16),
+            show_progress_bar=False,
+        ).float()
 
 
 class HistoricalMemoryController:
@@ -116,6 +134,8 @@ class HistoricalMemoryController:
         reference_depth_thw: Optional[torch.Tensor] = None,
         memory_anchor_count: int = 1,
         adaptive_voxel_details: Optional[dict] = None,
+        geometry_voxel_factor: float = 2.0,
+        geometry_depth_ratio: float = 0.03,
         fps: int = 24,
         save_diagnostics: bool = True,
     ):
@@ -176,25 +196,36 @@ class HistoricalMemoryController:
             raise ValueError(f"{memory_map_mode} requires aligned reference_depth_thw")
         if memory_map_mode in _OVERLAP_VOXEL_MODES:
             if memory_update_mode != "latent_keyframe":
-                raise ValueError("overlap_voxel_v3 requires latent_keyframe updates")
+                raise ValueError("overlap-voxel modes require latent_keyframe updates")
             if self.depth_backend != "da3":
-                raise ValueError("overlap_voxel_v3 currently requires the DA3 backend")
-            if memory_anchor_count != 1:
+                raise ValueError("overlap_voxel_v3/v4 currently requires DA3")
+            if memory_map_mode in _OVERLAP_VOXEL_V3_MODES and memory_anchor_count != 1:
                 raise NotImplementedError(
                     "Multi-anchor DA3 windows are reserved but not implemented"
                 )
-            if memory_map_mode == "overlap_voxel_v3_1" \
-                    and adaptive_voxel_details is None:
-                raise ValueError("overlap_voxel_v3_1 requires adaptive voxel metadata")
+            if memory_map_mode in {
+                "overlap_voxel_v3_1", "overlap_voxel_v4"
+            } and adaptive_voxel_details is None:
+                raise ValueError(f"{memory_map_mode} requires adaptive voxel metadata")
+            if memory_map_mode == "overlap_voxel_v4":
+                if not isinstance(memory, IncrementalVoxelSurfelMemory):
+                    raise TypeError("overlap_voxel_v4 requires voxel surfel memory")
+                if memory.splat_diameter != 3:
+                    raise ValueError("overlap_voxel_v4 requires a 3x3 point splat")
+                if geometry_voxel_factor <= 0 or geometry_depth_ratio <= 0:
+                    raise ValueError("V4 geometry thresholds must be positive")
         self.memory_update_mode = memory_update_mode
         self.memory_map_mode = memory_map_mode
         self.save_diagnostics = save_diagnostics
+        self.fps = int(fps)
         self.metrics = []
         self.closed = False
         self.previous_depth_scale = None
         self._historical_depth_by_block = {}
         self.memory_anchor_count = int(memory_anchor_count)
         self.adaptive_voxel_details = adaptive_voxel_details
+        self.geometry_voxel_factor = float(geometry_voxel_factor)
+        self.geometry_depth_ratio = float(geometry_depth_ratio)
         self.anchor_rgb = None
         self.anchor_world_points = None
         self.anchor_valid = None
@@ -202,16 +233,21 @@ class HistoricalMemoryController:
         self.previous_registration_scale = None
         self.previous_da3_focal = None
         self.observed_keyframes = {}
+        self.generated_latent_blocks = []
+
 
         _, _, _, height, width = reference_rgb_bcthw.shape
         self.height = height
         self.width = width
         os.makedirs(output_dir, exist_ok=True)
+        self.v4_output_dir = os.path.join(
+            output_dir, f"{output_prefix}-{memory_map_mode}-rank{rank}"
+        )
 
         paths = {
             "pred": f"{output_prefix}-pred_video_rank{rank}.mp4",
         }
-        if save_diagnostics:
+        if save_diagnostics and memory_map_mode != "overlap_voxel_v4":
             paths.update({
                 "reference": f"{output_prefix}-reference_render_rank{rank}.mp4",
                 "historical": f"{output_prefix}-historical_render_rank{rank}.mp4",
@@ -230,6 +266,137 @@ class HistoricalMemoryController:
             self.metrics.append({"block_index": len(self.metrics)})
         return self.metrics[block_index]
 
+    def _v4_block_dir(self, block_index: int) -> str:
+        path = os.path.join(self.v4_output_dir, f"block_{block_index:03d}")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _write_v4_video(
+        self,
+        block_index: int,
+        name: str,
+        video_tchw: torch.Tensor,
+        *,
+        signed: bool = False,
+    ) -> None:
+        if not self.save_diagnostics:
+            return
+        video = video_tchw
+        if signed:
+            video = (video.float() * 0.5 + 0.5).clamp(0, 1)
+        writer = VideoStreamWriter(
+            os.path.join(self._v4_block_dir(block_index), name),
+            self.width,
+            self.height,
+            self.fps,
+        )
+        writer.write(video)
+        writer.close()
+
+    def _write_v4_metrics(self, block_index: int, metric: dict) -> None:
+        path = os.path.join(self._v4_block_dir(block_index), "metrics.json")
+        temporary_path = path + ".tmp"
+        with open(temporary_path, "w") as handle:
+            json.dump(metric, handle, indent=2)
+        os.replace(temporary_path, path)
+
+    @torch.inference_mode()
+    def _condition_provider_v4(
+        self,
+        block_index: int,
+        latent_start: int,
+        latent_count: int,
+        pixel_start: int,
+        pixel_end: int,
+    ):
+        reference_rgb = self.reference_rgb[0, :, :pixel_end].permute(1, 0, 2, 3).float()
+        reference_mask = self.reference_mask[0, :1, :pixel_end].permute(1, 0, 2, 3) > 0
+        points_before_read = self.memory.point_count
+
+        _synchronize(self.memory.device)
+        t_render = time.perf_counter()
+        historical_rgb, historical_mask = self.memory.render(
+            self.target_c2w[:pixel_end], self.K
+        )
+        _synchronize(self.memory.device)
+        hist_render_ms = (time.perf_counter() - t_render) * 1000.0
+        historical_rgb = historical_rgb.mul(2).sub(1)
+
+        t_merge = time.perf_counter()
+        fused_rgb, fused_mask, historical_add = fuse_reference_and_history_v4(
+            reference_rgb.to(self.memory.device),
+            reference_mask.to(self.memory.device),
+            historical_rgb,
+            historical_mask,
+        )
+        merge_ms = (time.perf_counter() - t_merge) * 1000.0
+        if not torch.equal(fused_mask, reference_mask.to(self.memory.device) | historical_mask):
+            raise AssertionError("V4 fused mask differs from reference | history")
+
+        self._write_v4_video(
+            block_index, "pre_reference.mp4", reference_rgb, signed=True
+        )
+        self._write_v4_video(
+            block_index, "pre_historical.mp4", historical_rgb, signed=True
+        )
+        self._write_v4_video(block_index, "pre_fused.mp4", fused_rgb, signed=True)
+        self._write_v4_video(
+            block_index, "pre_reference_mask.mp4", reference_mask.float()
+        )
+        self._write_v4_video(
+            block_index, "pre_historical_mask.mp4", historical_mask.float()
+        )
+        self._write_v4_video(
+            block_index, "pre_fused_mask.mp4", fused_mask.float()
+        )
+
+        fused_video = fused_rgb.permute(1, 0, 2, 3).unsqueeze(0).to(
+            dtype=self.reference_rgb.dtype
+        )
+        fused_mask_video = (
+            fused_mask.float().permute(1, 0, 2, 3).unsqueeze(0).mul(2).sub(1)
+        )
+        _synchronize(fused_video.device)
+        t_encode = time.perf_counter()
+        render_prefix = self.encode_video(fused_video)
+        mask_prefix = convert_mask_video(fused_mask_video)
+        _synchronize(render_prefix.device)
+        condition_encode_ms = (time.perf_counter() - t_encode) * 1000.0
+        latent_end = latent_start + latent_count
+        if render_prefix.shape[1] < latent_end or mask_prefix.shape[1] < latent_end:
+            raise RuntimeError("V4 prefix condition encode returned too few latents")
+        render_block = render_prefix[:, latent_start:latent_end]
+        mask_block = mask_prefix[:, latent_start:latent_end]
+
+        current_slice = slice(pixel_start, pixel_end)
+        current_reference_mask = reference_mask[current_slice]
+        current_historical_mask = historical_mask[current_slice]
+        current_historical_add = historical_add[current_slice]
+        current_fused_mask = fused_mask[current_slice]
+        metric = self._metric_for_block(block_index)
+        metric.update({
+            "latent_start": latent_start,
+            "pixel_start": pixel_start,
+            "pixel_end": pixel_end,
+            "pixel_frames": pixel_end - pixel_start,
+            "condition_prefix_frames": pixel_end,
+            "hist_render_ms": hist_render_ms,
+            "merge_ms": merge_ms,
+            "condition_encode_ms": condition_encode_ms,
+            "reference_coverage": float(current_reference_mask.float().mean().item()),
+            "historical_coverage": float(current_historical_mask.float().mean().item()),
+            "hist_only_coverage": float(current_historical_add.float().mean().item()),
+            "fused_coverage": float(current_fused_mask.float().mean().item()),
+            "historical_pixels": int(current_historical_mask.sum().item()),
+            "history_injected_pixels": int(current_historical_add.sum().item()),
+            "points_before_read": points_before_read,
+            "memory_map_mode": self.memory_map_mode,
+            "memory_read_contract": "full_prefix_gpu_voxel_render+reference_priority_fuse+vae_encode",
+            "memory_render_uses_planned_c2w": True,
+            "memory_ply_roundtrip": False,
+        })
+        return render_block, mask_block
+
     @torch.inference_mode()
     def condition_provider(
         self,
@@ -242,6 +409,14 @@ class HistoricalMemoryController:
             raise RuntimeError(
                 f"Block {block_index} requires RGB frames [{pixel_start}, {pixel_end}), "
                 f"but only {self.reference_rgb.shape[2]} are available"
+            )
+        if self.memory_map_mode == "overlap_voxel_v4":
+            return self._condition_provider_v4(
+                block_index,
+                latent_start,
+                latent_count,
+                pixel_start,
+                pixel_end,
             )
 
         reference_rgb = (
@@ -381,6 +556,17 @@ class HistoricalMemoryController:
         dit_ms: float,
     ) -> None:
         pixel_start, pixel_end = latent_block_to_pixel_span(latent_start, denoised_latent.shape[1])
+
+        if self.memory_map_mode == "overlap_voxel_v4":
+            self._output_callback_overlap_v4(
+                block_index=block_index,
+                latent_start=latent_start,
+                denoised_latent=denoised_latent,
+                pixel_start=pixel_start,
+                pixel_end=pixel_end,
+                dit_ms=dit_ms,
+            )
+            return
 
         _synchronize(self.block_decoder.device)
         t_decode = time.perf_counter()
@@ -597,6 +783,251 @@ class HistoricalMemoryController:
             "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
             **update_details,
         })
+
+    @torch.inference_mode()
+    def _output_callback_overlap_v4(
+        self,
+        *,
+        block_index: int,
+        latent_start: int,
+        denoised_latent: torch.Tensor,
+        pixel_start: int,
+        pixel_end: int,
+        dit_ms: float,
+    ) -> None:
+        self.generated_latent_blocks.append(denoised_latent.detach().cpu())
+        latent_prefix = torch.cat(self.generated_latent_blocks, dim=1)
+
+        _synchronize(self.block_decoder.device)
+        t_decode = time.perf_counter()
+        decoded_prefix = self.block_decoder.decode_prefix(latent_prefix)
+        _synchronize(self.block_decoder.device)
+        decode_ms = (time.perf_counter() - t_decode) * 1000.0
+        if decoded_prefix.shape[1] != pixel_end:
+            raise RuntimeError(
+                f"V4 prefix decoder returned {decoded_prefix.shape[1]} frames, "
+                f"expected {pixel_end}"
+            )
+        self.writers["pred"].write(decoded_prefix[0, pixel_start:pixel_end])
+
+        historical_frame_indices = latent_keyframe_indices(0, latent_prefix.shape[1])
+        historical_keyframes = decoded_prefix[0, list(historical_frame_indices)]
+        self._write_v4_video(
+            block_index, "post_keyframes.mp4", historical_keyframes
+        )
+
+        _synchronize(self.depth_estimator.device)
+        t_da3 = time.perf_counter()
+        (
+            reconstruction_rgb,
+            da3_depth,
+            da3_intrinsics,
+            da3_w2c,
+        ) = self.depth_estimator.estimate_block(
+            historical_keyframes,
+            output_size=(self.height, self.width),
+            output_device=self.memory.device,
+        )
+        _synchronize(self.depth_estimator.device)
+        _synchronize(self.memory.device)
+        da3_ms = (time.perf_counter() - t_da3) * 1000.0
+
+        _synchronize(self.memory.device)
+        t_rebuild = time.perf_counter()
+        local_points = []
+        local_valid = []
+        reference_points = []
+        reference_valid = []
+        for history_index, frame_index in enumerate(historical_frame_indices):
+            points, valid = backproject_world_grid(
+                da3_depth[history_index],
+                da3_intrinsics[history_index],
+                w2c=da3_w2c[history_index],
+            )
+            local_points.append(points)
+            local_valid.append(valid)
+            points, valid = backproject_world_grid(
+                self.reference_depth[frame_index].to(
+                    self.memory.device, dtype=torch.float32
+                ),
+                self.K,
+                c2w=self.target_c2w[frame_index],
+            )
+            reference_points.append(points)
+            reference_valid.append(valid)
+
+        local_points = torch.stack(local_points)
+        local_valid = torch.stack(local_valid)
+        reference_points = torch.stack(reference_points)
+        reference_valid = torch.stack(reference_valid)
+        reference_depth = self.reference_depth[list(historical_frame_indices)].to(
+            self.memory.device, dtype=torch.float32
+        )
+        reference_mask = (
+            self.reference_mask[0, 0, list(historical_frame_indices)]
+            .to(self.memory.device) > 0
+        )
+        correspondence_valid = local_valid & reference_valid & reference_mask
+        correspondence_count = int(correspondence_valid.sum().item())
+
+        registration = None
+        registration_error = None
+        canonical_points = None
+        canonical_c2w = torch.empty(
+            (0, 4, 4), device=self.memory.device, dtype=torch.float32
+        )
+        point_stats = {
+            "da3_valid_points": int(local_valid.sum().item()),
+            "reference_uncovered_points": 0,
+            "reference_covered_points": 0,
+            "reference_geometry_consistent_points": 0,
+            "reference_geometry_rejected_points": 0,
+            "kept_points": 0,
+        }
+        update_stats = {
+            "raw_valid_points": 0,
+            "batch_voxels": 0,
+            "points_before": self.memory.point_count,
+            "points_after": self.memory.point_count,
+            "evicted_voxels": 0,
+        }
+        voxel_fusion_ms = 0.0
+        try:
+            registration = estimate_similarity_registration(
+                local_points,
+                reference_points,
+                correspondence_valid,
+                min_correspondences=min(
+                    4096,
+                    max(
+                        128,
+                        int(len(historical_frame_indices) * self.height * self.width * 0.01),
+                    ),
+                ),
+            )
+            canonical_points = apply_similarity(
+                local_points,
+                registration.scale,
+                registration.rotation,
+                registration.translation,
+            )
+            point_keep, point_stats = select_v4_runtime_points(
+                canonical_points,
+                reference_points,
+                local_valid,
+                reference_depth,
+                reference_valid,
+                reference_mask,
+                voxel_size=self.memory.voxel_size,
+                voxel_factor=self.geometry_voxel_factor,
+                relative_depth_ratio=self.geometry_depth_ratio,
+            )
+            canonical_c2w = torch.stack([
+                transform_da3_c2w(
+                    extrinsic,
+                    registration.scale,
+                    registration.rotation,
+                    registration.translation,
+                )
+                for extrinsic in da3_w2c
+            ])
+            candidate_map = self.memory.empty_like()
+            _synchronize(self.memory.device)
+            t_fusion = time.perf_counter()
+            update_stats = candidate_map.update_points(
+                canonical_points,
+                reconstruction_rgb.permute(0, 2, 3, 1),
+                point_keep,
+            )
+            _synchronize(self.memory.device)
+            voxel_fusion_ms = (time.perf_counter() - t_fusion) * 1000.0
+
+            self.memory = candidate_map
+            self.observed_keyframes = {
+                int(frame_index): pose.detach().cpu()
+                for frame_index, pose in zip(historical_frame_indices, canonical_c2w)
+            }
+        except (RuntimeError, ValueError) as error:
+            registration_error = str(error)
+        _synchronize(self.memory.device)
+        pointcloud_rebuild_ms = (time.perf_counter() - t_rebuild) * 1000.0
+
+        block_dir = self._v4_block_dir(block_index)
+        _synchronize(self.memory.device)
+        t_save = time.perf_counter()
+        self.memory.save_ply(os.path.join(block_dir, "post_point_map.ply"))
+        np.savez_compressed(
+            os.path.join(block_dir, "post_da3_cameras.npz"),
+            frame_indices=np.asarray(historical_frame_indices, dtype=np.int64),
+            da3_intrinsics=da3_intrinsics.detach().cpu().numpy().astype(np.float32),
+            da3_w2c=da3_w2c.detach().cpu().numpy().astype(np.float32),
+            planned_c2w=self.target_c2w[list(historical_frame_indices)]
+            .detach().cpu().numpy().astype(np.float32),
+            canonical_da3_c2w=canonical_c2w.detach().cpu().numpy().astype(np.float32),
+            sim3_scale=np.float32(np.nan if registration is None else registration.scale),
+            sim3_rotation=(
+                np.full((3, 3), np.nan, dtype=np.float32)
+                if registration is None
+                else registration.rotation.detach().cpu().numpy().astype(np.float32)
+            ),
+            sim3_translation=(
+                np.full((3,), np.nan, dtype=np.float32)
+                if registration is None
+                else registration.translation.detach().cpu().numpy().astype(np.float32)
+            ),
+        )
+        pointcloud_save_ms = (time.perf_counter() - t_save) * 1000.0
+
+        metric = self._metric_for_block(block_index)
+        cuda_allocated_peak_gb, cuda_reserved_peak_gb = _cuda_peak_gb(
+            self.memory.device
+        )
+        metric.update({
+            "dit_ms": float(dit_ms),
+            "decode_ms": decode_ms,
+            "depth_backend": self.depth_backend,
+            "depth_estimation_ms": da3_ms,
+            "da3_ms": da3_ms,
+            "historical_keyframe_count": len(historical_frame_indices),
+            "historical_frame_indices": list(historical_frame_indices),
+            "update_frame_indices": list(
+                latent_keyframe_indices(latent_start, denoised_latent.shape[1])
+            ),
+            "update_frames": int(denoised_latent.shape[1]),
+            "registration_accepted": registration is not None and registration_error is None,
+            "rebuild_succeeded": registration is not None and registration_error is None,
+            "rebuild_error": registration_error,
+            "sim3_correspondence_count": correspondence_count,
+            "sim3_sampled_correspondence_count": (
+                0 if registration is None else registration.sampled_count
+            ),
+            "sim3_inlier_count": 0 if registration is None else registration.inlier_count,
+            "sim3_inlier_ratio": 0.0 if registration is None else registration.inlier_ratio,
+            "sim3_rmse": None if registration is None else registration.rmse,
+            "sim3_normalized_rmse": (
+                None if registration is None else registration.normalized_rmse
+            ),
+            "sim3_scale": None if registration is None else registration.scale,
+            "voxel_size": self.memory.voxel_size,
+            "voxel_count": self.memory.point_count,
+            "pointcloud_rebuild_ms": pointcloud_rebuild_ms,
+            "voxel_fusion_ms": voxel_fusion_ms,
+            "pointcloud_save_ms": pointcloud_save_ms,
+            "memory_update_ms": pointcloud_rebuild_ms,
+            "pointcloud_total_ms": da3_ms + pointcloud_rebuild_ms,
+            "memory_update_mode": self.memory_update_mode,
+            "memory_map_mode": self.memory_map_mode,
+            "geometry_voxel_factor": self.geometry_voxel_factor,
+            "geometry_depth_ratio": self.geometry_depth_ratio,
+            "da3_peak_memory_gb": float(
+                getattr(self.depth_estimator, "last_peak_memory_gb", 0.0)
+            ),
+            "cuda_allocated_peak_gb": cuda_allocated_peak_gb,
+            "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
+            **point_stats,
+            **update_stats,
+        })
+        self._write_v4_metrics(block_index, metric)
 
     @torch.inference_mode()
     def _output_callback_overlap_v3(
@@ -861,6 +1292,9 @@ class HistoricalMemoryController:
         self.closed = True
         for writer in self.writers.values():
             writer.close()
+
+        if self.memory_map_mode == "overlap_voxel_v4":
+            return self.summary()
 
         if self.memory_map_mode in _OVERLAP_VOXEL_MODES:
             camera_indices = sorted(self.observed_keyframes)
