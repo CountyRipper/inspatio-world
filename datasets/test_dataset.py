@@ -84,6 +84,27 @@ class TestDataset():
         ])
         source_video = pixel_transforms(source_video)
 
+        # Source-camera poses are needed by the online MapAnything backend.
+        # Keep them in the same canonical frame used by the offline renderer:
+        # the first source camera is the world origin.
+        source_c2w = None
+        source_extrinsics_path = source_conf.get('vggt_extrinsics_path')
+        if source_extrinsics_path and os.path.exists(source_extrinsics_path):
+            source_w2c = self.read_matrix(source_extrinsics_path)
+            if source_w2c.shape[-2:] == (3, 4):
+                bottom = np.broadcast_to(
+                    np.array([0, 0, 0, 1], dtype=np.float32),
+                    (*source_w2c.shape[:-2], 1, 4),
+                )
+                source_w2c = np.concatenate((source_w2c, bottom), axis=-2)
+            if source_w2c.shape[-2:] != (4, 4):
+                raise ValueError(
+                    f'Expected source extrinsics [T,3/4,4], got {source_w2c.shape}'
+                )
+            source_c2w_np = np.linalg.inv(source_w2c)
+            source_c2w_np = np.linalg.inv(source_c2w_np[0]) @ source_c2w_np
+            source_c2w = torch.from_numpy(source_c2w_np.astype(np.float32))
+
         # ===================== load pre-rendered render/mask videos =====================
         render_dir = os.path.join(source_conf["vggt_depth_path"], 'render')
         render_video_path = os.path.join(render_dir, 'render_offline.mp4')
@@ -127,6 +148,13 @@ class TestDataset():
                 frozen_frame.expand(self.freeze_repeat, -1, -1, -1),
                 source_video[insert_pos:],
             ], dim=0)
+            if source_c2w is not None:
+                frozen_pose = source_c2w[freeze_idx:freeze_idx+1]
+                source_c2w = torch.cat([
+                    source_c2w[:insert_pos],
+                    frozen_pose.expand(self.freeze_repeat, -1, -1),
+                    source_c2w[insert_pos:],
+                ], dim=0)
             print(f'[Time-freeze] source_video: repeated frame {freeze_idx} x{self.freeze_repeat}, '
                   f'{n_src} -> {source_video.shape[0]} frames')
 
@@ -136,6 +164,8 @@ class TestDataset():
             frame_counts.append(exact_target_c2w.shape[0])
         if exact_reference_depth is not None:
             frame_counts.append(exact_reference_depth.shape[0])
+        if source_c2w is not None:
+            frame_counts.append(source_c2w.shape[0])
         min_frames = min(frame_counts)
         source_video = source_video[:min_frames]
         render_video = render_video[:min_frames]
@@ -144,6 +174,8 @@ class TestDataset():
             exact_target_c2w = exact_target_c2w[:min_frames]
         if exact_reference_depth is not None:
             exact_reference_depth = exact_reference_depth[:min_frames]
+        if source_c2w is not None:
+            source_c2w = source_c2w[:min_frames]
         n_frames = min_frames
 
         # ===================== load depth for radius computation =====================
@@ -208,6 +240,8 @@ class TestDataset():
                         exact_target_c2w = exact_target_c2w[expand_indices]
                     if exact_reference_depth is not None:
                         exact_reference_depth = exact_reference_depth[expand_indices]
+                    if source_c2w is not None:
+                        source_c2w = source_c2w[expand_indices]
                     n_frames = target_n_frames
                 elif n_frames > max_needed:
                     target_n_frames = max_needed
@@ -221,6 +255,8 @@ class TestDataset():
                         exact_target_c2w = exact_target_c2w[subsample_indices]
                     if exact_reference_depth is not None:
                         exact_reference_depth = exact_reference_depth[subsample_indices]
+                    if source_c2w is not None:
+                        source_c2w = source_c2w[subsample_indices]
                     n_frames = target_n_frames
                 else:
                     print(f'[Traj adaptive] Frame count OK, no adjustment needed')
@@ -237,6 +273,8 @@ class TestDataset():
         data['source_video'] = source_video
         data['render_video'] = render_video
         data['mask_video'] = mask_video
+        if source_c2w is not None:
+            data['source_c2w'] = source_c2w
         if exact_target_c2w is not None:
             data['target_c2w'] = exact_target_c2w
             data['target_intrinsic'] = exact_target_intrinsic

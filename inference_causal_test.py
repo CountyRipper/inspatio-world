@@ -41,7 +41,7 @@ parser.add_argument("--compile_dit", action="store_true", help="Apply torch.comp
 parser.add_argument("--historical_memory", action="store_true", help="Enable historical RGB point-cloud memory")
 parser.add_argument(
     "--memory_depth_backend",
-    choices=["da3", "align3r"],
+    choices=["da3", "align3r", "mapanything"],
     default="da3",
     help="Depth backend used to write generated historical-memory frames",
 )
@@ -49,13 +49,24 @@ parser.add_argument(
     "--memory_map_mode",
     choices=[
         "bounded_voxel", "dense_two_layer", "overlap_voxel_v3",
-        "overlap_voxel_v3_1", "overlap_voxel_v4",
+        "overlap_voxel_v3_1", "overlap_voxel_v4", "overlap_voxel_v5",
     ],
     default="bounded_voxel",
     help="Historical point-map implementation used for generated-memory writes",
 )
 parser.add_argument("--memory_da3_model_path", type=str, default="./checkpoints/DA3", help="DA3 checkpoint used for generated keyframe depth")
 parser.add_argument("--memory_depth_device", type=str, default=None, help="Logical CUDA device for DA3 depth (default: DiT device)")
+parser.add_argument(
+    "--memory_mapanything_model_path", type=str, default=None,
+    help="Local MapAnything checkpoint used by overlap_voxel_v5",
+)
+parser.add_argument(
+    "--memory_mapanything_confidence_percentile", type=float, default=10.0,
+)
+parser.add_argument(
+    "--memory_mapanything_min_consistent_ratio", type=float, default=0.01,
+    help="Reject a v5 block if even its better branch has less reference agreement",
+)
 parser.add_argument("--memory_align3r_python", type=str, default=None)
 parser.add_argument("--memory_align3r_root", type=str, default=None)
 parser.add_argument("--memory_align3r_weights", type=str, default=None)
@@ -104,12 +115,12 @@ args = parser.parse_args()
 if args.memory_max_points is None:
     args.memory_max_points = (
         3_000_000
-        if args.memory_map_mode == "overlap_voxel_v4"
+        if args.memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"}
         else 500_000
     )
 if args.memory_point_size is None:
     args.memory_point_size = (
-        3 if args.memory_map_mode == "overlap_voxel_v4" else 1
+        3 if args.memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"} else 1
     )
 
 # ============================================================================
@@ -320,19 +331,25 @@ if args.historical_memory:
         )
     if args.memory_map_mode in {
         "overlap_voxel_v3", "overlap_voxel_v3_1", "overlap_voxel_v4",
+        "overlap_voxel_v5",
     }:
         if args.memory_update_mode != "latent_keyframe":
             raise ValueError("overlap-voxel modes require latent_keyframe updates")
-        if args.memory_depth_backend != "da3":
+        if args.memory_map_mode == "overlap_voxel_v5":
+            if args.memory_depth_backend != "mapanything":
+                raise ValueError("overlap_voxel_v5 requires MapAnything")
+            if not args.memory_mapanything_model_path:
+                raise ValueError("overlap_voxel_v5 requires --memory_mapanything_model_path")
+        elif args.memory_depth_backend != "da3":
             raise ValueError("overlap_voxel_v3/v4 currently requires DA3")
         if args.memory_map_mode in {"overlap_voxel_v3", "overlap_voxel_v3_1"} \
                 and args.memory_anchor_count != 1:
             raise NotImplementedError(
                 "Multi-anchor DA3 windows are reserved but not implemented"
             )
-        if args.memory_map_mode == "overlap_voxel_v4" \
+        if args.memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"} \
                 and args.memory_point_size != 3:
-            raise ValueError("overlap_voxel_v4 requires --memory_point_size 3")
+            raise ValueError("overlap_voxel_v4/v5 requires --memory_point_size 3")
     from utils.wan_wrapper import WanVAEWrapper
 
     if args.memory_depth_backend == "da3":
@@ -350,7 +367,7 @@ if args.historical_memory:
             device=memory_depth_device,
         )
         memory_depth_estimator.backend_name = "da3"
-    else:
+    elif args.memory_depth_backend == "align3r":
         from depth.depth_only_align3r import Align3RDepthEstimator
 
         required_align3r = {
@@ -385,6 +402,22 @@ if args.historical_memory:
             xdg_config_home=args.memory_align3r_xdg_config_home,
             disable_curope=args.memory_align3r_disable_curope,
         )
+    else:
+        from utils.mapanything_estimator import MapAnythingPointEstimator
+
+        memory_depth_device = (
+            torch.device(args.memory_depth_device) if args.memory_depth_device else device
+        )
+        print(
+            f"[Rank {rank}] Loading historical-memory MapAnything on "
+            f"{memory_depth_device} (map_mode={args.memory_map_mode})..."
+        )
+        memory_depth_estimator = MapAnythingPointEstimator(
+            args.memory_mapanything_model_path,
+            memory_depth_device,
+            confidence_percentile=args.memory_mapanything_confidence_percentile,
+        )
+
 
     if not args.use_tae:
         print(f"[Rank {rank}] Loading dedicated block-decode WanVAE...")
@@ -515,6 +548,10 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
                 "Exact target_c2w/intrinsic are missing. Re-run Step 2b with the modified "
                 "scripts/render_point_cloud.py before enabling historical memory."
             )
+        if args.memory_map_mode == "overlap_voxel_v5" and "source_c2w" not in batch:
+            raise RuntimeError(
+                "overlap_voxel_v5 requires vggt_extrinsics_path/source_c2w"
+            )
 
         from pipeline.historical_memory_controller import (
             HistoricalMemoryController,
@@ -540,7 +577,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
         adaptive_voxel_details = None
         if args.memory_map_mode in {
             "dense_two_layer", "overlap_voxel_v3", "overlap_voxel_v3_1",
-            "overlap_voxel_v4",
+            "overlap_voxel_v4", "overlap_voxel_v5",
         }:
             if "reference_depth" not in batch:
                 raise RuntimeError(
@@ -552,7 +589,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             else:
                 voxel_size = args.memory_voxel_size
                 if args.memory_map_mode in {
-                    "overlap_voxel_v3_1", "overlap_voxel_v4"
+                    "overlap_voxel_v3_1", "overlap_voxel_v4", "overlap_voxel_v5"
                 }:
                     voxel_size, adaptive_voxel_details = scale_adaptive_voxel_size(
                         batch["reference_depth"],
@@ -588,6 +625,8 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
         memory_controller = HistoricalMemoryController(
             reference_rgb_bcthw=render_videos_ori,
             reference_mask_bcthw=mask_videos_ori,
+            source_rgb_bcthw=ref_video,
+            source_c2w=batch.get("source_c2w"),
             target_c2w=target_c2w,
             K=target_intrinsic,
             encode_video=encode_video,
@@ -606,6 +645,9 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             geometry_voxel_factor=args.memory_geometry_voxel_factor,
             geometry_depth_ratio=args.memory_geometry_depth_ratio,
             save_diagnostics=not args.disable_memory_diagnostics,
+            mapanything_min_consistent_ratio=(
+                args.memory_mapanything_min_consistent_ratio
+            ),
         )
         block_condition_provider = memory_controller.condition_provider
         block_output_callback = memory_controller.output_callback

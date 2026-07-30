@@ -68,7 +68,7 @@ class VideoDataset(torch.utils.data.Dataset):
             indices = torch.linspace(0, current_frames - 1, target_frames).long()
             for key in (
                 'source_video', 'target_video', 'render_video', 'mask_video',
-                'target_c2w', 'target_extrinsics', 'reference_depth',
+                'source_c2w', 'target_c2w', 'target_extrinsics', 'reference_depth',
             ):
                 if (
                     key in data

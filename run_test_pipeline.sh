@@ -37,9 +37,10 @@ set -e
 #   --tae_checkpoint_path (optional) Path to TAE checkpoint file (required when --use_tae is set)
 #   --compile_dit         (optional) Apply torch.compile to the DiT model
 #   --historical_memory   (optional) Enable training-free historical RGB point memory
-#   --memory_depth_backend (optional) da3, align3r (default: da3)
-#   --memory_map_mode     (optional) also supports overlap_voxel_v4
+#   --memory_depth_backend (optional) da3, align3r, or mapanything (default: da3)
+#   --memory_map_mode     (optional) also supports overlap_voxel_v4 and overlap_voxel_v5
 #   --memory_depth_device (optional) Logical CUDA device for memory DA3
+#   --memory_mapanything_model_path (required for overlap_voxel_v5)
 #   --memory_update_mode  (optional) keyframe, latent_keyframe, or full_block (default: keyframe)
 #   --memory_voxel_size   (optional) Historical point voxel size (default: 0.02)
 #   --memory_voxel_target_pixels (optional) V3.1 median-depth projected spacing (default: 3.0)
@@ -86,6 +87,9 @@ MEMORY_MAP_MODE="bounded_voxel"
 MEMORY_DEPTH_BACKEND="da3"
 MEMORY_DEPTH_DEVICE=""
 MEMORY_ALIGN3R_PYTHON=""
+MEMORY_MAPANYTHING_MODEL_PATH=""
+MEMORY_MAPANYTHING_CONFIDENCE_PERCENTILE="10.0"
+MEMORY_MAPANYTHING_MIN_CONSISTENT_RATIO="0.01"
 MEMORY_ALIGN3R_ROOT=""
 MEMORY_ALIGN3R_WEIGHTS=""
 MEMORY_ALIGN3R_WORK_DIR=""
@@ -220,6 +224,18 @@ while [[ $# -gt 0 ]]; do
             MEMORY_ALIGN3R_PYTHON="$2"
             shift 2
             ;;
+        --memory_mapanything_model_path)
+            MEMORY_MAPANYTHING_MODEL_PATH="$2"
+            shift 2
+            ;;
+        --memory_mapanything_confidence_percentile)
+            MEMORY_MAPANYTHING_CONFIDENCE_PERCENTILE="$2"
+            shift 2
+            ;;
+        --memory_mapanything_min_consistent_ratio)
+            MEMORY_MAPANYTHING_MIN_CONSISTENT_RATIO="$2"
+            shift 2
+            ;;
         --memory_align3r_root)
             MEMORY_ALIGN3R_ROOT="$2"
             shift 2
@@ -313,14 +329,14 @@ if [ -z "$TRAJ_TXT_PATH" ]; then
     exit 1
 fi
 if [ -z "$MEMORY_MAX_POINTS" ]; then
-    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
         MEMORY_MAX_POINTS="3000000"
     else
         MEMORY_MAX_POINTS="500000"
     fi
 fi
 if [ -z "$MEMORY_POINT_SIZE" ]; then
-    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
         MEMORY_POINT_SIZE="3"
     else
         MEMORY_POINT_SIZE="1"
@@ -330,11 +346,12 @@ if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] \
         && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3_1" ] \
-        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v4" ]; then
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v4" ] \
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v5" ]; then
     echo "Error: invalid --memory_map_mode"
     exit 1
 fi
-if [ "$MEMORY_DEPTH_BACKEND" != "da3" ] && [ "$MEMORY_DEPTH_BACKEND" != "align3r" ]; then
+if [ "$MEMORY_DEPTH_BACKEND" != "da3" ] && [ "$MEMORY_DEPTH_BACKEND" != "align3r" ] && [ "$MEMORY_DEPTH_BACKEND" != "mapanything" ]; then
     echo "Error: invalid --memory_depth_backend"
     exit 1
 fi
@@ -362,23 +379,31 @@ if [ "$MEMORY_MAP_MODE" = "dense_two_layer" ]; then
 fi
 if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3" ] \
         || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ] \
-        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
     if [ "$MEMORY_UPDATE_MODE" != "latent_keyframe" ]; then
         echo "Error: overlap-voxel modes require --memory_update_mode latent_keyframe"
         exit 1
     fi
-    if [ "$MEMORY_DEPTH_BACKEND" != "da3" ]; then
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
+        if [ "$MEMORY_DEPTH_BACKEND" != "mapanything" ] || [ -z "$MEMORY_MAPANYTHING_MODEL_PATH" ]; then
+            echo "Error: overlap_voxel_v5 requires mapanything and its local model path"
+            exit 1
+        fi
+    elif [ "$MEMORY_DEPTH_BACKEND" != "da3" ]; then
         echo "Error: overlap_voxel_v3/v4 require DA3"
         exit 1
     fi
     if [ "$MEMORY_MAP_MODE" != "overlap_voxel_v4" ] \
+            && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v5" ] \
             && [ "$MEMORY_ANCHOR_COUNT" != "1" ]; then
         echo "Error: multi-anchor V3 is reserved but not implemented"
         exit 1
     fi
-    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
+    if { [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
+            || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; } \
             && [ "$MEMORY_POINT_SIZE" != "3" ]; then
-        echo "Error: overlap_voxel_v4 requires --memory_point_size 3"
+        echo "Error: overlap_voxel_v4/v5 requires --memory_point_size 3"
         exit 1
     fi
     RENDER_BACKEND="ply"
@@ -432,7 +457,8 @@ echo "  Align3R memory work dir: ${MEMORY_ALIGN3R_WORK_DIR:-N/A}"
 echo "  Memory update mode: $MEMORY_UPDATE_MODE"
 echo "  Memory anchor count: $MEMORY_ANCHOR_COUNT (multi-anchor reserved)"
 if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ] \
-        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ]; then
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
     echo "  Memory voxel/max points/splat: adaptive / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
 else
     echo "  Memory voxel/max points/splat: $MEMORY_VOXEL_SIZE / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
@@ -617,6 +643,9 @@ if [ "$SKIP_STEP3" = false ]; then
         $([ -n "$MEMORY_DEPTH_DEVICE" ] && echo "--memory_depth_device $MEMORY_DEPTH_DEVICE") \
         --memory_update_mode "$MEMORY_UPDATE_MODE" \
         --memory_da3_model_path "$DA3_MODEL_PATH" \
+        $([ -n "$MEMORY_MAPANYTHING_MODEL_PATH" ] && echo "--memory_mapanything_model_path $MEMORY_MAPANYTHING_MODEL_PATH") \
+        --memory_mapanything_confidence_percentile "$MEMORY_MAPANYTHING_CONFIDENCE_PERCENTILE" \
+        --memory_mapanything_min_consistent_ratio "$MEMORY_MAPANYTHING_MIN_CONSISTENT_RATIO" \
         $([ -n "$MEMORY_ALIGN3R_PYTHON" ] && echo "--memory_align3r_python $MEMORY_ALIGN3R_PYTHON") \
         $([ -n "$MEMORY_ALIGN3R_ROOT" ] && echo "--memory_align3r_root $MEMORY_ALIGN3R_ROOT") \
         $([ -n "$MEMORY_ALIGN3R_WEIGHTS" ] && echo "--memory_align3r_weights $MEMORY_ALIGN3R_WEIGHTS") \

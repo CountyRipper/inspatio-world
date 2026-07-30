@@ -10,6 +10,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
+import torch.nn.functional as F
 from utils.historical_point_memory import (
     DenseGeneratedPointMemory,
     IncrementalVoxelSurfelMemory,
@@ -34,7 +35,7 @@ from utils.render_warper import convert_mask_video
 
 
 _OVERLAP_VOXEL_V3_MODES = {"overlap_voxel_v3", "overlap_voxel_v3_1"}
-_OVERLAP_VOXEL_MODES = {*_OVERLAP_VOXEL_V3_MODES, "overlap_voxel_v4"}
+_OVERLAP_VOXEL_MODES = {*_OVERLAP_VOXEL_V3_MODES, "overlap_voxel_v4", "overlap_voxel_v5"}
 
 
 def _synchronize(device: torch.device) -> None:
@@ -138,6 +139,9 @@ class HistoricalMemoryController:
         geometry_depth_ratio: float = 0.03,
         fps: int = 24,
         save_diagnostics: bool = True,
+        source_rgb_bcthw: Optional[torch.Tensor] = None,
+        source_c2w: Optional[torch.Tensor] = None,
+        mapanything_min_consistent_ratio: float = 0.01,
     ):
         if reference_rgb_bcthw.shape[0] != 1:
             raise ValueError("Historical memory baseline currently requires batch size 1")
@@ -149,6 +153,18 @@ class HistoricalMemoryController:
             if K.shape[0] != 1:
                 raise ValueError("Historical memory baseline currently requires batch size 1")
             K = K[0]
+        if source_rgb_bcthw is not None and source_rgb_bcthw.shape[0] != 1:
+            raise ValueError("MapAnything source RGB requires batch size 1")
+        if source_c2w is not None:
+            if source_c2w.ndim == 4:
+                if source_c2w.shape[0] != 1:
+                    raise ValueError("MapAnything source poses require batch size 1")
+                source_c2w = source_c2w[0]
+            if source_c2w.ndim != 3 or source_c2w.shape[-2:] != (4, 4):
+                raise ValueError(
+                    f"Expected source_c2w [T,4,4], got {tuple(source_c2w.shape)}"
+                )
+
 
         self.reference_rgb = reference_rgb_bcthw
         self.reference_mask = reference_mask_bcthw
@@ -161,6 +177,8 @@ class HistoricalMemoryController:
                 raise ValueError(
                     f"Expected reference depth [T,H,W], got {tuple(reference_depth_thw.shape)}"
                 )
+        self.source_rgb = source_rgb_bcthw
+        self.source_c2w = source_c2w
         self.reference_depth = reference_depth_thw
         self.target_c2w = target_c2w
         self.K = K
@@ -197,23 +215,28 @@ class HistoricalMemoryController:
         if memory_map_mode in _OVERLAP_VOXEL_MODES:
             if memory_update_mode != "latent_keyframe":
                 raise ValueError("overlap-voxel modes require latent_keyframe updates")
-            if self.depth_backend != "da3":
+            if memory_map_mode == "overlap_voxel_v5":
+                if self.depth_backend != "mapanything":
+                    raise ValueError("overlap_voxel_v5 requires MapAnything")
+                if self.source_rgb is None or self.source_c2w is None:
+                    raise ValueError("overlap_voxel_v5 requires source RGB and c2w")
+            elif self.depth_backend != "da3":
                 raise ValueError("overlap_voxel_v3/v4 currently requires DA3")
             if memory_map_mode in _OVERLAP_VOXEL_V3_MODES and memory_anchor_count != 1:
                 raise NotImplementedError(
                     "Multi-anchor DA3 windows are reserved but not implemented"
                 )
             if memory_map_mode in {
-                "overlap_voxel_v3_1", "overlap_voxel_v4"
+                "overlap_voxel_v3_1", "overlap_voxel_v4", "overlap_voxel_v5"
             } and adaptive_voxel_details is None:
                 raise ValueError(f"{memory_map_mode} requires adaptive voxel metadata")
-            if memory_map_mode == "overlap_voxel_v4":
+            if memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"}:
                 if not isinstance(memory, IncrementalVoxelSurfelMemory):
-                    raise TypeError("overlap_voxel_v4 requires voxel surfel memory")
+                    raise TypeError("overlap_voxel_v4/v5 requires voxel surfel memory")
                 if memory.splat_diameter != 3:
-                    raise ValueError("overlap_voxel_v4 requires a 3x3 point splat")
+                    raise ValueError("overlap_voxel_v4/v5 requires a 3x3 point splat")
                 if geometry_voxel_factor <= 0 or geometry_depth_ratio <= 0:
-                    raise ValueError("V4 geometry thresholds must be positive")
+                    raise ValueError("V4/V5 geometry thresholds must be positive")
         self.memory_update_mode = memory_update_mode
         self.memory_map_mode = memory_map_mode
         self.save_diagnostics = save_diagnostics
@@ -235,6 +258,10 @@ class HistoricalMemoryController:
         self.observed_keyframes = {}
         self.generated_latent_blocks = []
 
+        if not 0 <= mapanything_min_consistent_ratio <= 1:
+            raise ValueError("MapAnything minimum consistent ratio must be in [0,1]")
+        self.mapanything_min_consistent_ratio = float(mapanything_min_consistent_ratio)
+        self.mapanything_chunks = {}
 
         _, _, _, height, width = reference_rgb_bcthw.shape
         self.height = height
@@ -247,7 +274,7 @@ class HistoricalMemoryController:
         paths = {
             "pred": f"{output_prefix}-pred_video_rank{rank}.mp4",
         }
-        if save_diagnostics and memory_map_mode != "overlap_voxel_v4":
+        if save_diagnostics and memory_map_mode not in {"overlap_voxel_v4", "overlap_voxel_v5"}:
             paths.update({
                 "reference": f"{output_prefix}-reference_render_rank{rank}.mp4",
                 "historical": f"{output_prefix}-historical_render_rank{rank}.mp4",
@@ -410,7 +437,7 @@ class HistoricalMemoryController:
                 f"Block {block_index} requires RGB frames [{pixel_start}, {pixel_end}), "
                 f"but only {self.reference_rgb.shape[2]} are available"
             )
-        if self.memory_map_mode == "overlap_voxel_v4":
+        if self.memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"}:
             return self._condition_provider_v4(
                 block_index,
                 latent_start,
@@ -556,6 +583,16 @@ class HistoricalMemoryController:
         dit_ms: float,
     ) -> None:
         pixel_start, pixel_end = latent_block_to_pixel_span(latent_start, denoised_latent.shape[1])
+        if self.memory_map_mode == "overlap_voxel_v5":
+            self._output_callback_overlap_v5(
+                block_index=block_index,
+                latent_start=latent_start,
+                denoised_latent=denoised_latent,
+                pixel_start=pixel_start,
+                pixel_end=pixel_end,
+                dit_ms=dit_ms,
+            )
+            return
 
         if self.memory_map_mode == "overlap_voxel_v4":
             self._output_callback_overlap_v4(
@@ -783,6 +820,296 @@ class HistoricalMemoryController:
             "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
             **update_details,
         })
+
+    def _evaluate_mapanything_candidate(
+        self,
+        batch,
+        pred_slots: list[int],
+        frame_indices: tuple[int, ...],
+    ) -> tuple[float, torch.Tensor, dict, dict]:
+        """Score one MapAnything branch against immutable reference geometry."""
+        points = batch.points[pred_slots]
+        valid = batch.valid[pred_slots]
+        intrinsics = batch.intrinsics[pred_slots]
+        native_height, native_width = batch.processed_size
+        reference_depth = self.reference_depth[list(frame_indices)].to(
+            self.memory.device, dtype=torch.float32
+        )
+        reference_depth = F.interpolate(
+            reference_depth.unsqueeze(1),
+            size=(native_height, native_width),
+            mode="nearest",
+        ).squeeze(1)
+        reference_mask = (
+            self.reference_mask[0, 0, list(frame_indices)] > 0
+        ).float().unsqueeze(1)
+        reference_mask = F.interpolate(
+            reference_mask,
+            size=(native_height, native_width),
+            mode="nearest",
+        ).squeeze(1).bool().to(self.memory.device)
+
+        reference_points, reference_valid = [], []
+        for local_index, frame_index in enumerate(frame_indices):
+            frame_points, frame_valid = backproject_world_grid(
+                reference_depth[local_index],
+                intrinsics[local_index],
+                c2w=self.target_c2w[frame_index],
+            )
+            reference_points.append(frame_points)
+            reference_valid.append(frame_valid)
+        reference_points = torch.stack(reference_points)
+        reference_valid = torch.stack(reference_valid)
+
+        correspondence = valid & reference_valid & reference_mask
+        geometry_error = torch.linalg.norm(points - reference_points, dim=-1)
+        consistent_threshold = torch.maximum(
+            torch.full_like(
+                reference_depth,
+                self.geometry_voxel_factor * self.memory.voxel_size,
+            ),
+            self.geometry_depth_ratio * reference_depth,
+        )
+        consistent = (
+            correspondence
+            & torch.isfinite(geometry_error)
+            & (geometry_error <= consistent_threshold)
+        )
+        correspondence_count = int(correspondence.sum().item())
+        valid_error = geometry_error[correspondence]
+        median_error = (
+            float("inf")
+            if valid_error.numel() == 0
+            else float(valid_error.median().item())
+        )
+        consistent_ratio = float(
+            consistent.sum().item() / max(1, correspondence_count)
+        )
+        point_keep, point_stats = select_v4_runtime_points(
+            points,
+            reference_points,
+            valid,
+            reference_depth,
+            reference_valid,
+            reference_mask,
+            voxel_size=self.memory.voxel_size,
+            voxel_factor=self.geometry_voxel_factor,
+            relative_depth_ratio=self.geometry_depth_ratio,
+        )
+        point_stats = {
+            key.replace("da3", "mapanything"): value
+            for key, value in point_stats.items()
+        }
+        pose_metrics = [
+            pose_residual(
+                self.target_c2w[frame_index],
+                batch.camera_c2w[pred_slot],
+            )
+            for frame_index, pred_slot in zip(frame_indices, pred_slots)
+        ]
+        quality = {
+            "reference_correspondence_count": correspondence_count,
+            "reference_consistent_count": int(consistent.sum().item()),
+            "reference_consistent_ratio": consistent_ratio,
+            "reference_error_median": (
+                None if not np.isfinite(median_error) else median_error
+            ),
+            "reference_error_p90": (
+                None
+                if valid_error.numel() == 0
+                else float(torch.quantile(valid_error, 0.9).item())
+            ),
+            "pose_rotation_degrees_mean": float(
+                np.mean([item["rotation_degrees"] for item in pose_metrics])
+            ),
+            "pose_translation_mean": float(
+                np.mean([item["translation"] for item in pose_metrics])
+            ),
+        }
+        return median_error, point_keep, quality, point_stats
+
+    @torch.inference_mode()
+    def _output_callback_overlap_v5(
+        self,
+        *,
+        block_index: int,
+        latent_start: int,
+        denoised_latent: torch.Tensor,
+        pixel_start: int,
+        pixel_end: int,
+        dit_ms: float,
+    ) -> None:
+        """Build a bounded online map from paired source/pred MapAnything windows."""
+        self.generated_latent_blocks.append(denoised_latent.detach().cpu())
+        latent_prefix = torch.cat(self.generated_latent_blocks, dim=1)
+
+        _synchronize(self.block_decoder.device)
+        decode_started = time.perf_counter()
+        decoded_prefix = self.block_decoder.decode_prefix(latent_prefix)
+        _synchronize(self.block_decoder.device)
+        decode_ms = (time.perf_counter() - decode_started) * 1000.0
+        if decoded_prefix.shape[1] != pixel_end:
+            raise RuntimeError(
+                f"V5 prefix decoder returned {decoded_prefix.shape[1]} frames, "
+                f"expected {pixel_end}"
+            )
+        self.writers["pred"].write(decoded_prefix[0, pixel_start:pixel_end])
+
+        frame_indices = latent_keyframe_indices(
+            latent_start, denoised_latent.shape[1]
+        )
+        pred_keyframes = decoded_prefix[0, list(frame_indices)].float()
+        source_keyframes = (
+            self.source_rgb[0, :, list(frame_indices)]
+            .permute(1, 0, 2, 3)
+            .float().add(1).mul(0.5).clamp(0, 1)
+        )
+        self._write_v4_video(block_index, "post_source_keyframes.mp4", source_keyframes)
+        self._write_v4_video(block_index, "post_pred_keyframes.mp4", pred_keyframes)
+
+        target_poses = self.target_c2w[list(frame_indices)]
+        source_poses = self.source_c2w[list(frame_indices)].to(
+            self.memory.device, dtype=torch.float32
+        )
+        repeated_k = self.K.unsqueeze(0).repeat(len(frame_indices), 1, 1)
+        paired_rgb = torch.stack((source_keyframes, pred_keyframes), dim=1).flatten(0, 1)
+        paired_poses = torch.stack((source_poses, target_poses), dim=1).flatten(0, 1)
+        paired_k = self.K.unsqueeze(0).repeat(paired_rgb.shape[0], 1, 1)
+
+        mapanything_started = time.perf_counter()
+        pred_batch = self.depth_estimator.estimate_views(
+            pred_keyframes,
+            intrinsics_t33=repeated_k,
+            camera_c2w_t44=target_poses,
+            output_device=self.memory.device,
+        )
+        paired_batch = self.depth_estimator.estimate_views(
+            paired_rgb,
+            intrinsics_t33=paired_k,
+            camera_c2w_t44=paired_poses,
+            output_device=self.memory.device,
+        )
+        _synchronize(self.depth_estimator.device)
+        mapanything_ms = (time.perf_counter() - mapanything_started) * 1000.0
+
+        pred_score, pred_keep, pred_quality, pred_point_stats = (
+            self._evaluate_mapanything_candidate(
+                pred_batch, list(range(len(frame_indices))), frame_indices
+            )
+        )
+        paired_slots = list(range(1, paired_rgb.shape[0], 2))
+        paired_score, paired_keep, paired_quality, paired_point_stats = (
+            self._evaluate_mapanything_candidate(
+                paired_batch, paired_slots, frame_indices
+            )
+        )
+        if paired_score < pred_score:
+            selected_name = "paired"
+            selected_batch = paired_batch
+            selected_slots = paired_slots
+            selected_keep = paired_keep
+            selected_quality = paired_quality
+            selected_point_stats = paired_point_stats
+        else:
+            selected_name = "pred_only"
+            selected_batch = pred_batch
+            selected_slots = list(range(len(frame_indices)))
+            selected_keep = pred_keep
+            selected_quality = pred_quality
+            selected_point_stats = pred_point_stats
+
+        accepted = (
+            selected_quality["reference_consistent_ratio"]
+            >= self.mapanything_min_consistent_ratio
+        )
+        update_stats = {
+            "raw_valid_points": 0,
+            "batch_voxels": 0,
+            "points_before": self.memory.point_count,
+            "points_after": self.memory.point_count,
+            "evicted_voxels": 0,
+        }
+        fusion_started = time.perf_counter()
+        if accepted:
+            selected_points = selected_batch.points[selected_slots]
+            selected_colors = selected_batch.colors[selected_slots]
+            for local_index, frame_index in enumerate(frame_indices):
+                keep = selected_keep[local_index]
+                self.mapanything_chunks[int(frame_index)] = (
+                    selected_points[local_index][keep].detach().cpu(),
+                    selected_colors[local_index][keep].detach().cpu(),
+                )
+            chunk_points = [item[0] for item in self.mapanything_chunks.values()]
+            chunk_colors = [item[1] for item in self.mapanything_chunks.values()]
+            candidate_map = self.memory.empty_like()
+            update_stats = candidate_map.update_points(
+                torch.cat(chunk_points, dim=0),
+                torch.cat(chunk_colors, dim=0),
+            )
+            self.memory = candidate_map
+            self.observed_keyframes.update({
+                int(frame_index): selected_batch.camera_c2w[pred_slot].detach().cpu()
+                for frame_index, pred_slot in zip(frame_indices, selected_slots)
+            })
+        _synchronize(self.memory.device)
+        voxel_fusion_ms = (time.perf_counter() - fusion_started) * 1000.0
+
+        block_dir = self._v4_block_dir(block_index)
+        save_started = time.perf_counter()
+        self.memory.save_ply(os.path.join(block_dir, "post_point_map.ply"))
+        np.savez_compressed(
+            os.path.join(block_dir, "post_mapanything_cameras.npz"),
+            frame_indices=np.asarray(frame_indices, dtype=np.int64),
+            source_c2w=source_poses.detach().cpu().numpy().astype(np.float32),
+            planned_c2w=target_poses.detach().cpu().numpy().astype(np.float32),
+            pred_only_c2w=pred_batch.camera_c2w.detach().cpu().numpy().astype(np.float32),
+            paired_pred_c2w=paired_batch.camera_c2w[paired_slots]
+            .detach().cpu().numpy().astype(np.float32),
+            selected_branch=np.asarray(selected_name),
+            accepted=np.asarray(accepted),
+        )
+        pointcloud_save_ms = (time.perf_counter() - save_started) * 1000.0
+
+        metric = self._metric_for_block(block_index)
+        cuda_allocated_peak_gb, cuda_reserved_peak_gb = _cuda_peak_gb(
+            self.memory.device
+        )
+        metric.update({
+            "dit_ms": float(dit_ms),
+            "decode_ms": decode_ms,
+            "depth_backend": self.depth_backend,
+            "depth_estimation_ms": mapanything_ms,
+            "mapanything_ms": mapanything_ms,
+            "mapanything_window_frames": list(frame_indices),
+            "mapanything_input_views_pred_only": len(frame_indices),
+            "mapanything_input_views_paired": paired_rgb.shape[0],
+            "mapanything_selected_branch": selected_name,
+            "mapanything_block_accepted": accepted,
+            "mapanything_min_consistent_ratio": self.mapanything_min_consistent_ratio,
+            "pred_only_quality": pred_quality,
+            "paired_quality": paired_quality,
+            "voxel_size": self.memory.voxel_size,
+            "voxel_count": self.memory.point_count,
+            "accepted_frame_chunks": len(self.mapanything_chunks),
+            "voxel_fusion_ms": voxel_fusion_ms,
+            "pointcloud_save_ms": pointcloud_save_ms,
+            "memory_update_ms": voxel_fusion_ms,
+            "pointcloud_total_ms": mapanything_ms + voxel_fusion_ms,
+            "memory_update_mode": self.memory_update_mode,
+            "memory_map_mode": self.memory_map_mode,
+            "memory_write_contract": "bounded_current_block_source+pred_joint_pred_points_only",
+            "mapanything_peak_memory_gb": float(
+                getattr(self.depth_estimator, "last_peak_memory_gb", 0.0)
+            ),
+            "depth_backend_peak_memory_gb": float(
+                getattr(self.depth_estimator, "last_peak_memory_gb", 0.0)
+            ),
+            "cuda_allocated_peak_gb": cuda_allocated_peak_gb,
+            "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
+            **selected_point_stats,
+            **update_stats,
+        })
+        self._write_v4_metrics(block_index, metric)
 
     @torch.inference_mode()
     def _output_callback_overlap_v4(
@@ -1293,7 +1620,7 @@ class HistoricalMemoryController:
         for writer in self.writers.values():
             writer.close()
 
-        if self.memory_map_mode == "overlap_voxel_v4":
+        if self.memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"}:
             return self.summary()
 
         if self.memory_map_mode in _OVERLAP_VOXEL_MODES:
@@ -1401,9 +1728,13 @@ class HistoricalMemoryController:
             "online_total_ms": online_ms,
             "online_fps": output_frames / (online_ms / 1000.0) if online_ms > 0 else 0.0,
             "accepted_blocks": int(sum(
-                bool(block.get("registration_accepted", False))
+                bool(block.get(
+                    "mapanything_block_accepted",
+                    block.get("registration_accepted", False),
+                ))
                 for block in self.metrics
             )),
+            "mapanything_ms": float(sum(float(block.get("mapanything_ms", 0.0)) for block in self.metrics)),
             **stage_totals,
             **extra_v3_totals,
         }
