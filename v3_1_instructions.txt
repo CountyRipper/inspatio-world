@@ -5,7 +5,7 @@ dense yaw 0 -> 45 -> 0 -> 45 controls:
 
   cd /data4/daixiangting/inspatio-world
   GPU=2 OUTPUT_ROOT=/data4/daixiangting/inspatio_v3_1_results \
-    bash run_overlap_voxel_v3_1_server15.sh
+    bash run_scripts/run_overlap_voxel_v3_1_server15.sh
 
 Optional controls:
 

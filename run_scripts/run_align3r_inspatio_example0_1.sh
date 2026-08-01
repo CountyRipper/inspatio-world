@@ -6,7 +6,7 @@ set -euo pipefail
 # reconstructed with every consecutive frame, adapted to InSpatio's geometry
 # interface, rendered along 0->45->0->45 yaw, and passed through STAR/JDMD.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_ROOT="${SERVER_ROOT:-/mnt/16T2/daixiangting}"
 WORK_ROOT="${WORK_ROOT:-${SERVER_ROOT}/tmp/align3r_inspatio_example0_1_237f_20260724}"
 INPUT_DIR="${INPUT_DIR:-${WORK_ROOT}/official_example0_1_24fps_237f}"
@@ -156,7 +156,7 @@ run_align3r example0 "$INPUT_DIR/example0.mp4"
 run_align3r example1 "$INPUT_DIR/example1.mp4"
 
 PATH="${INSPATIO_ENV}/bin:${PATH}" CUDA_DEVICE_ORDER=PCI_BUS_ID \
-    bash "$SCRIPT_DIR/run_test_pipeline.sh" \
+    bash "$SCRIPT_DIR/run_scripts/run_test_pipeline.sh" \
     --input_dir "$INPUT_DIR" \
     --traj_txt_path "$TRAJECTORY" \
     --skip_step1 \

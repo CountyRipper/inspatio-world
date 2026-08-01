@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_ROOT="${SERVER_ROOT:-/mnt/16T2/daixiangting}"
 V21_ROOT="${V21_ROOT:-${SERVER_ROOT}/tmp/dense_memory_baseline_v2_1_full_gpu0_20260723}"
 WORK_ROOT="${WORK_ROOT:-${SERVER_ROOT}/tmp/align3r_full_frames_example0_1_237f_20260724}"

@@ -5,7 +5,7 @@ set -euo pipefail
 # replace DA3 generated-block depth with a persistent Align3R worker. Every
 # decoded RGB frame is written to M_gen and fused into subsequent STAR blocks.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_ROOT="${SERVER_ROOT:-/mnt/16T2/daixiangting}"
 V21_ROOT="${V21_ROOT:-${SERVER_ROOT}/tmp/dense_memory_baseline_v2_1_full_gpu0_20260723}"
 WORK_ROOT="${WORK_ROOT:-${SERVER_ROOT}/tmp/dense_memory_baseline_v2_2_align3r_fullblock_20260724}"
@@ -95,7 +95,7 @@ if [ "$ALIGN3R_DISABLE_CUROPE" = true ]; then
 fi
 
 CUDA_DEVICE_ORDER=PCI_BUS_ID PATH="${INSPATIO_ENV}/bin:${PATH}" \
-    bash "$SCRIPT_DIR/run_test_pipeline.sh" \
+    bash "$SCRIPT_DIR/run_scripts/run_test_pipeline.sh" \
     --input_dir "$INPUT_DIR" \
     --traj_txt_path "$TRAJECTORY" \
     --skip_step1 \

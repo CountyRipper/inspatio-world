@@ -31,7 +31,7 @@ run_case() {
     mkdir -p "${output_dir}"
 
     /usr/bin/time -v -o "${output_dir}/pipeline_resource_time.txt" \
-        bash run_test_pipeline.sh \
+        bash "${PROJECT_ROOT}/run_scripts/run_test_pipeline.sh" \
         --input_dir "${input_dir}" \
         --traj_txt_path "${trajectory}" \
         --output_folder "${output_dir}" \

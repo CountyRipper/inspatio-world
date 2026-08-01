@@ -8,7 +8,7 @@ set -e
 #   Step 3: Run v2v model inference
 #
 # Usage:
-#   bash run_test_pipeline.sh \
+#   bash run_scripts/run_test_pipeline.sh \
 #     --input_dir ./test_input \
 #     --traj_txt_path ./traj/y_left_30.txt \
 #     --checkpoint_path ./checkpoints/InSpatio-World/InSpatio-World.safetensors
@@ -57,7 +57,7 @@ set -e
 #   --render_backend      (optional) Rendering backend: warper (default, no point-cloud save) or ply
 ##############################################################################
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Default arguments
 STEP1_GPUS="0"

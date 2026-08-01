@@ -72,7 +72,7 @@ The full pipeline runs in three steps:
 All steps are wrapped in a single script:
 
 ```bash
-bash run_test_pipeline.sh \
+bash run_scripts/run_test_pipeline.sh \
   --input_dir ./test/example \
   --traj_txt_path ./traj/x_y_circle_cycle.txt 
 ```
@@ -85,7 +85,7 @@ mkdir -p my_videos
 cp your_video.mp4 my_videos/
 
 # 2. Run the full pipeline
-bash run_test_pipeline.sh \
+bash run_scripts/run_test_pipeline.sh \
   --input_dir ./my_videos \
   --traj_txt_path ./traj/x_y_circle_cycle.txt
 
@@ -151,7 +151,7 @@ A trajectory file is a plain text file with **3 lines**, each containing space-s
 If Step 1 or Step 2 outputs already exist, you can skip them:
 
 ```bash
-bash run_test_pipeline.sh \
+bash run_scripts/run_test_pipeline.sh \
   --input_dir ./my_videos \
   --traj_txt_path ./traj/x_y_circle_cycle.txt \
   --skip_step1 --skip_step2
@@ -160,7 +160,7 @@ bash run_test_pipeline.sh \
 ### Generate Temporal Control Videos
 
 ```bash
-bash run_test_pipeline.sh \
+bash run_scripts/run_test_pipeline.sh \
   --input_dir ./test/example \
   --traj_txt_path ./traj/x_y_circle_cycle.txt \
   --freeze_repeat 150 \
@@ -173,7 +173,7 @@ You can control the time-stop behavior using two specific parameters: use `--fre
 ### Autonomous Driving Applications
 
 ```bash
-bash run_test_pipeline.sh \
+bash run_scripts/run_test_pipeline.sh \
   --input_dir ./test/example3 \
   --traj_txt_path ./traj/x_y_circle_cycle.txt \
   --relative_to_source \
@@ -184,7 +184,7 @@ bash run_test_pipeline.sh \
 ### Speed Up
 
 ```bash
-bash run_test_pipeline.sh \
+bash run_scripts/run_test_pipeline.sh \
   --input_dir ./test/example \
   --traj_txt_path ./traj/x_y_circle_cycle.txt \
   --use_tae \

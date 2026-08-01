@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 MEMORY_WRITE_MODE="${MEMORY_WRITE_MODE:-latent_keyframe}"
 GPU="${GPU:-0}"
@@ -66,7 +66,7 @@ echo "  Map RGB frames:    $EXPECTED_MAP_FRAMES per video"
 echo "  GPU:               $GPU"
 echo "============================================"
 
-bash "$SCRIPT_DIR/run_test_pipeline.sh" \
+bash "$SCRIPT_DIR/run_scripts/run_test_pipeline.sh" \
     --input_dir "$INPUT_DIR" \
     --traj_txt_path "$TRAJECTORY" \
     --rotation_only \
