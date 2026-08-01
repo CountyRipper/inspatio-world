@@ -1,0 +1,56 @@
+import numpy as np
+import torch
+
+from scripts.build_slam3r_offline_v6_2 import (
+    apply_sim3,
+    best_confidence_voxels,
+    strict_reference_priority_fusion,
+    weighted_umeyama,
+)
+
+
+def test_weighted_umeyama_recovers_known_sim3():
+    rng = np.random.default_rng(7)
+    source = rng.normal(size=(200, 3))
+    angle = np.deg2rad(23.0)
+    rotation = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    target = apply_sim3(source, 1.7, rotation, np.array([0.2, -0.4, 1.1]))
+    scale_fit, rotation_fit, translation_fit = weighted_umeyama(source, target)
+    reconstructed = apply_sim3(source, scale_fit, rotation_fit, translation_fit)
+    np.testing.assert_allclose(reconstructed, target, atol=1e-8)
+
+
+def test_voxel_map_keeps_highest_confidence_observation_without_averaging():
+    points = np.array([[0.01, 0.01, 0.01], [0.09, 0.02, 0.01], [0.21, 0.0, 0.0]])
+    colors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    confidence = np.array([2.0, 9.0, 3.0])
+    source_ids = np.array([0, 1, 2])
+    result = best_confidence_voxels(
+        points, colors, confidence, source_ids, voxel_size=0.1
+    )
+    kept_points, kept_colors, kept_confidence, kept_source_ids = result
+    assert kept_points.shape[0] == 2
+    selected = np.flatnonzero(kept_source_ids == 1)
+    assert selected.size == 1
+    np.testing.assert_array_equal(kept_points[selected[0]], points[1])
+    np.testing.assert_array_equal(kept_colors[selected[0]], colors[1])
+    assert kept_confidence[selected[0]] == 9.0
+
+
+def test_reference_priority_and_black_invalid_pixels():
+    reference_rgb = torch.tensor([[[[0.8, 0.7, 0.6]]]]).expand(-1, 3, -1, -1).clone()
+    historical_rgb = torch.tensor([[[[0.2, 0.3, 0.4]]]]).expand(-1, 3, -1, -1).clone()
+    reference_mask = torch.tensor([[[[True, False, False]]]])
+    historical_mask = torch.tensor([[[[True, True, False]]]])
+    fused, fused_mask, historical_add = strict_reference_priority_fusion(
+        reference_rgb, reference_mask, historical_rgb, historical_mask
+    )
+    assert torch.equal(fused_mask, torch.tensor([[[[True, True, False]]]]))
+    assert torch.equal(historical_add, torch.tensor([[[[False, True, False]]]]))
+    torch.testing.assert_close(fused[..., 0], reference_rgb[..., 0])
+    torch.testing.assert_close(fused[..., 1], historical_rgb[..., 1])
+    torch.testing.assert_close(fused[..., 2], torch.zeros_like(fused[..., 2]))
