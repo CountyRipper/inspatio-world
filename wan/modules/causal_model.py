@@ -22,6 +22,7 @@ import torch.distributed as dist
 import time
 import copy
 from einops import rearrange
+from phase1_lsm.adapter import MemoryPatchAdapter
 
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
@@ -290,6 +291,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        if dim != 1536 or tuple(patch_size) != (1, 2, 2):
+            raise ValueError(
+                "Phase 1 MemoryPatchAdapter requires dim=1536 and patch_size=(1,2,2)"
+            )
+        self.memory_adapter = MemoryPatchAdapter()
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
             nn.Linear(dim, dim))
@@ -343,6 +349,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_size=(0,0),
         image_latent_input: torch.Tensor = None,
         render_latent_input: torch.Tensor = None,
+        memory_condition: torch.Tensor = None,
         freqs_offset: int = 0,
     ):
         r"""
@@ -400,6 +407,15 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        if memory_condition is not None:
+            if kv_size[1] < 0:
+                raise AssertionError("memory adapter is disabled for cache-fill passes")
+            if memory_condition.shape[0] != len(x):
+                raise ValueError("memory_condition batch does not match the denoising query")
+            memory_x = [self.memory_adapter(u.unsqueeze(0)) for u in memory_condition]
+            if any(base.shape != memory.shape for base, memory in zip(x, memory_x)):
+                raise ValueError("memory_condition spatial/temporal shape does not match query")
+            x = [base + memory for base, memory in zip(x, memory_x)]
         grid_sizes = torch.stack([
             torch.as_tensor(u.shape[2:], dtype=torch.long, device=u.device)
             for u in x

@@ -29,3 +29,6 @@ dist/
 build/
 *.so
 .env
+
+# Phase 1 LSM adapter generated data, checkpoints, plots, and run records
+/artifacts/phase1_lsm/

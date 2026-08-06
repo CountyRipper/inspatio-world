@@ -22,6 +22,9 @@ def denoise_block(
     denoising_kv_size=0,
     denoising_kv_size_0=0,
     denoising_steps=None,
+    memory_condition=None,
+    transition_noises=None,
+    step_callback=None,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -49,6 +52,7 @@ def denoise_block(
     for index, current_timestep in enumerate(denoising_steps):
         is_last_step = (index == len(denoising_steps) - 1)
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
+        step_input = noisy_input.detach()
 
         ctx = torch.no_grad() if not is_last_step else nullcontext()
         with ctx:
@@ -59,18 +63,33 @@ def denoise_block(
                 kv_cache=kv_cache,
                 kv_size=(denoising_kv_size_0, denoising_kv_size),
                 render_latent_input=render_block,
+                memory_condition=memory_condition,
                 freqs_offset=6,
             )
 
+        transition_noise = None
         if is_last_step:
             noise_before_last_step = noisy_input.clone()
         else:
             next_t = denoising_steps[index + 1]
+            if transition_noises is None:
+                transition_noise = torch.randn_like(denoised_pred.flatten(0, 1))
+            else:
+                transition_noise = transition_noises[index].to(device=device, dtype=dtype)
+                transition_noise = transition_noise.flatten(0, 1)
             noisy_input = scheduler.add_noise(
                 denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
+                transition_noise,
                 next_t * torch.ones([B * F], device=device, dtype=torch.long)
             ).unflatten(0, denoised_pred.shape[:2])
+
+        if step_callback is not None:
+            step_callback(
+                step_index=index,
+                timestep=float(current_timestep),
+                noisy_input=step_input,
+                transition_noise=None if transition_noise is None else transition_noise.unflatten(0, (B, F)),
+            )
 
     return denoised_pred, noise_before_last_step
 
@@ -132,6 +151,8 @@ class CausalInferencePipeline(torch.nn.Module):
         decode: bool = True,
         block_condition_provider: Optional[Callable[[int, int, int], Tuple[torch.Tensor, torch.Tensor]]] = None,
         block_output_callback: Optional[Callable[..., None]] = None,
+        block_memory_provider: Optional[Callable[[int, int, int], torch.Tensor]] = None,
+        block_step_callback: Optional[Callable[..., None]] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -231,6 +252,18 @@ class CausalInferencePipeline(torch.nn.Module):
                 render_block=render_block,
                 denoising_kv_size=kv_size,
                 denoising_steps=self.denoising_step_list,
+                memory_condition=(
+                    None
+                    if block_memory_provider is None
+                    else block_memory_provider(block_index, start_index, num_block_frame).to(
+                        device=noise.device, dtype=noise.dtype
+                    )
+                ),
+                step_callback=(
+                    None
+                    if block_step_callback is None
+                    else lambda **step: block_step_callback(block_index=block_index, **step)
+                ),
             )
 
             if block_output_callback is not None and noisy_input.is_cuda:

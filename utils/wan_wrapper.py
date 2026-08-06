@@ -294,6 +294,11 @@ class WanDiffusionWrapper(torch.nn.Module):
                 missing_keys, unexpected_keys = self.model.load_state_dict(state_dict_full, strict=False)
                 print(f"load_model {model_path} (primary) missing_keys: {len(missing_keys)} unexpected_keys: {len(unexpected_keys)}")
 
+            if is_causal:
+                # The model is constructed on meta then materialized with to_empty(),
+                # so explicitly restore the Phase 1 adapter's required zero init.
+                self.model.memory_adapter.reset_parameters()
+
             # Load secondary model (only for dual_model and non-causal mode)
             if dual_model and not is_causal and state_dict_full_2 is not None:
                 state_dict_full_2, _ = _filter_state_dict_keys(state_dict_full_2, skip_substrings=filter_list)
@@ -373,6 +378,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         kv_size: Optional[Tuple[int, int]] = (0, 0),
         image_latent_input: Optional[torch.Tensor] = None,
         render_latent_input: Optional[torch.Tensor] = None,
+        memory_condition: Optional[torch.Tensor] = None,
         freqs_offset: int = 0,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -387,6 +393,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         # Handle None inputs for T2V mode
         image_latent_permuted = image_latent_input.permute(0, 2, 1, 3, 4).contiguous() if image_latent_input is not None else None
         render_latent_permuted = render_latent_input.permute(0, 2, 1, 3, 4).contiguous() if render_latent_input is not None else None
+        if memory_condition is not None and self.uniform_timestep:
+            raise ValueError("memory_condition is only supported by the causal model")
+        memory_condition_permuted = memory_condition.permute(0, 2, 1, 3, 4).contiguous() if memory_condition is not None else None
 
         if kv_cache is not None:
             assert(not self.dual_model), "KV cache is not supported for dual-model mode"
@@ -399,6 +408,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_size=kv_size,
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
+                memory_condition=memory_condition_permuted,
                 freqs_offset=freqs_offset,
             ).permute(0, 2, 1, 3, 4)
             if kv_size[1]<0:
@@ -412,13 +422,18 @@ class WanDiffusionWrapper(torch.nn.Module):
             else:
                 selected_model = self.model
 
+            model_kwargs = {
+                "image_latent_input": image_latent_permuted,
+                "render_latent_input": render_latent_permuted,
+                "freqs_offset": freqs_offset,
+            }
+            if not self.uniform_timestep:
+                model_kwargs["memory_condition"] = memory_condition_permuted
             flow_pred = selected_model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
-                image_latent_input=image_latent_permuted,
-                render_latent_input=render_latent_permuted,
-                freqs_offset=freqs_offset,
+                **model_kwargs,
             ).permute(0, 2, 1, 3, 4)
 
 
