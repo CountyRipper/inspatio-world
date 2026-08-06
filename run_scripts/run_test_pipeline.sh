@@ -38,7 +38,7 @@ set -e
 #   --compile_dit         (optional) Apply torch.compile to the DiT model
 #   --historical_memory   (optional) Enable training-free historical RGB point memory
 #   --memory_depth_backend (optional) da3, align3r, or mapanything (default: da3)
-#   --memory_map_mode     (optional) also supports overlap_voxel_v4 and overlap_voxel_v5
+#   --memory_map_mode     (optional) also supports overlap_voxel_v3_2, v4, and v5
 #   --memory_depth_device (optional) Logical CUDA device for memory DA3
 #   --memory_mapanything_model_path (required for overlap_voxel_v5)
 #   --memory_update_mode  (optional) keyframe, latent_keyframe, or full_block (default: keyframe)
@@ -49,6 +49,7 @@ set -e
 #   --memory_geometry_voxel_factor (optional) V4 voxel tolerance multiplier (default: 2.0)
 #   --memory_geometry_depth_ratio (optional) V4 relative-depth tolerance (default: 0.03)
 #   --memory_anchor_count (optional) V3 DA3 anchor count; only 1 is implemented
+#   --memory_single_keyframe_index (required for V3.2) sole RGB keyframe index
 #   --disable_memory_diagnostics (optional) Disable historical/fused diagnostic videos
 #   --profile_blocks      (optional) Save per-block DiT timing
 #   --save_denoised_latents (optional) Save final denoised latent tensor
@@ -103,6 +104,7 @@ MEMORY_VOXEL_TARGET_PIXELS="3.0"
 MEMORY_MAX_POINTS=""
 MEMORY_POINT_SIZE=""
 MEMORY_ANCHOR_COUNT="1"
+MEMORY_SINGLE_KEYFRAME_INDEX=""
 MEMORY_GEOMETRY_VOXEL_FACTOR="2.0"
 MEMORY_GEOMETRY_DEPTH_RATIO="0.03"
 MEMORY_DIAGNOSTICS=true
@@ -296,6 +298,10 @@ while [[ $# -gt 0 ]]; do
             MEMORY_ANCHOR_COUNT="$2"
             shift 2
             ;;
+        --memory_single_keyframe_index)
+            MEMORY_SINGLE_KEYFRAME_INDEX="$2"
+            shift 2
+            ;;
         --disable_memory_diagnostics)
             MEMORY_DIAGNOSTICS=false
             shift
@@ -346,6 +352,7 @@ if [ "$MEMORY_MAP_MODE" != "bounded_voxel" ] \
         && [ "$MEMORY_MAP_MODE" != "dense_two_layer" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3_1" ] \
+        && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v3_2" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v4" ] \
         && [ "$MEMORY_MAP_MODE" != "overlap_voxel_v5" ]; then
     echo "Error: invalid --memory_map_mode"
@@ -379,10 +386,17 @@ if [ "$MEMORY_MAP_MODE" = "dense_two_layer" ]; then
 fi
 if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3" ] \
         || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_2" ] \
         || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
         || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
     if [ "$MEMORY_UPDATE_MODE" != "latent_keyframe" ]; then
         echo "Error: overlap-voxel modes require --memory_update_mode latent_keyframe"
+        exit 1
+    fi
+    if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_2" ] \
+            && { [ -z "$MEMORY_SINGLE_KEYFRAME_INDEX" ] \
+            || ! [[ "$MEMORY_SINGLE_KEYFRAME_INDEX" =~ ^[0-9]+$ ]]; }; then
+        echo "Error: overlap_voxel_v3_2 requires a non-negative --memory_single_keyframe_index"
         exit 1
     fi
     if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
@@ -456,7 +470,9 @@ echo "  Align3R memory GPU: ${MEMORY_ALIGN3R_GPU:-N/A}"
 echo "  Align3R memory work dir: ${MEMORY_ALIGN3R_WORK_DIR:-N/A}"
 echo "  Memory update mode: $MEMORY_UPDATE_MODE"
 echo "  Memory anchor count: $MEMORY_ANCHOR_COUNT (multi-anchor reserved)"
+echo "  Memory single keyframe: ${MEMORY_SINGLE_KEYFRAME_INDEX:-N/A}"
 if [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_1" ] \
+        || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v3_2" ] \
         || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v4" ] \
         || [ "$MEMORY_MAP_MODE" = "overlap_voxel_v5" ]; then
     echo "  Memory voxel/max points/splat: adaptive / $MEMORY_MAX_POINTS / $MEMORY_POINT_SIZE"
@@ -659,6 +675,7 @@ if [ "$SKIP_STEP3" = false ]; then
         --memory_max_points "$MEMORY_MAX_POINTS" \
         --memory_point_size "$MEMORY_POINT_SIZE" \
         --memory_anchor_count "$MEMORY_ANCHOR_COUNT" \
+        $([ -n "$MEMORY_SINGLE_KEYFRAME_INDEX" ] && echo "--memory_single_keyframe_index $MEMORY_SINGLE_KEYFRAME_INDEX") \
         --memory_geometry_voxel_factor "$MEMORY_GEOMETRY_VOXEL_FACTOR" \
         --memory_geometry_depth_ratio "$MEMORY_GEOMETRY_DEPTH_RATIO" \
         $([ "$MEMORY_DIAGNOSTICS" = false ] && echo "--disable_memory_diagnostics") \

@@ -34,8 +34,15 @@ from utils.overlap_da3_registration import (
 from utils.render_warper import convert_mask_video
 
 
-_OVERLAP_VOXEL_V3_MODES = {"overlap_voxel_v3", "overlap_voxel_v3_1"}
+_OVERLAP_VOXEL_V3_MODES = {
+    "overlap_voxel_v3", "overlap_voxel_v3_1", "overlap_voxel_v3_2",
+}
 _OVERLAP_VOXEL_MODES = {*_OVERLAP_VOXEL_V3_MODES, "overlap_voxel_v4", "overlap_voxel_v5"}
+_ADAPTIVE_OVERLAP_VOXEL_MODES = {
+    "overlap_voxel_v3_1", "overlap_voxel_v3_2",
+    "overlap_voxel_v4", "overlap_voxel_v5",
+}
+_CONTINUOUS_V3_READ_MODES = {"overlap_voxel_v3_1", "overlap_voxel_v3_2"}
 
 
 def _synchronize(device: torch.device) -> None:
@@ -142,6 +149,7 @@ class HistoricalMemoryController:
         source_rgb_bcthw: Optional[torch.Tensor] = None,
         source_c2w: Optional[torch.Tensor] = None,
         mapanything_min_consistent_ratio: float = 0.01,
+        memory_single_keyframe_index: Optional[int] = None,
     ):
         if reference_rgb_bcthw.shape[0] != 1:
             raise ValueError("Historical memory baseline currently requires batch size 1")
@@ -226,9 +234,8 @@ class HistoricalMemoryController:
                 raise NotImplementedError(
                     "Multi-anchor DA3 windows are reserved but not implemented"
                 )
-            if memory_map_mode in {
-                "overlap_voxel_v3_1", "overlap_voxel_v4", "overlap_voxel_v5"
-            } and adaptive_voxel_details is None:
+            if memory_map_mode in _ADAPTIVE_OVERLAP_VOXEL_MODES \
+                    and adaptive_voxel_details is None:
                 raise ValueError(f"{memory_map_mode} requires adaptive voxel metadata")
             if memory_map_mode in {"overlap_voxel_v4", "overlap_voxel_v5"}:
                 if not isinstance(memory, IncrementalVoxelSurfelMemory):
@@ -257,6 +264,18 @@ class HistoricalMemoryController:
         self.previous_da3_focal = None
         self.observed_keyframes = {}
         self.generated_latent_blocks = []
+        self.memory_single_keyframe_index = memory_single_keyframe_index
+        self.single_keyframe_attempted = False
+        self.single_keyframe_written = False
+        if self.memory_map_mode == "overlap_voxel_v3_2":
+            if memory_single_keyframe_index is None:
+                raise ValueError(
+                    "overlap_voxel_v3_2 requires memory_single_keyframe_index"
+                )
+            if not 0 <= memory_single_keyframe_index < target_c2w.shape[0]:
+                raise ValueError(
+                    "memory_single_keyframe_index must address a target RGB frame"
+                )
 
         if not 0 <= mapanything_min_consistent_ratio <= 1:
             raise ValueError("MapAnything minimum consistent ratio must be in [0,1]")
@@ -457,17 +476,17 @@ class HistoricalMemoryController:
         poses = self.target_c2w[pixel_start:pixel_end]
         points_before_read = self.memory.point_count
         points_after_previous_block = 0
-        if self.memory_map_mode == "overlap_voxel_v3_1":
+        if self.memory_map_mode in _CONTINUOUS_V3_READ_MODES:
             if block_index > 0:
                 previous_metric = self._metric_for_block(block_index - 1)
                 if "points_after" not in previous_metric:
                     raise AssertionError(
-                        "V3.1 memory read occurred before the previous block write"
+                        f"{self.memory_map_mode} memory read occurred before the previous block write"
                     )
                 points_after_previous_block = int(previous_metric["points_after"])
             if points_before_read != points_after_previous_block:
                 raise AssertionError(
-                    "V3.1 GPU map continuity failed: "
+                    f"{self.memory_map_mode} GPU map continuity failed: "
                     f"read={points_before_read}, previous_write={points_after_previous_block}"
                 )
 
@@ -495,9 +514,11 @@ class HistoricalMemoryController:
 
         historical_pixels = int(historical_mask.sum().item())
         history_injected_pixels = int(hist_only.sum().item())
-        if self.memory_map_mode == "overlap_voxel_v3_1" \
+        if self.memory_map_mode in _CONTINUOUS_V3_READ_MODES \
                 and block_index == 0 and historical_pixels != 0:
-            raise AssertionError("V3.1 block zero must not read historical pixels")
+            raise AssertionError(
+                f"{self.memory_map_mode} block zero must not read historical pixels"
+            )
         fused_rgb_l1_from_reference = float(
             (fused_rgb - reference_rgb.to(self.memory.device)).abs().mean().item()
         )
@@ -555,17 +576,17 @@ class HistoricalMemoryController:
             "points_after_previous_block": points_after_previous_block,
             "memory_read_point_continuity": (
                 points_before_read == points_after_previous_block
-                if self.memory_map_mode == "overlap_voxel_v3_1" else None
+                if self.memory_map_mode in _CONTINUOUS_V3_READ_MODES else None
             ),
             "memory_read_contract": (
                 "gpu_voxel_render+offline_reference_fuse+vae_encode"
-                if self.memory_map_mode == "overlap_voxel_v3_1" else None
+                if self.memory_map_mode in _CONTINUOUS_V3_READ_MODES else None
             ),
             "memory_render_uses_planned_c2w": (
-                True if self.memory_map_mode == "overlap_voxel_v3_1" else None
+                True if self.memory_map_mode in _CONTINUOUS_V3_READ_MODES else None
             ),
             "memory_ply_roundtrip": (
-                False if self.memory_map_mode == "overlap_voxel_v3_1" else None
+                False if self.memory_map_mode in _CONTINUOUS_V3_READ_MODES else None
             ),
             "memory_map_mode": self.memory_map_mode,
             "cuda_allocated_peak_gb": cuda_allocated_peak_gb,
@@ -1369,9 +1390,72 @@ class HistoricalMemoryController:
         decode_ms: float,
         dit_ms: float,
     ) -> None:
-        update_frame_indices = latent_keyframe_indices(
-            latent_start, denoised_latent.shape[1]
-        )
+        single_keyframe_selected = False
+        if self.memory_map_mode == "overlap_voxel_v3_2":
+            target_index = int(self.memory_single_keyframe_index)
+            single_keyframe_selected = (
+                not self.single_keyframe_attempted
+                and pixel_start <= target_index < pixel_end
+            )
+            if not single_keyframe_selected:
+                metric = self._metric_for_block(block_index)
+                cuda_allocated_peak_gb, cuda_reserved_peak_gb = _cuda_peak_gb(
+                    self.memory.device
+                )
+                point_count = self.memory.point_count
+                metric.update({
+                    "dit_ms": float(dit_ms),
+                    "decode_ms": decode_ms,
+                    "depth_backend": self.depth_backend,
+                    "depth_estimation_ms": 0.0,
+                    "da3_ms": 0.0,
+                    "registration_ms": 0.0,
+                    "pointcloud_build_ms": 0.0,
+                    "voxel_fusion_ms": 0.0,
+                    "memory_update_ms": 0.0,
+                    "pointcloud_total_ms": 0.0,
+                    "memory_update_mode": self.memory_update_mode,
+                    "memory_map_mode": self.memory_map_mode,
+                    "update_frame_indices": [],
+                    "update_frames": 0,
+                    "anchor_count": 0,
+                    "anchor_frame_index_input": self.anchor_frame_index,
+                    "anchor_frame_index_output": self.anchor_frame_index,
+                    "multi_anchor_retry_implemented": False,
+                    "da3_window_frames": 0,
+                    "registration_source": None,
+                    "registration_accepted": False,
+                    "registration_error": None,
+                    "registration_scale": None,
+                    "registration_rmse": None,
+                    "registration_normalized_rmse": None,
+                    "registration_correspondences": 0,
+                    "registration_inliers": 0,
+                    "registration_inlier_ratio": 0.0,
+                    "registration_scale_jump": None,
+                    "registration_normalized_rmse_limit": 0.20,
+                    "raw_valid_points": 0,
+                    "batch_voxels": 0,
+                    "points_before": point_count,
+                    "points_after": point_count,
+                    "evicted_voxels": 0,
+                    "single_keyframe_target_index": target_index,
+                    "single_keyframe_selected": False,
+                    "single_keyframe_attempted_total": self.single_keyframe_attempted,
+                    "single_keyframe_written_total": self.single_keyframe_written,
+                    "da3_peak_memory_gb": float(
+                        getattr(self.depth_estimator, "last_peak_memory_gb", 0.0)
+                    ),
+                    "cuda_allocated_peak_gb": cuda_allocated_peak_gb,
+                    "cuda_reserved_peak_gb": cuda_reserved_peak_gb,
+                })
+                return
+            self.single_keyframe_attempted = True
+            update_frame_indices = (target_index,)
+        else:
+            update_frame_indices = latent_keyframe_indices(
+                latent_start, denoised_latent.shape[1]
+            )
         update_local_indices = tuple(
             frame_index - pixel_start for frame_index in update_frame_indices
         )
@@ -1468,10 +1552,16 @@ class HistoricalMemoryController:
             scale_jump = abs(
                 registration.scale / self.previous_registration_scale - 1.0
             )
-        if accepted and registration.normalized_rmse > 0.15:
+        # V3.2 has one mandated single-frame build and no anchor retry. Keep its
+        # quality gate bounded, but slightly wider than the multi-frame V3 gate.
+        normalized_rmse_limit = (
+            0.20 if self.memory_map_mode == "overlap_voxel_v3_2" else 0.15
+        )
+        if accepted and registration.normalized_rmse > normalized_rmse_limit:
             accepted = False
             registration_error = (
-                f"normalized RMSE {registration.normalized_rmse:.6f} exceeds 0.15"
+                f"normalized RMSE {registration.normalized_rmse:.6f} exceeds "
+                f"{normalized_rmse_limit:.2f}"
             )
         if accepted and scale_jump is not None and scale_jump > 0.30:
             accepted = False
@@ -1540,6 +1630,9 @@ class HistoricalMemoryController:
             self.anchor_frame_index = int(update_frame_indices[-1])
             self.previous_registration_scale = registration.scale
 
+        if self.memory_map_mode == "overlap_voxel_v3_2":
+            self.single_keyframe_written = bool(accepted)
+
         focal = float(window_intrinsics[anchor_count:, 0, 0].mean().item())
         focal_jump = None
         if self.previous_da3_focal is not None:
@@ -1573,6 +1666,7 @@ class HistoricalMemoryController:
                 0.0 if registration is None else registration.inlier_ratio
             ),
             "registration_scale_jump": scale_jump,
+            "registration_normalized_rmse_limit": normalized_rmse_limit,
         }
         metric = self._metric_for_block(block_index)
         cuda_allocated_peak_gb, cuda_reserved_peak_gb = _cuda_peak_gb(
@@ -1593,6 +1687,10 @@ class HistoricalMemoryController:
             "memory_map_mode": self.memory_map_mode,
             "update_frame_indices": list(update_frame_indices),
             "update_frames": len(update_frame_indices),
+            "single_keyframe_target_index": self.memory_single_keyframe_index,
+            "single_keyframe_selected": single_keyframe_selected,
+            "single_keyframe_attempted_total": self.single_keyframe_attempted,
+            "single_keyframe_written_total": self.single_keyframe_written,
             "anchor_count": anchor_count,
             "anchor_frame_index_input": anchor_input_index,
             "anchor_frame_index_output": self.anchor_frame_index,
@@ -1702,6 +1800,9 @@ class HistoricalMemoryController:
             "voxel_size": getattr(self.memory, "voxel_size", None),
             "splat_diameter": getattr(self.memory, "splat_diameter", None),
             "adaptive_voxel": self.adaptive_voxel_details,
+            "single_keyframe_index": self.memory_single_keyframe_index,
+            "single_keyframe_attempted": self.single_keyframe_attempted,
+            "single_keyframe_written": self.single_keyframe_written,
             "da3_peak_memory_gb": max(
                 (float(block.get("da3_peak_memory_gb", 0.0)) for block in self.metrics),
                 default=0.0,

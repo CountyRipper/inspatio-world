@@ -49,7 +49,8 @@ parser.add_argument(
     "--memory_map_mode",
     choices=[
         "bounded_voxel", "dense_two_layer", "overlap_voxel_v3",
-        "overlap_voxel_v3_1", "overlap_voxel_v4", "overlap_voxel_v5",
+        "overlap_voxel_v3_1", "overlap_voxel_v3_2",
+        "overlap_voxel_v4", "overlap_voxel_v5",
     ],
     default="bounded_voxel",
     help="Historical point-map implementation used for generated-memory writes",
@@ -106,6 +107,12 @@ parser.add_argument(
     type=int,
     default=1,
     help="Overlapping DA3 anchors. Only one is implemented; larger values are reserved.",
+)
+parser.add_argument(
+    "--memory_single_keyframe_index",
+    type=int,
+    default=None,
+    help="V3.2 RGB frame index used for its only DA3 estimate and map write",
 )
 parser.add_argument("--disable_memory_diagnostics", action="store_true", help="Disable historical/fused diagnostic videos")
 parser.add_argument("--profile_blocks", action="store_true", help="Record per-block DiT timing")
@@ -330,11 +337,20 @@ if args.historical_memory:
             "--memory_update_mode latent_keyframe or full_block"
         )
     if args.memory_map_mode in {
-        "overlap_voxel_v3", "overlap_voxel_v3_1", "overlap_voxel_v4",
+        "overlap_voxel_v3", "overlap_voxel_v3_1", "overlap_voxel_v3_2",
+        "overlap_voxel_v4",
         "overlap_voxel_v5",
     }:
         if args.memory_update_mode != "latent_keyframe":
             raise ValueError("overlap-voxel modes require latent_keyframe updates")
+        if args.memory_map_mode == "overlap_voxel_v3_2" and (
+            args.memory_single_keyframe_index is None
+            or args.memory_single_keyframe_index < 0
+        ):
+            raise ValueError(
+                "overlap_voxel_v3_2 requires a non-negative "
+                "--memory_single_keyframe_index"
+            )
         if args.memory_map_mode == "overlap_voxel_v5":
             if args.memory_depth_backend != "mapanything":
                 raise ValueError("overlap_voxel_v5 requires MapAnything")
@@ -342,7 +358,7 @@ if args.historical_memory:
                 raise ValueError("overlap_voxel_v5 requires --memory_mapanything_model_path")
         elif args.memory_depth_backend != "da3":
             raise ValueError("overlap_voxel_v3/v4 currently requires DA3")
-        if args.memory_map_mode in {"overlap_voxel_v3", "overlap_voxel_v3_1"} \
+        if args.memory_map_mode in {"overlap_voxel_v3", "overlap_voxel_v3_1", "overlap_voxel_v3_2"} \
                 and args.memory_anchor_count != 1:
             raise NotImplementedError(
                 "Multi-anchor DA3 windows are reserved but not implemented"
@@ -577,7 +593,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
         adaptive_voxel_details = None
         if args.memory_map_mode in {
             "dense_two_layer", "overlap_voxel_v3", "overlap_voxel_v3_1",
-            "overlap_voxel_v4", "overlap_voxel_v5",
+            "overlap_voxel_v3_2", "overlap_voxel_v4", "overlap_voxel_v5",
         }:
             if "reference_depth" not in batch:
                 raise RuntimeError(
@@ -589,7 +605,8 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             else:
                 voxel_size = args.memory_voxel_size
                 if args.memory_map_mode in {
-                    "overlap_voxel_v3_1", "overlap_voxel_v4", "overlap_voxel_v5"
+                    "overlap_voxel_v3_1", "overlap_voxel_v3_2",
+                    "overlap_voxel_v4", "overlap_voxel_v5",
                 }:
                     voxel_size, adaptive_voxel_details = scale_adaptive_voxel_size(
                         batch["reference_depth"],
@@ -641,6 +658,7 @@ for i, batch_data in tqdm(enumerate(dataloader), total=len(dataloader), disable=
             memory_map_mode=args.memory_map_mode,
             reference_depth_thw=batch.get("reference_depth"),
             memory_anchor_count=args.memory_anchor_count,
+            memory_single_keyframe_index=args.memory_single_keyframe_index,
             adaptive_voxel_details=adaptive_voxel_details,
             geometry_voxel_factor=args.memory_geometry_voxel_factor,
             geometry_depth_ratio=args.memory_geometry_depth_ratio,

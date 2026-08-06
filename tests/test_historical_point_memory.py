@@ -840,6 +840,116 @@ class HistoricalPointMemoryTest(unittest.TestCase):
         self.assertEqual(summary["splat_diameter"], 3)
         self.assertEqual(summary["adaptive_voxel"], adaptive_details)
 
+        from scripts.summarize_overlap_voxel_v3 import validate_contract
+
+        validate_contract({"summary": summary, "blocks": controller.metrics})
+
+    def test_v3_2_estimates_and_writes_only_the_selected_keyframe(self):
+        try:
+            from pipeline.historical_memory_controller import HistoricalMemoryController
+        except ModuleNotFoundError as error:
+            if error.name in {"einops", "easydict"}:
+                self.skipTest(f"local lightweight environment lacks {error.name}")
+            raise
+
+        num_frames = 33
+        reference_rgb = torch.zeros((1, 3, num_frames, self.height, self.width))
+        reference_mask = torch.ones_like(reference_rgb)
+        reference_mask[:, :, :, :, self.width // 2:] = -1
+        reference_depth = torch.ones((1, num_frames, self.height, self.width))
+        target_c2w = self.pose.repeat(num_frames, 1, 1).unsqueeze(0)
+        memory = self.make_voxel_surfel_memory(voxel_size=0.01, point_size=3)
+        depth_estimator = FakeDepthEstimator()
+
+        def encode_video(video):
+            latent_frames = (video.shape[2] + 3) // 4
+            return torch.zeros(
+                (1, latent_frames, 16, self.height // 8, self.width // 8)
+            )
+
+        adaptive_details = {
+            "adaptive_voxel": True,
+            "voxel_size": 0.01,
+            "projected_pixel_spacing": 3.0,
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            controller = HistoricalMemoryController(
+                reference_rgb_bcthw=reference_rgb,
+                reference_mask_bcthw=reference_mask,
+                reference_depth_thw=reference_depth,
+                target_c2w=target_c2w,
+                K=self.K.unsqueeze(0),
+                encode_video=encode_video,
+                block_decoder=FakeBlockDecoder(self.height, self.width),
+                depth_estimator=depth_estimator,
+                memory=memory,
+                output_dir=output_dir,
+                output_prefix="v3_2",
+                rank=0,
+                reference_map_path="reference/frames_pcd",
+                memory_update_mode="latent_keyframe",
+                memory_map_mode="overlap_voxel_v3_2",
+                memory_single_keyframe_index=12,
+                adaptive_voxel_details=adaptive_details,
+                save_diagnostics=False,
+            )
+
+            controller.condition_provider(0, 0, 3)
+            controller.output_callback(
+                block_index=0,
+                latent_start=0,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            self.assertEqual(depth_estimator.block_calls, 0)
+            self.assertEqual(memory.point_count, 0)
+
+            controller.condition_provider(1, 3, 3)
+            controller.output_callback(
+                block_index=1,
+                latent_start=3,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            points_after_write = memory.point_count
+            self.assertEqual(depth_estimator.block_calls, 1)
+            self.assertEqual(depth_estimator.block_frame_counts, [1])
+            self.assertGreater(points_after_write, 0)
+
+            controller.condition_provider(2, 6, 3)
+            controller.output_callback(
+                block_index=2,
+                latent_start=6,
+                denoised_latent=torch.zeros((1, 3, 16, 3, 4)),
+                dit_ms=1.0,
+            )
+            self.assertEqual(depth_estimator.block_calls, 1)
+            self.assertEqual(memory.point_count, points_after_write)
+            summary = controller.close()
+
+        self.assertEqual(controller.metrics[0]["update_frame_indices"], [])
+        self.assertFalse(controller.metrics[0]["single_keyframe_selected"])
+        self.assertEqual(controller.metrics[1]["update_frame_indices"], [12])
+        self.assertTrue(controller.metrics[1]["single_keyframe_selected"])
+        self.assertEqual(controller.metrics[1]["da3_window_frames"], 1)
+        self.assertEqual(controller.metrics[1]["anchor_count"], 0)
+        self.assertEqual(
+            controller.metrics[1]["registration_source"],
+            "immutable_reference_depth",
+        )
+        self.assertTrue(controller.metrics[1]["registration_accepted"])
+        self.assertEqual(controller.metrics[2]["update_frame_indices"], [])
+        self.assertFalse(controller.metrics[2]["single_keyframe_selected"])
+        self.assertGreater(controller.metrics[2]["history_injected_pixels"], 0)
+        self.assertTrue(summary["single_keyframe_attempted"])
+        self.assertTrue(summary["single_keyframe_written"])
+        self.assertEqual(summary["single_keyframe_index"], 12)
+        self.assertEqual(summary["accepted_blocks"], 1)
+
+        from scripts.summarize_overlap_voxel_v3 import validate_contract
+
+        validate_contract({"summary": summary, "blocks": controller.metrics})
+
     def test_v4_rebuilds_from_all_historical_keyframes(self):
         try:
             from pipeline.historical_memory_controller import HistoricalMemoryController
