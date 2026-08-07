@@ -23,6 +23,7 @@ def denoise_block(
     denoising_kv_size_0=0,
     denoising_steps=None,
     memory_condition=None,
+    memory_gate=None,
     transition_noises=None,
     step_callback=None,
 ):
@@ -64,6 +65,7 @@ def denoise_block(
                 kv_size=(denoising_kv_size_0, denoising_kv_size),
                 render_latent_input=render_block,
                 memory_condition=memory_condition,
+                memory_gate=memory_gate,
                 freqs_offset=6,
             )
 
@@ -152,6 +154,7 @@ class CausalInferencePipeline(torch.nn.Module):
         block_condition_provider: Optional[Callable[[int, int, int], Tuple[torch.Tensor, torch.Tensor]]] = None,
         block_output_callback: Optional[Callable[..., None]] = None,
         block_memory_provider: Optional[Callable[[int, int, int], torch.Tensor]] = None,
+        block_memory_gate_provider: Optional[Callable[[int, int, int], torch.Tensor]] = None,
         block_step_callback: Optional[Callable[..., None]] = None,
     ) -> torch.Tensor:
         """
@@ -239,6 +242,18 @@ class CausalInferencePipeline(torch.nn.Module):
                 context_frames = torch.cat([ref_block, last_pred_padded], dim=1)
                 kv_size = kv_size + 1560 * 3
 
+            memory_condition = None
+            memory_gate = None
+            if block_memory_provider is not None:
+                if block_memory_gate_provider is None:
+                    raise ValueError("block_memory_provider requires block_memory_gate_provider")
+                memory_condition = block_memory_provider(
+                    block_index, start_index, num_block_frame
+                ).to(device=noise.device, dtype=noise.dtype)
+                memory_gate = block_memory_gate_provider(
+                    block_index, start_index, num_block_frame
+                ).to(device=noise.device, dtype=noise.dtype)
+
             if block_output_callback is not None and noisy_input.is_cuda:
                 torch.cuda.synchronize(noisy_input.device)
             t_dit_start = time.perf_counter()
@@ -252,13 +267,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 render_block=render_block,
                 denoising_kv_size=kv_size,
                 denoising_steps=self.denoising_step_list,
-                memory_condition=(
-                    None
-                    if block_memory_provider is None
-                    else block_memory_provider(block_index, start_index, num_block_frame).to(
-                        device=noise.device, dtype=noise.dtype
-                    )
-                ),
+                memory_condition=memory_condition,
+                memory_gate=memory_gate,
                 step_callback=(
                     None
                     if block_step_callback is None

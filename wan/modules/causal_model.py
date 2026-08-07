@@ -22,7 +22,7 @@ import torch.distributed as dist
 import time
 import copy
 from einops import rearrange
-from phase1_lsm.adapter import MemoryPatchAdapter
+from phase1_lsm.adapter import MemoryPatchAdapter, gated_adapter_residual
 
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
@@ -350,6 +350,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         image_latent_input: torch.Tensor = None,
         render_latent_input: torch.Tensor = None,
         memory_condition: torch.Tensor = None,
+        memory_gate: torch.Tensor = None,
         freqs_offset: int = 0,
     ):
         r"""
@@ -407,12 +408,26 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        if memory_condition is not None:
+        if memory_condition is None:
+            if memory_gate is not None:
+                raise ValueError("memory_gate requires memory_condition")
+        else:
             if kv_size[1] < 0:
                 raise AssertionError("memory adapter is disabled for cache-fill passes")
+            if memory_gate is None:
+                raise ValueError("memory_condition requires a hard memory_gate")
             if memory_condition.shape[0] != len(x):
                 raise ValueError("memory_condition batch does not match the denoising query")
-            memory_x = [self.memory_adapter(u.unsqueeze(0)) for u in memory_condition]
+            if memory_gate.shape[0] != len(x):
+                raise ValueError("memory_gate batch does not match the denoising query")
+            memory_x = [
+                gated_adapter_residual(
+                    self.memory_adapter,
+                    condition.unsqueeze(0),
+                    gate.unsqueeze(0),
+                )[0]
+                for condition, gate in zip(memory_condition, memory_gate)
+            ]
             if any(base.shape != memory.shape for base, memory in zip(x, memory_x)):
                 raise ValueError("memory_condition spatial/temporal shape does not match query")
             x = [base + memory for base, memory in zip(x, memory_x)]

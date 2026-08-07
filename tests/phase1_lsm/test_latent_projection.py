@@ -28,6 +28,9 @@ def test_invalid_depth_maps_to_minus_one_mask():
     depth[:, :2, :2] = 0
     K = torch.tensor([[2.0, 0.0, 2.0], [0.0, 2.0, 2.0], [0.0, 0.0, 1.0]])
     c2w = torch.eye(4).repeat(3, 1, 1)
-    _, mask4, occupancy = project_memory_sequence(latent, depth, K, c2w, c2w)
+    projected, mask4, occupancy = project_memory_sequence(latent, depth, K, c2w, c2w)
+    metrics = identity_reprojection_error(latent, projected, occupancy)
     assert torch.equal(mask4, occupancy.expand_as(mask4).to(mask4.dtype).mul(2).sub(1))
     assert (mask4 == -1).any()
+    assert metrics["valid_fraction"] < 1.0
+    assert metrics["max_abs_error"] == 0.0

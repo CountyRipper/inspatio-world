@@ -379,6 +379,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         image_latent_input: Optional[torch.Tensor] = None,
         render_latent_input: Optional[torch.Tensor] = None,
         memory_condition: Optional[torch.Tensor] = None,
+        memory_gate: Optional[torch.Tensor] = None,
         freqs_offset: int = 0,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -393,9 +394,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         # Handle None inputs for T2V mode
         image_latent_permuted = image_latent_input.permute(0, 2, 1, 3, 4).contiguous() if image_latent_input is not None else None
         render_latent_permuted = render_latent_input.permute(0, 2, 1, 3, 4).contiguous() if render_latent_input is not None else None
-        if memory_condition is not None and self.uniform_timestep:
+        if (memory_condition is not None or memory_gate is not None) and self.uniform_timestep:
             raise ValueError("memory_condition is only supported by the causal model")
+        if (memory_condition is None) != (memory_gate is None):
+            raise ValueError("memory_condition and memory_gate must be provided together")
         memory_condition_permuted = memory_condition.permute(0, 2, 1, 3, 4).contiguous() if memory_condition is not None else None
+        memory_gate_permuted = memory_gate.permute(0, 2, 1, 3, 4).contiguous() if memory_gate is not None else None
 
         if kv_cache is not None:
             assert(not self.dual_model), "KV cache is not supported for dual-model mode"
@@ -409,6 +413,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
                 memory_condition=memory_condition_permuted,
+                memory_gate=memory_gate_permuted,
                 freqs_offset=freqs_offset,
             ).permute(0, 2, 1, 3, 4)
             if kv_size[1]<0:
@@ -429,6 +434,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             }
             if not self.uniform_timestep:
                 model_kwargs["memory_condition"] = memory_condition_permuted
+                model_kwargs["memory_gate"] = memory_gate_permuted
             flow_pred = selected_model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
