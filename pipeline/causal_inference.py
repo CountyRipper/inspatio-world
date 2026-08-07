@@ -26,6 +26,8 @@ def denoise_block(
     memory_gate=None,
     transition_noises=None,
     step_callback=None,
+    backpropagate_all_steps=False,
+    step_input_transform=None,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -53,9 +55,15 @@ def denoise_block(
     for index, current_timestep in enumerate(denoising_steps):
         is_last_step = (index == len(denoising_steps) - 1)
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
+        if step_input_transform is not None:
+            noisy_input = step_input_transform(index, current_timestep, noisy_input)
         step_input = noisy_input.detach()
 
-        ctx = torch.no_grad() if not is_last_step else nullcontext()
+        ctx = (
+            nullcontext()
+            if backpropagate_all_steps or is_last_step
+            else torch.no_grad()
+        )
         with ctx:
             _, denoised_pred = generator(
                 noisy_image_or_video=noisy_input,

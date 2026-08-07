@@ -1,0 +1,1610 @@
+{
+  "schema_version": 1,
+  "description": "Phase 2 generated-latent self-rollout groups; only two local scenes have complete 240-frame geometry, so heldout is trajectory-level.",
+  "heldout_unit": "trajectory",
+  "group_count": 30,
+  "scenes": {
+    "S0": {
+      "video": "/data4/daixiangting/inspatio-world/test/example/cropped_source.mp4",
+      "metadata_json": "/data4/daixiangting/inspatio-world/test/example/new.json",
+      "geometry": "/data4/daixiangting/inspatio-world/test/example/new_vggt/cropped_source"
+    },
+    "S1": {
+      "video": "/data4/daixiangting/inspatio-world/test/example2/coffee_martini.mp4",
+      "metadata_json": "/data4/daixiangting/inspatio-world/test/example2/new.json",
+      "geometry": "/data4/daixiangting/inspatio-world/test/example2/new_vggt/coffee_martini"
+    }
+  },
+  "groups": [
+    {
+      "group_id": "g00_s0_outward_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 0,
+      "initial_yaw_degrees": 0,
+      "phase2a": true,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": 10,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -7,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": 15,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g01_s1_branch_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1,
+      "initial_yaw_degrees": 0,
+      "phase2a": true,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "A",
+          "yaw_degrees": 15,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "B",
+          "yaw_degrees": -8,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g02_s0_multi_memory",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1002,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": -17,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -14,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g03_s1_outward_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1003,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -13,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g04_s0_branch_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1004,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "B",
+          "yaw_degrees": -3,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g05_s1_multi_memory",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1005,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": 2,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -1,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g06_s0_outward_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1006,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": -8,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g07_s1_branch_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1007,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "B",
+          "yaw_degrees": -7,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g08_s0_multi_memory",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1008,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -30,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": 7,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 4,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g09_s1_outward_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1009,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -30,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": 3,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g10_s0_branch_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1010,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 30,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "B",
+          "yaw_degrees": -2,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g11_s1_multi_memory",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1011,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 30,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -7,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -4,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g12_s0_outward_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1012,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 35,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -25,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": 8,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g13_s1_branch_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1013,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 35,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -25,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "B",
+          "yaw_degrees": 10,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "B",
+          "yaw_degrees": 7,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": 35,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g14_s0_multi_memory",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1014,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 35,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": -20,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": -2,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 1,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g15_s1_outward_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1015,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 35,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": -15,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": 2,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": -20,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g16_s0_branch_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1016,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 40,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 10,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -20,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "B",
+          "yaw_degrees": 15,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "A",
+          "yaw_degrees": 35,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "B",
+          "yaw_degrees": 12,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": 40,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g17_s1_multi_memory",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1017,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 40,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 10,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -20,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": 35,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": 17,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": 40,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 14,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g18_s0_outward_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1018,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -20,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 10,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 40,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": -10,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": 7,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": -15,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 10,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g19_s1_branch_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1019,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -20,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 10,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 40,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "A",
+          "yaw_degrees": -15,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "B",
+          "yaw_degrees": 8,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": -20,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g20_s0_multi_memory",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1020,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": 15,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -3,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -6,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g21_s1_outward_return",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "outward_return",
+      "seed": 1021,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": 10,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": -7,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": 15,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g22_s0_branch_return",
+      "scene_id": "S0",
+      "split": "train",
+      "family": "branch_return",
+      "seed": 1022,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "B",
+          "yaw_degrees": -15,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "B",
+          "yaw_degrees": -12,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g23_s1_multi_memory",
+      "scene_id": "S1",
+      "split": "train",
+      "family": "multi_memory",
+      "seed": 1023,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -10,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 20,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -17,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": -40,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -14,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g24_s0_outward_return",
+      "scene_id": "S0",
+      "split": "heldout",
+      "family": "outward_return",
+      "seed": 1024,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": 15,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -2,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g25_s1_branch_return",
+      "scene_id": "S1",
+      "split": "heldout",
+      "family": "branch_return",
+      "seed": 1025,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "A",
+          "yaw_degrees": 20,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "B",
+          "yaw_degrees": -3,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g26_s0_multi_memory",
+      "scene_id": "S0",
+      "split": "heldout",
+      "family": "multi_memory",
+      "seed": 1026,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": -12,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -9,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g27_s1_outward_return",
+      "scene_id": "S1",
+      "split": "heldout",
+      "family": "outward_return",
+      "seed": 1027,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": -35,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": 25,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "A",
+          "yaw_degrees": -25,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "B",
+          "yaw_degrees": -8,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "A",
+          "yaw_degrees": -30,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": -5,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g28_s0_branch_return",
+      "scene_id": "S0",
+      "split": "heldout",
+      "family": "branch_return",
+      "seed": 1028,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 2,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "write"
+        },
+        {
+          "block": 5,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "write"
+        },
+        {
+          "block": 8,
+          "memory_id": "C",
+          "yaw_degrees": -30,
+          "action": "write"
+        },
+        {
+          "block": 11,
+          "memory_id": "B",
+          "yaw_degrees": 5,
+          "action": "return_write"
+        },
+        {
+          "block": 14,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return_write"
+        },
+        {
+          "block": 17,
+          "memory_id": "B",
+          "yaw_degrees": 2,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "return"
+        }
+      ]
+    },
+    {
+      "group_id": "g29_s1_multi_memory",
+      "scene_id": "S1",
+      "split": "heldout",
+      "family": "multi_memory",
+      "seed": 1029,
+      "initial_yaw_degrees": 0,
+      "phase2a": false,
+      "stations": [
+        {
+          "block": 1,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "write"
+        },
+        {
+          "block": 4,
+          "memory_id": "B",
+          "yaw_degrees": 0,
+          "action": "write"
+        },
+        {
+          "block": 7,
+          "memory_id": "C",
+          "yaw_degrees": -30,
+          "action": "write"
+        },
+        {
+          "block": 10,
+          "memory_id": "A",
+          "yaw_degrees": 25,
+          "action": "return_write"
+        },
+        {
+          "block": 13,
+          "memory_id": "B",
+          "yaw_degrees": 7,
+          "action": "return_write"
+        },
+        {
+          "block": 16,
+          "memory_id": "A",
+          "yaw_degrees": 30,
+          "action": "return"
+        },
+        {
+          "block": 19,
+          "memory_id": "B",
+          "yaw_degrees": 4,
+          "action": "return"
+        }
+      ]
+    }
+  ]
+}

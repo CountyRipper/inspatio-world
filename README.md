@@ -193,6 +193,39 @@ bash run_scripts/run_test_pipeline.sh \
 
 You can switch from VAE to TAE to accelerate the process. Furthermore, you can use `--compile_dit` to further boost the speed, reaching 24 fps on an H-series NVIDIA GPU (1.3B). However, please note that this operation requires a relatively long warm-up time when triggered for the first time. It is suitable for scenarios where you need to deploy as a service and pursue extreme speed.
 
+## Online Latent Memory Self-Rollout (Phase 2)
+
+Phase 2 keeps the 1.3B backbone frozen and trains only the existing 122,880-parameter memory adapter. The online bank stores detached model-generated clean latents plus pose, intrinsics, depth, occupancy/confidence, FOV, ID, and version metadata. Returns use pose/FOV retrieval followed by non-identity geometric projection; no future return target is written to memory.
+
+Edit `configs/phase2_memory_manifest.json` to point at geometry-complete scenes. The checked-in manifest contains 30 trajectory groups (24 train and 6 trajectory-held-out) spanning outward-return, branch-return, and multi-memory patterns.
+
+The main entry points are:
+
+- `scripts/phase2_memory/capture_rollouts.py`: online A/B/C writes, returns, writeback/re-read, and exact replay records.
+- `scripts/phase2_memory/train_adapter.py`: adapter-only training through all four denoising steps with detached history.
+- `scripts/phase2_memory/evaluate.py`: no-memory/correct/wrong/mask-only metrics, full videos, and montages.
+- `scripts/phase2_memory/launch_on_best_gpu.py`: selects the most-free physical GPU among 0, 1, and 2 and retries only CUDA OOM failures.
+
+Example Phase 2B flow after a successful Phase 2A run:
+
+```bash
+P2_CHECKPOINT=/path/to/InSpatio-World-1.3B.safetensors
+P2_PHASE2A_ADAPTER=artifacts/phase2_memory_selfrollout/phase2a/train200_anchor035/memory_adapter.safetensors
+P2_OUTPUT=artifacts/phase2_memory_selfrollout/phase2b
+
+python scripts/phase2_memory/launch_on_best_gpu.py --log-root "${P2_OUTPUT}/capture_train_logs" -- python scripts/phase2_memory/capture_rollouts.py --output-root "${P2_OUTPUT}/train_records_anchor035" --adapter "${P2_PHASE2A_ADAPTER}" --split train --anchoring-strength 0.35
+
+python scripts/phase2_memory/launch_on_best_gpu.py --log-root "${P2_OUTPUT}/train300_lr1e4_pw025_logs" -- python scripts/phase2_memory/train_adapter.py --records-root "${P2_OUTPUT}/train_records_anchor035" --output-root "${P2_OUTPUT}/train300_lr1e4_pw025" --checkpoint "${P2_CHECKPOINT}" --init-adapter "${P2_PHASE2A_ADAPTER}" --split train --max-steps 300 --lr 1e-4 --preservation-weight 0.25 --history-truncation-probability 0.25 --anchoring-strength 0.35
+
+python scripts/phase2_memory/launch_on_best_gpu.py --log-root "${P2_OUTPUT}/heldout_final_eval4_logs" -- python scripts/phase2_memory/evaluate.py --output-root "${P2_OUTPUT}/heldout_final_eval4" --adapter "${P2_OUTPUT}/train300_lr1e4_pw025/memory_adapter.safetensors" --split heldout --condition no_memory --condition correct --condition wrong --condition mask_only --anchoring-strength 0.35
+```
+
+Run the dependency-light regression suite with:
+
+```bash
+PYTHONPATH=. python scripts/phase2_memory/run_cpu_tests.py
+```
+
 ## License
 
 This project is licensed under the [Apache-2.0 License](https://github.com/inspatio/inspatio-world/blob/main/LICENSE). Note that this license only applies to code in our library, the dependencies and submodules of which ([Depth-Anything-3](https://github.com/ByteDance-Seed/depth-anything-3), [Florence-2](https://github.com/anyantudre/Florence-2-Vision-Language-Model), [TAEHV](https://github.com/madebyollin/taehv.git)) are separate and individually licensed.

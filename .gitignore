@@ -32,3 +32,6 @@ build/
 
 # Phase 1 LSM adapter generated data, checkpoints, plots, and run records
 /artifacts/phase1_lsm/
+
+# Phase 2 generated rollout records, checkpoints, videos, metrics, and logs
+/artifacts/phase2_memory_selfrollout/
