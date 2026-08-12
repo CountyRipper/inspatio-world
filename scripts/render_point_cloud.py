@@ -249,10 +249,26 @@ def generate_target_c2ws(traj_txt_path, initial_c2w, source_c2ws, num_frames, de
     y_left_angle = [float(i) for i in lines[1].split()]
     r_raw = [float(i) for i in lines[2].split()]
 
-    # generate_traj_txt returns relative c2w offsets (identity at frame 0)
-    relative_c2ws = generate_traj_txt(
-        x_up_angle, y_left_angle, r_raw, r_raw, num_frames, is_translation=rotation_only
-    )  # (N, 4, 4) numpy, these are relative c2w transforms # Twc
+    # Dense per-frame Teacher schedules are already interpolated. Preserve them
+    # exactly instead of fitting a global cubic spline through the same samples.
+    from datasets import utils as dataset_utils
+
+    original_interpolation = dataset_utils.txt_interpolation
+
+    def preserve_dense(input_list, n, mode="smooth"):
+        if len(input_list) == n:
+            return np.asarray(input_list, dtype=np.float64)
+        return original_interpolation(input_list, n, mode=mode)
+
+    dataset_utils.txt_interpolation = preserve_dense
+    try:
+        # generate_traj_txt returns relative c2w offsets (identity at frame 0)
+        relative_c2ws = generate_traj_txt(
+            x_up_angle, y_left_angle, r_raw, r_raw, num_frames,
+            is_translation=rotation_only,
+        )
+    finally:
+        dataset_utils.txt_interpolation = original_interpolation
 
     target_c2ws = []
     for i in range(num_frames):

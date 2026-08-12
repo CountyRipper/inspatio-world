@@ -9,6 +9,31 @@ from scripts.render_point_cloud import generate_target_c2ws
 
 
 class RenderPointCloudPoseTest(unittest.TestCase):
+    def test_dense_per_frame_schedule_is_not_resmoothed(self):
+        yaw_values = [0.0, 12.5, 40.0, 12.5, 40.0]
+        identity = torch.eye(4)
+        with tempfile.TemporaryDirectory() as directory:
+            trajectory_path = Path(directory) / "dense.txt"
+            trajectory_path.write_text(
+                "0 0 0 0 0\n"
+                + " ".join(str(value) for value in yaw_values)
+                + "\n0 0 0 0 0\n",
+                encoding="utf-8",
+            )
+            targets = generate_target_c2ws(
+                trajectory_path,
+                identity,
+                [identity] * len(yaw_values),
+                num_frames=len(yaw_values),
+                device=torch.device("cpu"),
+                rotation_only=True,
+            )
+        recovered = [
+            np.rad2deg(np.arctan2(float(target[0, 2]), float(target[0, 0])))
+            for target in targets
+        ]
+        self.assertTrue(np.allclose(recovered, yaw_values, atol=1e-5))
+
     def test_rotation_only_yaw_stays_at_first_camera_center(self):
         angle = np.deg2rad(12.0)
         initial_c2w = torch.tensor(
