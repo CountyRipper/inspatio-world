@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from einops import rearrange
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.render_warper import convert_mask_video
+from world_state.domains import erode_source_mask, strict_source_mask
 
 
 def denoise_block(
@@ -26,6 +27,9 @@ def denoise_block(
     memory_occupancy=None,
     world_context=None,
     full_denoise_grad=False,
+    source_clean=None,
+    source_core=None,
+    fixed_source_noise=None,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -39,6 +43,34 @@ def denoise_block(
         raise ValueError("memory_condition and memory_occupancy must be provided together")
     if world_context is not None and memory_condition is not None:
         raise ValueError("direct memory residual and WorldStateReader are mutually exclusive")
+    source_values = (source_clean, source_core, fixed_source_noise)
+    if any(value is not None for value in source_values) and not all(
+        value is not None for value in source_values
+    ):
+        raise ValueError(
+            "source_clean, source_core, and fixed_source_noise must be provided together"
+        )
+    if source_clean is not None:
+        if source_clean.shape != noisy_input.shape or fixed_source_noise.shape != noisy_input.shape:
+            raise ValueError("source clean/noise must match the noisy latent shape")
+        if source_core.shape != (B, F, 1, *noisy_input.shape[-2:]):
+            raise ValueError("source_core must have shape [B,F,1,H,W]")
+        source_core = source_core.bool()
+
+    def clamp_source(value, timestep):
+        if source_clean is None:
+            return value
+        source_xt = scheduler.add_noise(
+            source_clean.flatten(0, 1),
+            fixed_source_noise.flatten(0, 1),
+            timestep.reshape(-1),
+        ).unflatten(0, source_clean.shape[:2])
+        return torch.where(source_core, source_xt, value)
+
+    def clamp_clean_source(value):
+        if source_clean is None:
+            return value
+        return torch.where(source_core, source_clean, value)
 
     if context_frames is not None:
         times_zero = torch.zeros([B, F], device=device, dtype=torch.int64)
@@ -57,6 +89,7 @@ def denoise_block(
     for index, current_timestep in enumerate(denoising_steps):
         is_last_step = (index == len(denoising_steps) - 1)
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
+        noisy_input = clamp_source(noisy_input, timestep)
 
         ctx = (
             nullcontext()
@@ -81,6 +114,7 @@ def denoise_block(
                 freqs_offset=6,
                 **memory_kwargs,
             )
+            denoised_pred = clamp_clean_source(denoised_pred)
 
         if is_last_step:
             noise_before_last_step = noisy_input.clone()
@@ -91,6 +125,10 @@ def denoise_block(
                 torch.randn_like(denoised_pred.flatten(0, 1)),
                 next_t * torch.ones([B * F], device=device, dtype=torch.long)
             ).unflatten(0, denoised_pred.shape[:2])
+            noisy_input = clamp_source(
+                noisy_input,
+                next_t * torch.ones([B, F], device=device, dtype=torch.long),
+            )
 
     return denoised_pred, noise_before_last_step
 
@@ -165,6 +203,10 @@ class CausalInferencePipeline(torch.nn.Module):
         ] = None,
         world_context_provider: Optional[Callable[[int, int, object], object]] = None,
         query_camera=None,
+        source_clean_latent: Optional[torch.Tensor] = None,
+        source_mask4: Optional[torch.Tensor] = None,
+        fixed_source_noise: Optional[torch.Tensor] = None,
+        source_collar: int = 1,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -180,6 +222,19 @@ class CausalInferencePipeline(torch.nn.Module):
                 When decode=True, normalized to [0, 1]. When decode=False, raw latents.
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        source_values = (source_clean_latent, source_mask4, fixed_source_noise)
+        if any(value is not None for value in source_values) and not all(
+            value is not None for value in source_values
+        ):
+            raise ValueError(
+                "source clean, mask4, and fixed noise must be provided together"
+            )
+        if source_clean_latent is not None:
+            if source_clean_latent.shape != noise.shape or fixed_source_noise.shape != noise.shape:
+                raise ValueError("source clean/noise must match the pipeline noise shape")
+            expected_mask = (batch_size, num_frames, 4, height, width)
+            if source_mask4.shape != expected_mask:
+                raise ValueError(f"source_mask4 must have shape {expected_mask}")
         assert num_frames % self.num_frame_per_block == 0, f"num_frames {num_frames} is not a multiple of num_frame_per_block {self.num_frame_per_block}"
         num_blocks = num_frames // self.num_frame_per_block
 
@@ -221,6 +276,25 @@ class CausalInferencePipeline(torch.nn.Module):
             render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             render_block = torch.cat([mask_block, render_block], dim=2)
+
+            source_kwargs = {}
+            if source_clean_latent is not None:
+                source_block = source_clean_latent[
+                    :, start_index:start_index + num_block_frame
+                ].to(device=noise.device, dtype=noise.dtype)
+                source_mask_block = source_mask4[
+                    :, start_index:start_index + num_block_frame
+                ].to(device=noise.device)
+                source_core = erode_source_mask(
+                    strict_source_mask(source_mask_block), collar=int(source_collar)
+                )
+                source_kwargs = {
+                    "source_clean": source_block,
+                    "source_core": source_core,
+                    "fixed_source_noise": fixed_source_noise[
+                        :, start_index:start_index + num_block_frame
+                    ].to(device=noise.device, dtype=noise.dtype),
+                }
 
             memory_condition = None
             memory_occupancy = None
@@ -272,6 +346,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 memory_condition=memory_condition,
                 memory_occupancy=memory_occupancy,
                 world_context=world_context,
+                **source_kwargs,
             )
 
 

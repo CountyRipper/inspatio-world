@@ -1,0 +1,52 @@
+# Three-Domain WorldStateReader v1. Bank, projection, and trajectory stay at v0.
+experiment:
+  base_config: configs/inference_1.3b.yaml
+  checkpoint: checkpoints/InSpatio-World-1.3B/InSpatio-World-1.3B.safetensors
+  direct_adapter: artifacts/exact_identity/adapter.safetensors
+  teacher_v0_checkpoint: artifacts/world_teacher_v0/checkpoints/teacher_final.safetensors
+  data_root: data/world_teacher_v0
+  artifact_root: artifacts/world_teacher_v1
+  block_size: 3
+  write_block: 6
+  common_prefix_last_block: 12
+  second_traversal_first_block: 13
+  first_exact_block: 16
+
+reader:
+  selected_layers: [8, 14, 20]
+  selector_width: 256
+  top_observations: 2
+  confidence_threshold: 0.35
+  source_collar: 1
+  lora_rank: 8
+
+training:
+  exact_learning_rate: 0.0002
+  continuous_learning_rate: 0.0001
+  lora_learning_rate: 0.00005
+  two_block_learning_rate: 0.00003
+  weight_decay: 0.01
+  exact_reader_steps: 160
+  continuous_reader_steps: 240
+  selected_continuous_step: 120
+  continuous_lora_steps: 120
+  two_block_steps: 60
+  gradient_checkpointing: true
+  save_every: 20
+  milestone_steps: [120]
+  memory_l1_weight: 1.0
+  spatial_gradient_weight: 0.05
+  laplacian_weight: 0.02
+  unknown_preservation_weight: 0.01
+
+evaluation:
+  continuous_blocks: [13, 14, 15, 16, 17, 18]
+  paired_target_blocks: [2, 3, 4, 5, 6, 6]
+  montage_blocks: [13, 14, 16, 17, 18]
+  hold_blocks: [16, 17, 18]
+  end_block: 18
+  two_block_windows:
+    - [13, 14, 2, 3]
+    - [15, 16, 4, 5]
+    - [16, 17, 5, 6]
+    - [17, 18, 6, 6]

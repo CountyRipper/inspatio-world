@@ -92,6 +92,9 @@ class BlockExample:
     camera: CameraBatch
     denoising_steps: torch.Tensor
     transition_seed: int
+    source_clean: torch.Tensor
+    source_mask4: torch.Tensor
+    fixed_source_noise: torch.Tensor
 
 
 def make_block_example(
@@ -137,6 +140,15 @@ def make_block_example(
         camera=query_camera(record, query_block, device),
         denoising_steps=record["denoising_steps"].to(device=device),
         transition_seed=int(record["transition_seed"]) + query_block,
+        source_clean=record["render_latent"][:, start:end].to(
+            device=device, dtype=dtype
+        ),
+        source_mask4=record["mask_latent"][:, start:end].to(
+            device=device, dtype=dtype
+        ),
+        fixed_source_noise=record["noise_A"][:, start:end].to(
+            device=device, dtype=dtype
+        ),
     )
 
 

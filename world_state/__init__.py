@@ -16,6 +16,20 @@ from .types import (
     WorldObservation,
     WorldReadPacket,
 )
+from .domains import (
+    ThreeDomainMasks,
+    build_three_domains,
+    erode_source_mask,
+    patchify_domains,
+    strict_source_mask,
+)
+from .runtime_v1 import (
+    WorldStateRuntimeV1,
+    attach_world_state_reader_v1,
+    load_world_state_reader_v1,
+    save_world_state_reader_v1,
+    world_state_v1_trainable_parameters,
+)
 
 __all__ = [
     "Authority",
@@ -26,8 +40,18 @@ __all__ = [
     "WorldObservation",
     "WorldReadPacket",
     "WorldStateRuntime",
+    "WorldStateRuntimeV1",
     "attach_world_state_reader",
     "load_world_state_reader",
     "save_world_state_reader",
     "world_state_trainable_parameters",
+    "ThreeDomainMasks",
+    "attach_world_state_reader_v1",
+    "build_three_domains",
+    "erode_source_mask",
+    "load_world_state_reader_v1",
+    "patchify_domains",
+    "save_world_state_reader_v1",
+    "strict_source_mask",
+    "world_state_v1_trainable_parameters",
 ]

@@ -161,3 +161,27 @@ class WorldBlockContext:
     layers: Dict[int, WorldLayerContext]
     coverage: torch.Tensor
     observation_ids: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class EncodedWorldContentV1:
+    """Generated-memory center features; metadata exists only on selector keys."""
+
+    content: torch.Tensor  # [B,L,1536]
+    selector_key: torch.Tensor  # [B,L,S]
+    memory_patch: torch.Tensor  # [B,L,1], bool
+
+
+@dataclass(frozen=True)
+class WorldLayerContextV1:
+    selector_key: torch.Tensor  # [B,L,S]
+    projected_value: torch.Tensor  # [B,L,1536]
+    memory_patch: torch.Tensor  # [B,L,1], bool
+    enable_lora: bool = False
+
+
+@dataclass(frozen=True)
+class WorldBlockContextV1:
+    layers: Dict[int, WorldLayerContextV1]
+    coverage: torch.Tensor
+    observation_ids: Tuple[str, ...]

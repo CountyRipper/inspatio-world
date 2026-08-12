@@ -59,6 +59,7 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache=None,  
         kv_size=(0,0),
         world_lora_enabled=False,
+        world_lora_gate=None,
     ):
         r"""
         Args:
@@ -72,7 +73,10 @@ class CausalWanSelfAttention(nn.Module):
         def qkv_fn(x):
             q_projection = self.q(x)
             if world_lora_enabled and hasattr(self, "world_q_lora"):
-                q_projection = q_projection + self.world_q_lora(x)
+                q_update = self.world_q_lora(x)
+                if world_lora_gate is not None:
+                    q_update = q_update * world_lora_gate.to(q_update.dtype)
+                q_projection = q_projection + q_update
             q = self.norm_q(q_projection).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
@@ -108,7 +112,10 @@ class CausalWanSelfAttention(nn.Module):
         x = x.flatten(2)
         output = self.o(x)
         if world_lora_enabled and hasattr(self, "world_o_lora"):
-            output = output + self.world_o_lora(x)
+            o_update = self.world_o_lora(x)
+            if world_lora_gate is not None:
+                o_update = o_update * world_lora_gate.to(o_update.dtype)
+            output = output + o_update
         x = output
         return x
 
@@ -175,12 +182,17 @@ class CausalWanAttentionBlock(nn.Module):
 
         e = (self.modulation + e).chunk(6, dim=1)
 
+        world_lora_gate = None
         if world_reader_context is not None:
             if not hasattr(self, "world_reader"):
                 raise RuntimeError("world context reached a block without a reader")
             if timestep_embedding is None:
                 raise ValueError("WorldStateReader requires the denoise timestep embedding")
-            x = self.world_reader(x, timestep_embedding, world_reader_context)
+            reader_output = self.world_reader(x, timestep_embedding, world_reader_context)
+            if isinstance(reader_output, tuple):
+                x, world_lora_gate = reader_output
+            else:
+                x = reader_output
 
         y = self.self_attn(
             self.norm1(x) * (1 + e[1]) + e[0],
@@ -192,6 +204,7 @@ class CausalWanAttentionBlock(nn.Module):
                 world_reader_context is not None
                 and world_reader_context.enable_lora
             ),
+            world_lora_gate=world_lora_gate,
         )
 
         x = x + y * e[2]
