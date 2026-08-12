@@ -375,6 +375,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         render_latent_input: Optional[torch.Tensor] = None,
         memory_condition: Optional[torch.Tensor] = None,
         memory_occupancy: Optional[torch.Tensor] = None,
+        world_context=None,
         freqs_offset: int = 0,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -391,12 +392,15 @@ class WanDiffusionWrapper(torch.nn.Module):
         render_latent_permuted = render_latent_input.permute(0, 2, 1, 3, 4).contiguous() if render_latent_input is not None else None
         if (memory_condition is None) != (memory_occupancy is None):
             raise ValueError("memory_condition and memory_occupancy must be provided together")
+        if world_context is not None and memory_condition is not None:
+            raise ValueError("direct memory residual and WorldStateReader are mutually exclusive")
         memory_kwargs = {}
         if memory_condition is not None:
             memory_kwargs = {
                 "memory_condition": memory_condition.permute(0, 2, 1, 3, 4).contiguous(),
                 "memory_occupancy": memory_occupancy.permute(0, 2, 1, 3, 4).contiguous(),
             }
+        world_kwargs = {} if world_context is None else {"world_context": world_context}
 
         if kv_cache is not None:
             assert(not self.dual_model), "KV cache is not supported for dual-model mode"
@@ -410,6 +414,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
                 freqs_offset=freqs_offset,
+                **world_kwargs,
                 **memory_kwargs,
             ).permute(0, 2, 1, 3, 4)
             if kv_size[1]<0:
@@ -430,6 +435,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
                 freqs_offset=freqs_offset,
+                **world_kwargs,
                 **memory_kwargs,
             ).permute(0, 2, 1, 3, 4)
 

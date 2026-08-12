@@ -24,6 +24,8 @@ def denoise_block(
     denoising_steps=None,
     memory_condition=None,
     memory_occupancy=None,
+    world_context=None,
+    full_denoise_grad=False,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -35,6 +37,8 @@ def denoise_block(
     noise_before_last_step = None
     if (memory_condition is None) != (memory_occupancy is None):
         raise ValueError("memory_condition and memory_occupancy must be provided together")
+    if world_context is not None and memory_condition is not None:
+        raise ValueError("direct memory residual and WorldStateReader are mutually exclusive")
 
     if context_frames is not None:
         times_zero = torch.zeros([B, F], device=device, dtype=torch.int64)
@@ -54,7 +58,11 @@ def denoise_block(
         is_last_step = (index == len(denoising_steps) - 1)
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
 
-        ctx = torch.no_grad() if not is_last_step else nullcontext()
+        ctx = (
+            nullcontext()
+            if full_denoise_grad or is_last_step
+            else torch.no_grad()
+        )
         memory_kwargs = {}
         if memory_condition is not None:
             memory_kwargs = {
@@ -69,6 +77,7 @@ def denoise_block(
                 kv_cache=kv_cache,
                 kv_size=(denoising_kv_size_0, denoising_kv_size),
                 render_latent_input=render_block,
+                world_context=world_context,
                 freqs_offset=6,
                 **memory_kwargs,
             )
@@ -154,6 +163,8 @@ class CausalInferencePipeline(torch.nn.Module):
         block_output_callback: Optional[
             Callable[[int, int, torch.Tensor], None]
         ] = None,
+        world_context_provider: Optional[Callable[[int, int, object], object]] = None,
+        query_camera=None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -223,6 +234,17 @@ class CausalInferencePipeline(torch.nn.Module):
                         )
                     memory_condition, memory_occupancy = memory
 
+            world_context = None
+            if world_context_provider is not None:
+                if query_camera is None:
+                    raise ValueError("query_camera is required with world_context_provider")
+                query_pose = query_camera.slice(start_index, num_block_frame)
+                world_context = world_context_provider(
+                    block_index, start_index, query_pose
+                )
+            if world_context is not None and memory_condition is not None:
+                raise ValueError("direct memory and WorldStateReader cannot share a block")
+
             kv_size = 1560*3
 
             # Prepare context
@@ -249,6 +271,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 denoising_steps=self.denoising_step_list,
                 memory_condition=memory_condition,
                 memory_occupancy=memory_occupancy,
+                world_context=world_context,
             )
 
 

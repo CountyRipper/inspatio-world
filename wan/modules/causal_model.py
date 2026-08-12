@@ -58,6 +58,7 @@ class CausalWanSelfAttention(nn.Module):
         freqs, 
         kv_cache=None,  
         kv_size=(0,0),
+        world_lora_enabled=False,
     ):
         r"""
         Args:
@@ -68,8 +69,11 @@ class CausalWanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        def qkv_fn(x): 
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
+        def qkv_fn(x):
+            q_projection = self.q(x)
+            if world_lora_enabled and hasattr(self, "world_q_lora"):
+                q_projection = q_projection + self.world_q_lora(x)
+            q = self.norm_q(q_projection).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
             return q, k, v
@@ -102,7 +106,10 @@ class CausalWanSelfAttention(nn.Module):
                 )
  
         x = x.flatten(2)
-        x = self.o(x)
+        output = self.o(x)
+        if world_lora_enabled and hasattr(self, "world_o_lora"):
+            output = output + self.world_o_lora(x)
+        x = output
         return x
 
 
@@ -154,6 +161,8 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache=None,
         kv_cache=None,
         kv_size=(0,0),
+        world_reader_context=None,
+        timestep_embedding=None,
     ):
         r"""
         Args:
@@ -166,7 +175,24 @@ class CausalWanAttentionBlock(nn.Module):
 
         e = (self.modulation + e).chunk(6, dim=1)
 
-        y = self.self_attn(self.norm1(x) * (1 + e[1]) + e[0], seq_lens, freqs_x, kv_cache=kv_cache, kv_size=kv_size)
+        if world_reader_context is not None:
+            if not hasattr(self, "world_reader"):
+                raise RuntimeError("world context reached a block without a reader")
+            if timestep_embedding is None:
+                raise ValueError("WorldStateReader requires the denoise timestep embedding")
+            x = self.world_reader(x, timestep_embedding, world_reader_context)
+
+        y = self.self_attn(
+            self.norm1(x) * (1 + e[1]) + e[0],
+            seq_lens,
+            freqs_x,
+            kv_cache=kv_cache,
+            kv_size=kv_size,
+            world_lora_enabled=(
+                world_reader_context is not None
+                and world_reader_context.enable_lora
+            ),
+        )
 
         x = x + y * e[2]
 
@@ -346,6 +372,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         render_latent_input: torch.Tensor = None,
         memory_condition: torch.Tensor = None,
         memory_occupancy: torch.Tensor = None,
+        world_context=None,
         freqs_offset: int = 0,
     ):
         r"""
@@ -401,6 +428,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             x = torch.cat([x, render_latent_input], dim=1)
         assert(x.shape[1] == 36) 
         
+        if world_context is not None and memory_condition is not None:
+            raise ValueError("direct memory residual and WorldStateReader are mutually exclusive")
+
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         if memory_condition is not None:
@@ -446,6 +476,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         for block_index, block in enumerate(self.blocks):
             kwargs['kv_cache'] = kv_cache[block_index]
+            kwargs['world_reader_context'] = (
+                None if world_context is None else world_context.layers.get(block_index)
+            )
+            kwargs['timestep_embedding'] = e
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x= torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
