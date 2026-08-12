@@ -2,6 +2,7 @@
 checkpoints/
 checkpoints
 output/
+/artifacts/
 test/example/new_vggt/
 test/example2/new_vggt/
 test/example3/new_vggt/

@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 import torch
 import time
 from contextlib import nullcontext
@@ -22,6 +22,8 @@ def denoise_block(
     denoising_kv_size=0,
     denoising_kv_size_0=0,
     denoising_steps=None,
+    memory_condition=None,
+    memory_occupancy=None,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -31,6 +33,8 @@ def denoise_block(
     B, F = noisy_input.shape[:2]
     device, dtype = noisy_input.device, noisy_input.dtype
     noise_before_last_step = None
+    if (memory_condition is None) != (memory_occupancy is None):
+        raise ValueError("memory_condition and memory_occupancy must be provided together")
 
     if context_frames is not None:
         times_zero = torch.zeros([B, F], device=device, dtype=torch.int64)
@@ -51,6 +55,12 @@ def denoise_block(
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
 
         ctx = torch.no_grad() if not is_last_step else nullcontext()
+        memory_kwargs = {}
+        if memory_condition is not None:
+            memory_kwargs = {
+                "memory_condition": memory_condition,
+                "memory_occupancy": memory_occupancy,
+            }
         with ctx:
             _, denoised_pred = generator(
                 noisy_image_or_video=noisy_input,
@@ -60,6 +70,7 @@ def denoise_block(
                 kv_size=(denoising_kv_size_0, denoising_kv_size),
                 render_latent_input=render_block,
                 freqs_offset=6,
+                **memory_kwargs,
             )
 
         if is_last_step:
@@ -87,7 +98,14 @@ class CausalInferencePipeline(torch.nn.Module):
         super().__init__()
         # Step 1: Initialize all models
         time_start = time.time() 
-        self.generator = WanDiffusionWrapper(**getattr(args, "generator", {}), is_causal=True)
+        self.generator = (
+            WanDiffusionWrapper(
+                **getattr(args, "generator", {}),
+                is_causal=True,
+            )
+            if generator is None
+            else generator
+        )
         print(f"Time taken to initialize generator: {time.time() - time_start} seconds")
 
         time_start = time.time()
@@ -130,6 +148,12 @@ class CausalInferencePipeline(torch.nn.Module):
         render_latent: Optional[torch.Tensor] = None,
         mask_latent: Optional[torch.Tensor] = None,
         decode: bool = True,
+        memory_provider: Optional[
+            Callable[[int, int, int], Optional[Tuple[torch.Tensor, torch.Tensor]]]
+        ] = None,
+        block_output_callback: Optional[
+            Callable[[int, int, torch.Tensor], None]
+        ] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -180,12 +204,24 @@ class CausalInferencePipeline(torch.nn.Module):
 
         start_index = 0
         last_pred = None
-        for num_block_frame in all_num_frames:
+        for block_index, num_block_frame in enumerate(all_num_frames):
             noisy_input = noise[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             ref_block = ref_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             render_block = torch.cat([mask_block, render_block], dim=2)
+
+            memory_condition = None
+            memory_occupancy = None
+            if memory_provider is not None:
+                memory = memory_provider(block_index, start_index, num_block_frame)
+                if memory is not None:
+                    if not isinstance(memory, tuple) or len(memory) != 2:
+                        raise TypeError(
+                            "memory_provider must return None or "
+                            "(memory_condition, memory_occupancy)"
+                        )
+                    memory_condition, memory_occupancy = memory
 
             kv_size = 1560*3
 
@@ -211,12 +247,20 @@ class CausalInferencePipeline(torch.nn.Module):
                 render_block=render_block,
                 denoising_kv_size=kv_size,
                 denoising_steps=self.denoising_step_list,
+                memory_condition=memory_condition,
+                memory_occupancy=memory_occupancy,
             )
 
 
             # Step 3.2: record the model's output
             output[:, start_index:start_index + num_block_frame] = denoised_pred
             last_pred = denoised_pred.clone().detach()
+            if block_output_callback is not None:
+                block_output_callback(
+                    block_index,
+                    start_index,
+                    denoised_pred.detach().clone(),
+                )
 
             # Step 3.4: update the start and end frame indices
             start_index += num_block_frame

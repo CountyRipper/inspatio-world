@@ -1,0 +1,46 @@
+# Exact-pose implicit latent memory readout baseline. Memory stays opt-in.
+memory:
+  enabled: false
+  model_dim: 1536
+  condition_channels: 20
+  latent_channels: 16
+  mask_channels: 4
+  occupancy_channels: 1
+
+experiment:
+  base_config: configs/inference_1.3b.yaml
+  checkpoint: checkpoints/InSpatio-World-1.3B/InSpatio-World-1.3B.safetensors
+  metadata_json: test/example/new.json
+  da3_dir: test/example/new_vggt/cropped_source_da3_tmp
+  artifact_dir: artifacts/exact_identity
+  block_size: 3
+  first_g_write_block: 6
+  final_g_return_block: 19
+  yaw_degrees: 40.0
+  rotation_only: true
+  world_a_seed: 0
+  world_b_seed: 42
+  denoise_seed: 20260812
+
+trajectory:
+  # Dense linear schedule for the 247-frame cup scene. Constant spans give
+  # exact per-frame +40/0-degree poses at STAR blocks 5-6, 12-13, and 18-19.
+  frame_count: 247
+  yaw_points:
+    - [0, 0.0]
+    - [7, 0.0]
+    - [56, 40.0]
+    - [83, 40.0]
+    - [140, 0.0]
+    - [167, 0.0]
+    - [216, 40.0]
+    - [246, 40.0]
+
+training:
+  adapter_seed: 314159
+  learning_rate: 0.00075
+  weight_decay: 0.01
+  stage_a_steps: 120
+  stage_b_steps: 180
+  save_every: 25
+  gradient_checkpointing: true

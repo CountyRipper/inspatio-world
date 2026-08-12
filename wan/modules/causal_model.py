@@ -22,6 +22,7 @@ import torch.distributed as dist
 import time
 import copy
 from einops import rearrange
+from world_memory.latent_adapter import add_gated_memory_residual
 
 flex_attention = torch.compile(
     flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
@@ -343,6 +344,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_size=(0,0),
         image_latent_input: torch.Tensor = None,
         render_latent_input: torch.Tensor = None,
+        memory_condition: torch.Tensor = None,
+        memory_occupancy: torch.Tensor = None,
         freqs_offset: int = 0,
     ):
         r"""
@@ -400,6 +403,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        if memory_condition is not None:
+            x = add_gated_memory_residual(
+                x,
+                getattr(self, "memory_adapter", None),
+                memory_condition,
+                memory_occupancy,
+            )
+        elif memory_occupancy is not None:
+            raise ValueError(
+                "memory_condition is required when memory_occupancy is provided"
+            )
         grid_sizes = torch.stack([
             torch.as_tensor(u.shape[2:], dtype=torch.long, device=u.device)
             for u in x

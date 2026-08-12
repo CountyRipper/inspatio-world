@@ -373,6 +373,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         kv_size: Optional[Tuple[int, int]] = (0, 0),
         image_latent_input: Optional[torch.Tensor] = None,
         render_latent_input: Optional[torch.Tensor] = None,
+        memory_condition: Optional[torch.Tensor] = None,
+        memory_occupancy: Optional[torch.Tensor] = None,
         freqs_offset: int = 0,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
@@ -387,6 +389,14 @@ class WanDiffusionWrapper(torch.nn.Module):
         # Handle None inputs for T2V mode
         image_latent_permuted = image_latent_input.permute(0, 2, 1, 3, 4).contiguous() if image_latent_input is not None else None
         render_latent_permuted = render_latent_input.permute(0, 2, 1, 3, 4).contiguous() if render_latent_input is not None else None
+        if (memory_condition is None) != (memory_occupancy is None):
+            raise ValueError("memory_condition and memory_occupancy must be provided together")
+        memory_kwargs = {}
+        if memory_condition is not None:
+            memory_kwargs = {
+                "memory_condition": memory_condition.permute(0, 2, 1, 3, 4).contiguous(),
+                "memory_occupancy": memory_occupancy.permute(0, 2, 1, 3, 4).contiguous(),
+            }
 
         if kv_cache is not None:
             assert(not self.dual_model), "KV cache is not supported for dual-model mode"
@@ -400,6 +410,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
                 freqs_offset=freqs_offset,
+                **memory_kwargs,
             ).permute(0, 2, 1, 3, 4)
             if kv_size[1]<0:
                 return flow_pred
@@ -419,6 +430,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
                 freqs_offset=freqs_offset,
+                **memory_kwargs,
             ).permute(0, 2, 1, 3, 4)
 
 
