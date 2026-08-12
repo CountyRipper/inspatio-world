@@ -30,7 +30,7 @@ set -e
 #   --skip_step1          (optional) Skip Step 1
 #   --skip_step2          (optional) Skip Step 2
 #   --skip_step3          (optional) Skip Step 3
-#   --relative_to_source  (optional) Compose trajectory poses relative to initial view
+#   --relative_to_source  (optional) Apply trajectory from each source-frame pose
 #   --rotation_only       (optional) Only apply rotation, ignore translation (tripod pan/tilt)
 #   --disable_adaptive_frame (optional) Disable adaptive frame expansion/subsampling
 #   --use_tae             (optional) Use Tiny Auto Encoder (TAE) instead of WanVAE

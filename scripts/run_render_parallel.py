@@ -68,7 +68,8 @@ def main():
     parser.add_argument("--render_backend", choices=["warper", "ply"], default="warper",
                         help="Rendering backend passed through to render_point_cloud.py")
     parser.add_argument("--relative_to_source", action="store_true",
-                        help="Compose trajectory poses relative to initial view")
+                        help="Apply the trajectory from each source-frame pose "
+                             "(default: anchor to the first source pose)")
     parser.add_argument("--rotation_only", action="store_true",
                         help="Only apply rotation from the trajectory, ignore translation")
     parser.add_argument("--freeze_repeat", type=int, default=0,

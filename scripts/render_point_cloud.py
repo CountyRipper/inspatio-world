@@ -228,15 +228,16 @@ def generate_target_c2ws(traj_txt_path, initial_c2w, source_c2ws, num_frames, de
 
     1. Read traj_txt -> generate_traj_txt() -> relative c2w offsets (N, 4, 4)
     2. Optionally zero out translation (rotation_only)
-    3. Compose with initial_c2w (relative_to_source) or use as absolute poses
+    3. Apply the relative motion from the first source camera, or from each
+       per-frame source camera when relative_to_source is enabled
 
     Args:
         traj_txt_path: path to traj txt file (3 lines: x_up, y_left, r)
         initial_c2w: (4, 4) first-frame c2w from DA3
         num_frames: how many frames to generate
         device: torch device
-        relative_to_source: if True, compose relative poses on top of initial_c2w;
-                            if False, treat generated poses as absolute world coords
+        relative_to_source: if True, apply the trajectory from each source pose;
+                            if False, keep it anchored to the first source pose
         rotation_only: if True, zero out translation in relative poses (tripod pan/tilt)
 
     Returns:
@@ -254,18 +255,10 @@ def generate_target_c2ws(traj_txt_path, initial_c2w, source_c2ws, num_frames, de
     )  # (N, 4, 4) numpy, these are relative c2w transforms # Twc
 
     target_c2ws = []
-    abs_source_c2ws = []
     for i in range(num_frames):
-        rel_source = source_c2ws[i]  # already a torch tensor (4,4) on device, Twc
-        abs_source_c2w = initial_c2w.inverse() @ rel_source # Tc0w @ Twc = Tc0c
-        abs_source_c2ws.append(abs_source_c2w)
-
-        rel = torch.tensor(relative_c2ws[i], dtype=torch.float32, device=device) #Twc
-        abs_target_c2w = initial_c2w.inverse() @ rel # Tc0w @ Twc = Tc0c
-        if relative_to_source:
-            abs_target_c2w = (abs_target_c2w.inverse() @ abs_source_c2w.inverse()).inverse() # (new_Tcw_tgt = Tcw_tgt @ Tcw_src).inverse
-
-        target_c2ws.append(abs_target_c2w)
+        rel = torch.tensor(relative_c2ws[i], dtype=torch.float32, device=device)
+        anchor_c2w = source_c2ws[i] if relative_to_source else initial_c2w
+        target_c2ws.append(anchor_c2w @ rel)
     return target_c2ws
 
 
@@ -766,7 +759,8 @@ def main():
     parser.add_argument("--point_size", type=int, default=2)
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--relative_to_source", action="store_true",
-                        help="Compose trajectory poses relative to initial view (default: off, use absolute poses)")
+                        help="Apply the trajectory from each source-frame pose "
+                             "(default: anchor to the first source pose)")
     parser.add_argument("--rotation_only", action="store_true",
                         help="Only apply rotation from the trajectory, ignore translation (tripod pan/tilt)")
     parser.add_argument("--freeze_repeat", type=int, default=0,

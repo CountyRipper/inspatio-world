@@ -135,7 +135,7 @@ A trajectory file is a plain text file with **3 lines**, each containing space-s
 | `--skip_step1` | No | false | Skip caption generation |
 | `--skip_step2` | No | false | Skip depth estimation |
 | `--skip_step3` | No | false | Skip v2v inference |
-| `--relative_to_source` | No | false | Compose trajectory poses relative to initial view |
+| `--relative_to_source` | No | false | Apply trajectory from each source-frame pose; otherwise anchor to the first pose |
 | `--rotation_only` | No | false | Only apply rotation from trajectory, ignore translation (tripod pan/tilt) |
 | `--render_backend` | No | `warper` | Rendering backend: `warper` uses fast depth-image warping and skips point-cloud saving; `ply` uses the original point-cloud renderer |
 | `--disable_adaptive_frame` | No | false | Disable adaptive frame expansion/subsampling (use original frame count as-is) |
