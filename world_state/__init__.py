@@ -18,6 +18,7 @@ from .types import (
 )
 from .domains import (
     ThreeDomainMasks,
+    build_exact_shared_domains,
     build_three_domains,
     erode_source_mask,
     patchify_domains,
@@ -47,6 +48,7 @@ __all__ = [
     "world_state_trainable_parameters",
     "ThreeDomainMasks",
     "attach_world_state_reader_v1",
+    "build_exact_shared_domains",
     "build_three_domains",
     "erode_source_mask",
     "load_world_state_reader_v1",

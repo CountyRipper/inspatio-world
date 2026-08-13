@@ -9,6 +9,7 @@ from torch import nn
 from world_memory.latent_adapter import LatentMemoryAdapter
 from world_state import CameraBatch, Provenance, RotationProjector, WorldObservation
 from world_state.domains import (
+    build_exact_shared_domains,
     build_three_domains,
     strict_source_mask,
 )
@@ -86,6 +87,17 @@ class WorldStateReaderV1Test(unittest.TestCase):
         actual = strict_source_mask(mask4)
         self.assertEqual(actual.flatten().tolist(), [True, True, False])
 
+    def test_exact_shared_domains_ignore_confidence_and_use_source_core(self):
+        packet = RotationProjector().project((generated_observation(),), camera())
+        packet.confidence.zero_()
+        mask4 = torch.full((1, 3, 4, 4, 6), -1.0)
+        mask4[..., :3, :3] = 1.0
+        domains = build_exact_shared_domains(mask4, packet, source_collar=1)
+        self.assertTrue(torch.equal(domains.source, domains.source_core))
+        self.assertTrue(domains.memory[~domains.source].all())
+        self.assertFalse(domains.memory[domains.source].any())
+        self.assertFalse(domains.unknown.any())
+
     def test_encoder_keeps_full_width_center_content_separate_from_metadata(self):
         packet = RotationProjector().project((generated_observation(),), camera())
         domains = build_three_domains(
@@ -120,6 +132,21 @@ class WorldStateReaderV1Test(unittest.TestCase):
         outside = ~encoded.memory_patch.expand_as(hidden)
         self.assertTrue(torch.equal(actual[outside], hidden[outside]))
         self.assertTrue(torch.count_nonzero(gate[~encoded.memory_patch]) == 0)
+
+    def test_forced_exact_gate_is_one_inside_memory_and_zero_outside(self):
+        torch.manual_seed(31)
+        reader = IdentityPreservingWorldReader(16, selector_width=8)
+        hidden = torch.randn(1, 6, 16)
+        encoded = type("Encoded", (), {})()
+        encoded.content = torch.randn(1, 6, 16)
+        encoded.selector_key = torch.randn(1, 6, 8)
+        encoded.memory_patch = torch.tensor(
+            [[[True], [False], [True], [False], [False], [True]]]
+        )
+        context = reader.precompute(encoded, force_memory_gate=True)
+        _, gate = reader(hidden, torch.randn(1, 16), context)
+        self.assertTrue(torch.equal(gate.bool(), encoded.memory_patch))
+        self.assertTrue(torch.equal(gate[encoded.memory_patch], torch.ones(3)))
 
     def test_zero_innovation_is_an_exact_noop(self):
         torch.manual_seed(4)
@@ -220,6 +247,95 @@ class WorldStateReaderV1Test(unittest.TestCase):
                 model.blocks[0].world_reader.value_projection.weight, expected
             )
         )
+
+    def test_runtime_precompute_can_activate_exactly_one_reader_layer(self):
+        class ToyBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Module()
+
+        class ToyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dim = 16
+                self.blocks = nn.ModuleList([ToyBlock() for _ in range(3)])
+
+        model = ToyModel()
+        runtime = WorldStateRuntimeV1(
+            model,
+            LatentMemoryAdapter(model_dim=16),
+            selected_layers=(0, 1, 2),
+            selector_width=8,
+        )
+        packet = RotationProjector().project((generated_observation(),), camera())
+        domains = build_exact_shared_domains(
+            torch.full((1, 3, 4, 4, 6), -1.0), packet
+        )
+        context = runtime.precompute(
+            packet,
+            domains,
+            active_layers=(1,),
+            force_memory_gate=True,
+        )
+        self.assertEqual(tuple(context.layers), (1,))
+        self.assertTrue(context.layers[1].force_memory_gate)
+
+    def test_sidecar_can_export_only_one_reader_without_lora(self):
+        class ToyBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = nn.Module()
+
+        class ToyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dim = 16
+                self.blocks = nn.ModuleList([ToyBlock() for _ in range(2)])
+
+        model = ToyModel()
+        runtime = WorldStateRuntimeV1(
+            model,
+            LatentMemoryAdapter(model_dim=16),
+            selected_layers=(0, 1),
+            selector_width=8,
+            lora_rank=2,
+        )
+        model.add_module("world_state_runtime", runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "layer0.safetensors"
+            save_world_state_reader_v1(
+                model,
+                path,
+                selected_layers=(0,),
+                include_lora=False,
+            )
+            from safetensors import safe_open
+
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                keys = tuple(handle.keys())
+                metadata = handle.metadata()
+            self.assertTrue(any("blocks.0.world_reader" in key for key in keys))
+            self.assertFalse(any("blocks.1.world_reader" in key for key in keys))
+            self.assertFalse(any("world_q_lora" in key for key in keys))
+            self.assertEqual(metadata["selected_layers"], "[0]")
+            self.assertEqual(metadata["lora_rank"], "0")
+
+            deployed = ToyModel()
+            deployed_runtime = WorldStateRuntimeV1(
+                deployed,
+                LatentMemoryAdapter(model_dim=16),
+                selected_layers=(0,),
+                selector_width=8,
+                lora_rank=0,
+            )
+            deployed.add_module("world_state_runtime", deployed_runtime)
+            load_world_state_reader_v1(deployed, path)
+            self.assertTrue(
+                torch.equal(
+                    deployed.blocks[0].world_reader.value_projection.weight,
+                    model.blocks[0].world_reader.value_projection.weight,
+                )
+            )
 
 
 if __name__ == "__main__":

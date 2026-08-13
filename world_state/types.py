@@ -178,6 +178,7 @@ class WorldLayerContextV1:
     projected_value: torch.Tensor  # [B,L,1536]
     memory_patch: torch.Tensor  # [B,L,1], bool
     enable_lora: bool = False
+    force_memory_gate: bool = False
 
 
 @dataclass(frozen=True)

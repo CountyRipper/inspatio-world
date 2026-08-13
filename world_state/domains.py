@@ -1,6 +1,7 @@
 """Mutually exclusive source, memory, and unknown latent domains."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -66,7 +67,7 @@ def erode_source_mask(source: torch.Tensor, collar: int = 1) -> torch.Tensor:
 def generated_projection(
     packet: WorldReadPacket,
     *,
-    confidence_threshold: float,
+    confidence_threshold: Optional[float],
 ) -> tuple[int, torch.Tensor]:
     """Select the single generated center candidate used by Reader v1."""
     generated = (packet.provenance[0] == int(Provenance.GENERATED)).nonzero(
@@ -78,9 +79,11 @@ def generated_projection(
             f"got {generated.numel()}"
         )
     index = int(generated.item())
-    trusted = packet.valid[:, index] & (
-        packet.confidence[:, index] >= float(confidence_threshold)
-    )
+    trusted = packet.valid[:, index]
+    if confidence_threshold is not None:
+        trusted = trusted & (
+            packet.confidence[:, index] >= float(confidence_threshold)
+        )
     return index, trusted
 
 
@@ -103,6 +106,37 @@ def build_three_domains(
     return ThreeDomainMasks(
         source=source,
         source_core=erode_source_mask(source, collar=source_collar),
+        memory=memory,
+        unknown=unknown,
+    )
+
+
+def build_exact_shared_domains(
+    render_mask4: torch.Tensor,
+    packet: WorldReadPacket,
+    *,
+    source_collar: int = 1,
+) -> ThreeDomainMasks:
+    """Build the decisive exact-pose contract without confidence holes.
+
+    ``S`` is the clamped source core, not the wider render-condition mask.
+    Generated validity comes directly from the projected observation. The
+    caller is responsible for supplying a generated-only packet so an older
+    source-candidate authority rule cannot modify ``V``.
+    """
+    source_core = erode_source_mask(
+        strict_source_mask(render_mask4), collar=source_collar
+    )
+    _, projected_in_bounds = generated_projection(
+        packet, confidence_threshold=None
+    )
+    if projected_in_bounds.shape != source_core.shape:
+        raise ValueError("render mask and projected memory must share B,F,H,W")
+    memory = (~source_core) & projected_in_bounds
+    unknown = ~(source_core | memory)
+    return ThreeDomainMasks(
+        source=source_core,
+        source_core=source_core,
         memory=memory,
         unknown=unknown,
     )

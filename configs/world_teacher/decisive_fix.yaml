@@ -1,0 +1,31 @@
+# Exact-only decisive test for the existing innovation Reader.
+experiment:
+  base_config: configs/inference_1.3b.yaml
+  checkpoint: checkpoints/InSpatio-World-1.3B/InSpatio-World-1.3B.safetensors
+  direct_adapter: artifacts/exact_identity/adapter.safetensors
+  teacher_v0_checkpoint: artifacts/world_teacher_v0/checkpoints/teacher_final.safetensors
+  reader_v1_checkpoint: artifacts/world_teacher_v1/checkpoints/reader_v1_final.safetensors
+  data_root: data/world_teacher_v0
+  artifact_root: artifacts/worldstate_reader_decisive_fix
+
+reader:
+  ablation_layers: [8, 14, 20]
+  selected_layers: [8]
+  selector_width: 256
+  source_collar: 1
+  lora_rank: 8
+
+training:
+  steps: 80
+  learning_rate: 0.0002
+  weight_decay: 0.0
+  save_every: 20
+
+evaluation:
+  exact_block: 16
+  hold_block: 17
+  layer_sets:
+    layer8: [8]
+    layer14: [14]
+    layer20: [20]
+    all_layers: [8, 14, 20]

@@ -61,12 +61,14 @@ class IdentityPreservingWorldReader(nn.Module):
         encoded: EncodedWorldContentV1,
         *,
         enable_lora: bool = False,
+        force_memory_gate: bool = False,
     ) -> WorldLayerContextV1:
         return WorldLayerContextV1(
             selector_key=encoded.selector_key,
             projected_value=self.value_projection(encoded.content),
             memory_patch=encoded.memory_patch,
             enable_lora=enable_lora,
+            force_memory_gate=force_memory_gate,
         )
 
     def forward(
@@ -78,11 +80,14 @@ class IdentityPreservingWorldReader(nn.Module):
         if hidden.shape[:2] != context.selector_key.shape[:2]:
             raise ValueError("world context and DiT hidden sequence do not match")
         normalized = self.hidden_norm(hidden)
-        query = self.selector_query(normalized)
-        query = query + self.selector_timestep(timestep_embedding).unsqueeze(1)
-        memory_logit = (query * context.selector_key).sum(dim=-1, keepdim=True)
-        memory_logit = memory_logit * (self.selector_width ** -0.5)
-        alpha = torch.sigmoid(memory_logit - self.null_logit)
+        if context.force_memory_gate:
+            alpha = torch.ones_like(context.memory_patch, dtype=hidden.dtype)
+        else:
+            query = self.selector_query(normalized)
+            query = query + self.selector_timestep(timestep_embedding).unsqueeze(1)
+            memory_logit = (query * context.selector_key).sum(dim=-1, keepdim=True)
+            memory_logit = memory_logit * (self.selector_width ** -0.5)
+            alpha = torch.sigmoid(memory_logit - self.null_logit)
         gate = context.memory_patch.to(alpha.dtype) * alpha
 
         current = self.current_projection(normalized)

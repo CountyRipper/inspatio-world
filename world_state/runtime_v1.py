@@ -63,12 +63,22 @@ class WorldStateRuntimeV1(nn.Module):
         self,
         packet: WorldReadPacket,
         domains: ThreeDomainMasks,
+        *,
+        active_layers: Optional[Sequence[int]] = None,
+        force_memory_gate: bool = False,
     ) -> Optional[WorldBlockContextV1]:
         if not domains.memory.any():
             return None
         model = self._model_ref()
         if model is None:
             raise RuntimeError("the attached DiT model no longer exists")
+        layers_to_use = (
+            self.selected_layers
+            if active_layers is None
+            else tuple(int(index) for index in active_layers)
+        )
+        if not layers_to_use or not set(layers_to_use).issubset(self.selected_layers):
+            raise ValueError("active_layers must be a non-empty Reader layer subset")
         autocast = (
             torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)
             if packet.candidate_20ch.device.type == "cuda"
@@ -80,8 +90,9 @@ class WorldStateRuntimeV1(nn.Module):
                 index: model.blocks[index].world_reader.precompute(
                     encoded,
                     enable_lora=self.lora_enabled and self.lora_rank > 0,
+                    force_memory_gate=force_memory_gate,
                 )
-                for index in self.selected_layers
+                for index in layers_to_use
             }
         return WorldBlockContextV1(
             layers=layers,
@@ -148,7 +159,29 @@ def world_state_v1_trainable_parameters(
     return parameters
 
 
-def _reader_v1_state(model: nn.Module):
+def _reader_v1_state(
+    model: nn.Module,
+    *,
+    selected_layers: Optional[Sequence[int]] = None,
+    include_lora: bool = True,
+):
+    runtime = model.world_state_runtime
+    layers = (
+        runtime.selected_layers
+        if selected_layers is None
+        else tuple(int(index) for index in selected_layers)
+    )
+    if not layers or not set(layers).issubset(runtime.selected_layers):
+        raise ValueError("selected_layers must be a non-empty attached layer subset")
+    reader_prefixes = tuple(f"blocks.{index}.world_reader." for index in layers)
+    lora_prefixes = tuple(
+        prefix
+        for index in layers
+        for prefix in (
+            f"blocks.{index}.self_attn.world_q_lora.",
+            f"blocks.{index}.self_attn.world_o_lora.",
+        )
+    )
     return {
         name: value.detach().cpu().contiguous()
         for name, value in model.state_dict().items()
@@ -156,27 +189,44 @@ def _reader_v1_state(model: nn.Module):
             "world_state_runtime.encoder" in name
             and ".content_adapter." not in name
         )
-        or ".world_reader." in name
-        or ".world_q_lora." in name
-        or ".world_o_lora." in name
+        or name.startswith(reader_prefixes)
+        or (include_lora and name.startswith(lora_prefixes))
     }
 
 
 def save_world_state_reader_v1(
-    model: nn.Module, path, *, metadata: Optional[dict] = None
+    model: nn.Module,
+    path,
+    *,
+    metadata: Optional[dict] = None,
+    selected_layers: Optional[Sequence[int]] = None,
+    include_lora: bool = True,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     runtime = model.world_state_runtime
+    layers = (
+        runtime.selected_layers
+        if selected_layers is None
+        else tuple(int(index) for index in selected_layers)
+    )
     values = {
         "format": "inspatio_worldstate_reader_v1",
-        "selected_layers": json.dumps(runtime.selected_layers),
+        "selected_layers": json.dumps(layers),
         "selector_width": str(runtime.selector_width),
         "confidence_threshold": str(runtime.confidence_threshold),
-        "lora_rank": str(runtime.lora_rank),
+        "lora_rank": str(runtime.lora_rank if include_lora else 0),
     }
     values.update({key: str(value) for key, value in (metadata or {}).items()})
-    save_file(_reader_v1_state(model), str(path), metadata=values)
+    save_file(
+        _reader_v1_state(
+            model,
+            selected_layers=layers,
+            include_lora=include_lora,
+        ),
+        str(path),
+        metadata=values,
+    )
 
 
 def load_world_state_reader_v1(model: nn.Module, path) -> None:
