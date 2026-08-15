@@ -90,7 +90,7 @@ def make_comparison_video(
     write_video(
         str(output_path),
         tensor,
-        fps=float(fps or min(source_fps)),
+        fps=int(round(fps or min(source_fps))),
         video_codec="h264",
         options={"crf": "18"},
     )

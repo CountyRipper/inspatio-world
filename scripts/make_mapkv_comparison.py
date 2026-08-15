@@ -161,7 +161,7 @@ def make_video(
     write_video(
         str(output),
         torch.from_numpy(np.stack(rows)),
-        fps=min(fps_values),
+        fps=int(round(min(fps_values))),
         video_codec="h264",
         options={"crf": "18"},
     )

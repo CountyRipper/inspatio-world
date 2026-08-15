@@ -117,7 +117,7 @@ def make_phase1_video(
     write_video(
         str(output),
         torch.from_numpy(np.stack(output_frames)),
-        fps=min(fps_values),
+        fps=int(round(min(fps_values))),
         video_codec="h264",
         options={"crf": "18"},
     )
@@ -271,6 +271,17 @@ def main() -> None:
     metrics_text = json.dumps(metrics, indent=2)
     (oracle_root / "metrics.json").write_text(metrics_text, encoding="utf-8")
     (final_root / "metrics.json").write_text(metrics_text, encoding="utf-8")
+    geometry_root = artifact_root / "geometry"
+    geometry_root.mkdir(parents=True, exist_ok=True)
+    (geometry_root / "SKIPPED.md").write_text(
+        "# Phase II not executed\n\n"
+        "Phase I was a NO-GO: stable OracleKV injection did not clearly restore "
+        "the first-visit appearance. Per Situation A in the experiment protocol, "
+        "CUT3R/PoseKV/GeometryKV generation was stopped instead of obscuring the "
+        "payload result with a geometry experiment. This is not a negative result "
+        "for CUT3R retrieval.\n",
+        encoding="utf-8",
+    )
 
     source_block = mapping_block(mapping, args.source_chunk)
     target_block = mapping_block(mapping, args.target_chunk)
