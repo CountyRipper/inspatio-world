@@ -13,6 +13,8 @@ import torch
 from PIL import Image, ImageDraw
 from torchvision.io import read_video, write_video
 
+from mapkv_proto.metrics import compute_revisit_metrics
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -194,6 +196,23 @@ def run_metrics(
                 index for index, value in enumerate(block_diffs) if value != 0.0
             ]
         metrics["methods"][name] = method
+    metrics.update(
+        compute_revisit_metrics(
+            source_keyframe=keyframe(baseline_root, mapping, source_chunk),
+            revisit_keyframes={
+                name: keyframe(root, mapping, target_chunk)
+                for name, root in run_roots.items()
+            },
+            boundary_pairs={
+                name: (
+                    keyframe(root, mapping, target_chunk - 1),
+                    keyframe(root, mapping, target_chunk),
+                )
+                for name, root in run_roots.items()
+            },
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+    )
     return metrics
 
 
@@ -265,7 +284,6 @@ def main() -> None:
             "baseline_repeat_max_abs_diff": baseline_meta["replay"]["in_process_memory_off"]["max_abs_diff"],
             "legacy_attention_max_abs_diff": legacy_meta["replay"]["against_saved_latents"]["max_abs_diff"],
             "alpha_zero_max_abs_diff": alpha_zero_meta["replay"]["against_saved_latents"]["max_abs_diff"],
-            "lpips_available": False,
         }
     )
     metrics_text = json.dumps(metrics, indent=2)
@@ -286,6 +304,23 @@ def main() -> None:
     source_block = mapping_block(mapping, args.source_chunk)
     target_block = mapping_block(mapping, args.target_chunk)
     stable = metrics["methods"]
+    if metrics["lpips_available"]:
+        revisit_lpips = metrics["revisit_lpips"]
+        boundary_lpips = metrics["boundary_lpips"]
+        lpips_summary = (
+            f" LPIPS was baseline={revisit_lpips['baseline']:.9f}, "
+            f"WrongKV={revisit_lpips['wrong_a010']:.9f}, "
+            f"Oracle .05/.10/.20={revisit_lpips['oracle_a005']:.9f}/"
+            f"{revisit_lpips['oracle_a010']:.9f}/{revisit_lpips['oracle_a020']:.9f}."
+        )
+        boundary_lpips_summary = (
+            f" Boundary LPIPS was baseline={boundary_lpips['baseline']:.9f} and "
+            f"Oracle .05/.10/.20={boundary_lpips['oracle_a005']:.9f}/"
+            f"{boundary_lpips['oracle_a010']:.9f}/{boundary_lpips['oracle_a020']:.9f}."
+        )
+    else:
+        lpips_summary = " LPIPS was unavailable in the runtime environment."
+        boundary_lpips_summary = " Boundary LPIPS was unavailable in the runtime environment."
     report = f"""# CUT3R-Surfel KV Prototype Report
 
 ## Environment
@@ -304,10 +339,10 @@ def main() -> None:
 
 ## Phase I — Oracle KV
 - Baseline vs AlphaZero equality: legacy-attention vs memory-off max_abs_diff={metrics['legacy_attention_max_abs_diff']}; memory-off repeat={metrics['baseline_repeat_max_abs_diff']}; AlphaZero vs baseline={metrics['alpha_zero_max_abs_diff']}.
-- Correct Oracle visual effect: alpha 0.05–0.20 produced small, target-local changes but no clearly visible restoration of source-region identity. Blind-weighted source L1 was baseline={stable['baseline']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}, Oracle .05={stable['oracle_a005']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}, .10={stable['oracle_a010']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}, .20={stable['oracle_a020']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}; the tiny/non-monotonic deltas are not evidence of recovery.
+- Correct Oracle visual effect: alpha 0.05–0.20 produced small, target-local changes but no clearly visible restoration of source-region identity. Blind-weighted source L1 was baseline={stable['baseline']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}, Oracle .05={stable['oracle_a005']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}, .10={stable['oracle_a010']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}, .20={stable['oracle_a020']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}; the tiny/non-monotonic deltas are not evidence of recovery.{lpips_summary}
 - WrongKV visual effect: WrongKV also produced only a small change and did not improve identity; blind-weighted source L1={stable['wrong_a010']['source_revisit_pixel_l1_reference_blind_weighted']:.9f}.
 - Best alpha/layer/step: no successful alpha; tested 0.05/0.10/0.20 on layers 26–29 at step index 3. Alpha 1.0 was diagnostic only and moved target latent max_abs_diff to 0.98046875 without moving the image toward the source.
-- Activation discontinuity: no obvious scene cut or camera failure. Boundary L1 stayed near baseline {stable['baseline']['boundary_pixel_l1']:.9f} (Oracle .05/.10/.20: {stable['oracle_a005']['boundary_pixel_l1']:.9f}/{stable['oracle_a010']['boundary_pixel_l1']:.9f}/{stable['oracle_a020']['boundary_pixel_l1']:.9f}).
+- Activation discontinuity: no obvious scene cut or camera failure. Boundary L1 stayed near baseline {stable['baseline']['boundary_pixel_l1']:.9f} (Oracle .05/.10/.20: {stable['oracle_a005']['boundary_pixel_l1']:.9f}/{stable['oracle_a010']['boundary_pixel_l1']:.9f}/{stable['oracle_a020']['boundary_pixel_l1']:.9f}).{boundary_lpips_summary}
 - Conclusion: NO-GO
 
 ## Phase II — Geometry Retrieval
