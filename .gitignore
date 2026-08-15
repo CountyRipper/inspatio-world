@@ -23,3 +23,7 @@ dist/
 build/
 *.so
 .env
+
+# MapKV prototype outputs and pinned external research dependency
+artifacts/
+third_party/vmem/

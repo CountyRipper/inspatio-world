@@ -1,0 +1,43 @@
+experiment:
+  seed: 0
+  use_saved_noise_bundle: true
+  noise_bundle_path: artifacts/baseline/noise_bundle.pt
+  save_latents: true
+  save_lossless_keyframes: true
+
+mapkv:
+  enabled: false
+  mode: off
+  source_chunk: null
+  target_chunks: []
+  wrong_chunk: null
+  selected_layers: [-4, -3, -2, -1]
+  selected_step_indices: [-1]
+  alpha: 0.10
+  gate:
+    mode: ref_blind
+    smooth_kernel: 3
+  bank:
+    root: artifacts/baseline/kv_bank
+    storage_device: cpu
+    pin_memory: true
+    dtype: bfloat16
+    capture_selected_layers_only: true
+
+geometry:
+  views_json: artifacts/geometry/views/views.json
+  surfel_index: artifacts/geometry/surfel_index.npz
+  retrieval_plan: artifacts/geometry/surfel_plan.json
+  top_k: 1
+  exclude_immediate_previous: true
+
+cut3r:
+  checkpoint: null
+  image_size: 512
+  incremental: true
+  niter: 100
+  lr: 0.01
+  pointmap_grid: [30, 52]
+  conf_threshold: 1.0
+  radius_scale: 0.5
+  merge_normal_cosine: 0.6

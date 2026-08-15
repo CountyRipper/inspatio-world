@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Mapping, Optional
 import torch
 import time
 from contextlib import nullcontext
@@ -22,6 +22,10 @@ def denoise_block(
     denoising_kv_size=0,
     denoising_kv_size_0=0,
     denoising_steps=None,
+    block_id=0,
+    after_context_write=None,
+    noise_provider=None,
+    memory_context=None,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -45,14 +49,25 @@ def denoise_block(
                 kv_size=(context_kv_size_0, -1),
                 freqs_offset=context_freqs_offset,
             )
+        if after_context_write is not None:
+            after_context_write(
+                block_id=block_id,
+                kv_cache=kv_cache,
+                context_frames=context_frames,
+            )
 
     for index, current_timestep in enumerate(denoising_steps):
         is_last_step = (index == len(denoising_steps) - 1)
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
 
         ctx = torch.no_grad() if not is_last_step else nullcontext()
+        step_memory = (
+            memory_context.for_denoising_step(index, len(denoising_steps))
+            if memory_context is not None
+            else None
+        )
         with ctx:
-            _, denoised_pred = generator(
+            generator_kwargs = dict(
                 noisy_image_or_video=noisy_input,
                 conditional_dict=conditional_dict,
                 timestep=timestep,
@@ -61,14 +76,25 @@ def denoise_block(
                 render_latent_input=render_block,
                 freqs_offset=6,
             )
+            if step_memory is not None:
+                generator_kwargs["memory_context"] = step_memory
+            _, denoised_pred = generator(**generator_kwargs)
 
         if is_last_step:
             noise_before_last_step = noisy_input.clone()
         else:
             next_t = denoising_steps[index + 1]
+            if noise_provider is None:
+                step_noise = torch.randn_like(denoised_pred)
+            else:
+                step_noise = noise_provider.get_re_noise(
+                    block_id=block_id,
+                    step_index=index,
+                    like=denoised_pred,
+                )
             noisy_input = scheduler.add_noise(
                 denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
+                step_noise.flatten(0, 1),
                 next_t * torch.ones([B * F], device=device, dtype=torch.long)
             ).unflatten(0, denoised_pred.shape[:2])
 
@@ -109,7 +135,7 @@ class CausalInferencePipeline(torch.nn.Module):
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
         self.num_transformer_blocks = len(self.generator.model.blocks)
-        self.frame_seq_length = 1560
+        self.frame_seq_length = None
 
         self.kv_cache1 = None
         self.args = args
@@ -121,6 +147,9 @@ class CausalInferencePipeline(torch.nn.Module):
             self.generator.model.num_frame_per_block = self.num_frame_per_block
         
         self.max_num_context_frames = 6
+        self._layout_printed = False
+        self.last_query_gates = {}
+        self.last_block_latencies = {}
 
     def inference(
         self,
@@ -130,6 +159,9 @@ class CausalInferencePipeline(torch.nn.Module):
         render_latent: Optional[torch.Tensor] = None,
         mask_latent: Optional[torch.Tensor] = None,
         decode: bool = True,
+        noise_provider=None,
+        after_context_write=None,
+        memory_contexts: Optional[Mapping[int, object]] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -147,6 +179,12 @@ class CausalInferencePipeline(torch.nn.Module):
         batch_size, num_frames, num_channels, height, width = noise.shape
         assert num_frames % self.num_frame_per_block == 0, f"num_frames {num_frames} is not a multiple of num_frame_per_block {self.num_frame_per_block}"
         num_blocks = num_frames // self.num_frame_per_block
+        layout = self._runtime_layout(height, width)
+        self.frame_seq_length = layout["tokens_per_frame"]
+        if memory_contexts or after_context_write is not None:
+            assert self.num_frame_per_block == 3, (
+                "The MapKV prototype currently supports num_frame_per_block=3 only"
+            )
 
         num_output_frames = num_frames   # add the initial latent frames
         conditional_dict = self.text_encoder(
@@ -161,17 +199,13 @@ class CausalInferencePipeline(torch.nn.Module):
 
 
         # Step 1: Initialize KV cache to all zeros
-        if self.kv_cache1 is None:
-            self._initialize_kv_cache(
-                batch_size=batch_size,
-                dtype=noise.dtype,
-                device=noise.device
-            )
-        else:
-            # reset kv cache
-            for block_index in range(len(self.kv_cache1)):
-                self.kv_cache1[block_index]["k"].detach_().zero_()
-                self.kv_cache1[block_index]["v"].detach_().zero_()
+        self._initialize_kv_cache(
+            batch_size=batch_size,
+            dtype=noise.dtype,
+            device=noise.device,
+            latent_height=height,
+            latent_width=width,
+        )
  
         # Step 3: Temporal denoising loop
         print(f"Generating {num_blocks} blocks...")
@@ -180,14 +214,18 @@ class CausalInferencePipeline(torch.nn.Module):
 
         start_index = 0
         last_pred = None
-        for num_block_frame in all_num_frames:
+        self.last_query_gates = {}
+        self.last_block_latencies = {}
+        for block_id, num_block_frame in enumerate(all_num_frames):
+            block_start_time = time.time()
             noisy_input = noise[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             ref_block = ref_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             render_block = torch.cat([mask_block, render_block], dim=2)
 
-            kv_size = 1560*3
+            recent_slot_len = layout["recent_slot_len"]
+            kv_size = recent_slot_len
 
             # Prepare context
             context_frames = None
@@ -200,7 +238,25 @@ class CausalInferencePipeline(torch.nn.Module):
                 zero_latents = torch.zeros_like(last_pred)
                 last_pred_padded = torch.cat([last_pred, zero_latents[:, :, :4], zero_latents], dim=2)
                 context_frames = torch.cat([ref_block, last_pred_padded], dim=1)
-                kv_size = kv_size + 1560 * 3
+                kv_size = 2 * recent_slot_len
+                assert kv_size == layout["kv_size_used_for_nonfirst_block"]
+
+            block_memory = (memory_contexts or {}).get(block_id)
+            if block_memory is not None:
+                if block_id == 0:
+                    raise ValueError("Memory cannot be activated on the first block")
+                if block_memory.target_block != block_id:
+                    raise ValueError(
+                        f"Memory target {block_memory.target_block} does not match block {block_id}"
+                    )
+                if block_memory.source_chunk >= block_id - 1:
+                    raise ValueError(
+                        "Memory source must be older than the immediate previous chunk"
+                    )
+                block_memory = block_memory.with_query_gate(
+                    mask_block, layout["token_hw"]
+                )
+                self.last_query_gates[block_id] = block_memory.query_gate.detach().cpu()
 
             denoised_pred, _ = denoise_block(
                 self.generator, self.scheduler, noisy_input, conditional_dict,
@@ -211,12 +267,17 @@ class CausalInferencePipeline(torch.nn.Module):
                 render_block=render_block,
                 denoising_kv_size=kv_size,
                 denoising_steps=self.denoising_step_list,
+                block_id=block_id,
+                after_context_write=after_context_write,
+                noise_provider=noise_provider,
+                memory_context=block_memory,
             )
 
 
             # Step 3.2: record the model's output
             output[:, start_index:start_index + num_block_frame] = denoised_pred
             last_pred = denoised_pred.clone().detach()
+            self.last_block_latencies[block_id] = time.time() - block_start_time
 
             # Step 3.4: update the start and end frame indices
             start_index += num_block_frame
@@ -231,14 +292,56 @@ class CausalInferencePipeline(torch.nn.Module):
 
         return video
 
-    def _initialize_kv_cache(self, batch_size, dtype, device):
+    def _runtime_layout(self, latent_height, latent_width):
+        patch_size = tuple(self.generator.model.config.patch_size)
+        if len(patch_size) != 3 or patch_size[0] != 1:
+            raise ValueError(f"Unsupported causal patch size: {patch_size}")
+        if latent_height % patch_size[1] or latent_width % patch_size[2]:
+            raise ValueError(
+                f"Latent size {(latent_height, latent_width)} is not divisible by {patch_size[1:]}"
+            )
+        h_token = latent_height // patch_size[1]
+        w_token = latent_width // patch_size[2]
+        tokens_per_frame = h_token * w_token
+        recent_slot_len = self.num_frame_per_block * tokens_per_frame
+        layout = {
+            "latent_hw": (latent_height, latent_width),
+            "token_hw": (h_token, w_token),
+            "tokens_per_frame": tokens_per_frame,
+            "recent_slot_len": recent_slot_len,
+            "kv_size_used_for_nonfirst_block": 2 * recent_slot_len,
+        }
+        assert tokens_per_frame == h_token * w_token
+        assert recent_slot_len == self.num_frame_per_block * tokens_per_frame
+        assert layout["kv_size_used_for_nonfirst_block"] == 2 * recent_slot_len
+        if not self._layout_printed:
+            print(f"[MapKV layout] {layout}")
+            self._layout_printed = True
+        return layout
+
+    def _initialize_kv_cache(
+        self,
+        batch_size,
+        dtype,
+        device,
+        latent_height=None,
+        latent_width=None,
+    ):
         """
         Initialize or reuse KV cache for the Wan model.
         Uses detach() + zero_() to safely reuse cache without gradient issues.
         Cache is allocated only once; subsequent calls only zero the existing tensors.
         """
+        if latent_height is None:
+            latent_height = int(getattr(self.args, "height", 480)) // 8
+        if latent_width is None:
+            latent_width = int(getattr(self.args, "width", 832)) // 8
+        layout = self._runtime_layout(latent_height, latent_width)
+        kv_cache_size = layout["kv_size_used_for_nonfirst_block"]
+
         if self.kv_cache1 is not None and len(self.kv_cache1) == self.num_transformer_blocks \
                 and self.kv_cache1[0]["k"].shape[0] == batch_size \
+                and self.kv_cache1[0]["k"].shape[1] == kv_cache_size \
                 and self.kv_cache1[0]["k"].dtype == dtype \
                 and self.kv_cache1[0]["k"].device == device:
             for block_cache in self.kv_cache1:
@@ -246,7 +349,6 @@ class CausalInferencePipeline(torch.nn.Module):
                 block_cache["v"].detach_().zero_()
             return
 
-        kv_cache_size = 1560 * 6
         num_heads = self.generator.model.config.num_heads
         dim = self.generator.model.config.dim
 
