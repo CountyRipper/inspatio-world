@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+import torch
+
+from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
+from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
+from mapkv_proto.kv_bank import KVBank, KVBankWriter
+from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
+from pipeline.causal_inference import denoise_block
+
+
+def test_reference_blind_gate_follows_upstream_mask_semantics():
+    valid = torch.ones(1, 3, 4, 4, 6)
+    invalid = -torch.ones_like(valid)
+    assert torch.count_nonzero(reference_blind_gate(valid, (2, 3))) == 0
+    gate = reference_blind_gate(invalid, (2, 3), smooth_kernel=1)
+    torch.testing.assert_close(gate, torch.ones_like(gate))
+
+
+def test_noise_bundle_roundtrip_and_provider_does_not_use_global_rng(tmp_path):
+    bundle = DeterministicNoiseBundle.create(
+        shape=(1, 3, 1, 2, 2),
+        num_blocks=1,
+        num_denoising_steps=3,
+        seed=17,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    path = tmp_path / "noise_bundle.pt"
+    bundle.save(path)
+    loaded = DeterministicNoiseBundle.load(path)
+    torch.testing.assert_close(loaded.initial_noise, bundle.initial_noise, rtol=0, atol=0)
+
+    class Generator:
+        def __call__(self, *, noisy_image_or_video, kv_size, **kwargs):
+            if kv_size[1] < 0:
+                return torch.zeros_like(noisy_image_or_video)
+            return torch.zeros_like(noisy_image_or_video), noisy_image_or_video + 0.25
+
+    class Scheduler:
+        @staticmethod
+        def add_noise(x, noise, timestep):
+            return x + noise
+
+    kwargs = dict(
+        generator=Generator(),
+        scheduler=Scheduler(),
+        noisy_input=loaded.get_initial(device="cpu", dtype=torch.float32),
+        conditional_dict={},
+        kv_cache=[],
+        denoising_steps=torch.tensor([3, 2, 1]),
+        block_id=0,
+        noise_provider=loaded,
+    )
+    state_before = torch.random.get_rng_state().clone()
+    first, _ = denoise_block(**kwargs)
+    state_after = torch.random.get_rng_state().clone()
+    second, _ = denoise_block(**kwargs)
+    assert torch.equal(state_before, state_after)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+def test_kv_bank_captures_only_clean_recent_slot(tmp_path):
+    caches = []
+    for layer in range(4):
+        base = torch.arange(8, dtype=torch.float32).view(1, 8, 1, 1) + 100 * layer
+        caches.append({"k": base.clone(), "v": (base + 50).clone()})
+    writer = KVBankWriter(
+        tmp_path,
+        selected_layers=(-2, -1),
+        num_layers=4,
+        recent_slot_len=4,
+        frames_per_block=2,
+        tokens_per_frame=2,
+        dtype=torch.float32,
+    )
+    writer(block_id=1, kv_cache=caches, context_frames=torch.zeros(1, 4, 1, 1, 1))
+
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert sorted(metadata["chunks"]["0"]["layers"]) == ["2", "3"]
+    assert not (tmp_path / "chunk_0000/layer_00.pt").exists()
+
+    bank = KVBank(tmp_path)
+    payloads = bank.materialize(
+        0,
+        selected_layers=(-2, -1),
+        num_layers=4,
+        device="cpu",
+        dtype=torch.float32,
+        pin_memory=False,
+    )
+    torch.testing.assert_close(payloads[2][0], caches[2]["k"][:, 4:8])
+    torch.testing.assert_close(payloads[3][1], caches[3]["v"][:, 4:8])
+
+
+def test_auxiliary_attention_is_strictly_opt_in_and_cache_safe(monkeypatch):
+    import wan.modules.causal_model as causal_model
+
+    calls = []
+
+    def fake_attention(q, k, v):
+        calls.append((k.clone(), v.clone()))
+        return q + v.mean(dim=1, keepdim=True)
+
+    monkeypatch.setattr(causal_model, "attention", fake_attention)
+    module = causal_model.CausalWanSelfAttention(
+        dim=4, num_heads=2, qk_norm=False
+    )
+    with torch.no_grad():
+        identity = torch.eye(4)
+        for projection in (module.q, module.k, module.v, module.o):
+            projection.weight.copy_(identity)
+            projection.bias.zero_()
+
+    x = torch.tensor([[[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]])
+    freqs = torch.ones(2, 1, 1, dtype=torch.complex128)
+    cache = {
+        "k": torch.arange(16, dtype=torch.float32).view(1, 4, 2, 2),
+        "v": torch.arange(16, dtype=torch.float32).view(1, 4, 2, 2) + 20,
+    }
+    cache_before = {name: tensor.clone() for name, tensor in cache.items()}
+
+    baseline = module(x, None, freqs, kv_cache=cache, kv_size=(0, 4))
+    assert len(calls) == 1
+
+    calls.clear()
+    alpha_zero = ActiveLayerMemory(
+        k=torch.full((1, 2, 2, 2), -5.0),
+        v=torch.full((1, 2, 2, 2), 200.0),
+        alpha=0.0,
+        query_gate=torch.ones(1, 2),
+        source_chunk=0,
+    )
+    alpha_zero_out = module(
+        x, None, freqs, kv_cache=cache, kv_size=(0, 4), layer_memory=alpha_zero
+    )
+    assert len(calls) == 1
+    torch.testing.assert_close(alpha_zero_out, baseline, rtol=0, atol=0)
+
+    calls.clear()
+    active = ActiveLayerMemory(
+        k=torch.full((1, 2, 2, 2), -5.0),
+        v=torch.full((1, 2, 2, 2), 200.0),
+        alpha=0.1,
+        query_gate=torch.ones(1, 2),
+        source_chunk=0,
+    )
+    active_out = module(
+        x, None, freqs, kv_cache=cache, kv_size=(0, 4), layer_memory=active
+    )
+    assert len(calls) == 2
+    assert not torch.equal(active_out, baseline)
+    for name in cache:
+        torch.testing.assert_close(cache[name], cache_before[name], rtol=0, atol=0)
+
+    with pytest.raises(AssertionError, match="writer"):
+        module(x, None, freqs, kv_cache=cache, kv_size=(0, -1), layer_memory=active)
+
+
+def test_surfel_merge_serialization_and_causal_visibility_vote(tmp_path):
+    original = KVSurfel(
+        position=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+        normal=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        radius=0.4,
+        confidence=3.0,
+        observing_chunks=[1],
+        created_chunk=1,
+    )
+    index = SurfelIndex([original])
+    close_observation = KVSurfel(
+        position=np.array([0.01, 0.0, 2.0], dtype=np.float32),
+        normal=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        radius=0.4,
+        confidence=99.0,
+        observing_chunks=[3],
+        created_chunk=3,
+    )
+    merge = index.merge(
+        [close_observation], position_threshold=0.05, normal_cosine=0.6
+    )
+    assert merge["merged"] == 1
+    assert len(index.surfels) == 1
+    assert index.surfels[0].observing_chunks == [1, 3]
+    assert index.surfels[0].confidence == 3.0
+
+    index.surfels.extend(
+        [
+            KVSurfel(
+                position=np.array([0.5, 0.0, 3.0], dtype=np.float32),
+                normal=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                radius=0.1,
+                confidence=0.5,
+                observing_chunks=[2],
+                created_chunk=2,
+            ),
+            KVSurfel(
+                position=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                normal=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+                radius=0.8,
+                confidence=1000.0,
+                observing_chunks=[4],
+                created_chunk=4,
+            ),
+        ]
+    )
+    path = tmp_path / "surfels.npz"
+    index.save(path, tmp_path / "surfels.ply")
+    loaded = SurfelIndex.load(path)
+    intrinsic = np.array([[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]])
+    plan, rendered = loaded.retrieve(
+        target_chunk=5,
+        c2w=np.eye(4),
+        intrinsic=intrinsic,
+        image_hw=(11, 11),
+        oracle_chunk=1,
+    )
+    assert 4 not in plan["candidate_chunks"]
+    assert plan["selected_chunks"] == [1]
+    assert plan["oracle_hit"] is True
+    assert rendered["coverage"].sum() > 0
+    assert not np.any(rendered["surfel_id"] == 2), "future-created surfel leaked into target"
+    chunk_one_coverage = loaded.coverage_for_chunk(
+        rendered, chunk_id=1, target_chunk=5
+    )
+    chunk_two_coverage = loaded.coverage_for_chunk(
+        rendered, chunk_id=2, target_chunk=5
+    )
+    assert chunk_one_coverage.sum() > 0
+    assert chunk_two_coverage.sum() == 0, "occluded chunk must have empty coverage"
+    with pytest.raises(ValueError, match="causally valid"):
+        loaded.coverage_for_chunk(rendered, chunk_id=4, target_chunk=5)
