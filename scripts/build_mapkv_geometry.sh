@@ -9,6 +9,7 @@ ARTIFACT_ROOT="${MAPKV_ARTIFACT_ROOT:-${REPO_ROOT}/artifacts}"
 VMEM_ROOT="${VMEM_ROOT:-${REPO_ROOT}/third_party/vmem}"
 CUT3R_CHECKPOINT="${CUT3R_CHECKPOINT:-${VMEM_ROOT}/extern/CUT3R/src/cut3r_512_dpt_4_64.pth}"
 CUT3R_DEVICE="${CUT3R_DEVICE:-cuda:0}"
+CUT3R_GPU="${CUT3R_GPU:-${MAPKV_GPU:-0}}"
 TARGET_CHUNK=""
 ORACLE_SOURCE=""
 
@@ -33,7 +34,8 @@ done
 GEOMETRY_ROOT="${ARTIFACT_ROOT}/geometry"
 VIEWS_ROOT="${GEOMETRY_ROOT}/views"
 cd "${REPO_ROOT}"
-PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${CUT3R_GPU}" \
+  PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${INSPATIO_PYTHON}" -m mapkv_proto.cut3r.export_views \
   --block_mapping "${ARTIFACT_ROOT}/baseline/block_mapping.json" \
   --anchor_image "${ARTIFACT_ROOT}/baseline/anchor.png" \

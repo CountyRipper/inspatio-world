@@ -66,7 +66,8 @@ fi
 RUN_ROOT="${ARTIFACT_ROOT}/oracle/runs/${RUN_NAME}"
 VIDEO_OUTPUT="${ARTIFACT_ROOT}/oracle/${RUN_NAME}.mp4"
 cd "${REPO_ROOT}"
-CUDA_VISIBLE_DEVICES="${GPU}" PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${GPU}" \
+  PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${PYTHON_BIN}" inference_mapkv_proto.py \
   --config_path configs/inference_1.3b.yaml \
   --mapkv_config configs/mapkv_proto.yaml \

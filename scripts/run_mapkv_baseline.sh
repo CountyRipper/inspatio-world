@@ -24,7 +24,8 @@ if [[ "${MAPKV_REQUIRE_EXACT:-0}" == "1" ]]; then
 fi
 
 cd "${REPO_ROOT}"
-CUDA_VISIBLE_DEVICES="${GPU}" PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${GPU}" \
+  PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${PYTHON_BIN}" inference_mapkv_proto.py \
   --config_path configs/inference_1.3b.yaml \
   --mapkv_config configs/mapkv_proto.yaml \
