@@ -324,7 +324,8 @@ def main() -> None:
     report = f"""# CUT3R-Surfel KV Prototype Report
 
 ## Environment
-- InSpatio commit: {baseline_meta['git_commit']}
+- InSpatio base commit: 2d15b7c742fbc90bfd7e67052a260ff87d97abc3
+- Prototype run commit: {baseline_meta['git_commit']}
 - VMem commit: 39291e4f272f6b4f270691d930926ab5930f942e (pinned reference; Phase II not executed)
 - CUT3R checkpoint: not used because Phase I was NO-GO
 - GPU: {baseline_meta['gpu']}
