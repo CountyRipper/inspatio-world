@@ -204,11 +204,11 @@ class WanDiffusionWrapper(torch.nn.Module):
             filter_list=[],
             in_dim=36,
             dual_model=False,
-            high_noise_threshold=0.5,
+        high_noise_threshold=0.5,
     ):
         super().__init__()
         import torch.distributed as dist
-        rank = dist.get_rank()
+        rank = dist.get_rank() if dist.is_initialized() else 0
         torch.set_num_threads(32)
 
         # model_path: use the first weight_list path's directory as the model config source,
@@ -300,7 +300,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 missing_keys_2, unexpected_keys_2 = self.model_2.load_state_dict(state_dict_full_2, strict=False)
                 print(f"load_model_2 {model_path} (low noise model for Wan2.2) missing_keys: {len(missing_keys_2)} unexpected_keys: {len(unexpected_keys_2)}")
 
-        dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
 
         self.uniform_timestep = not is_causal
 
