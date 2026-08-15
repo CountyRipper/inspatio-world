@@ -7,6 +7,13 @@ from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.render_warper import convert_mask_video
 
 
+def _model_config_value(model, name):
+    config = model.config
+    if isinstance(config, Mapping):
+        return config[name]
+    return getattr(config, name)
+
+
 def denoise_block(
     generator,
     scheduler,
@@ -293,7 +300,7 @@ class CausalInferencePipeline(torch.nn.Module):
         return video
 
     def _runtime_layout(self, latent_height, latent_width):
-        patch_size = tuple(self.generator.model.config.patch_size)
+        patch_size = tuple(_model_config_value(self.generator.model, "patch_size"))
         if len(patch_size) != 3 or patch_size[0] != 1:
             raise ValueError(f"Unsupported causal patch size: {patch_size}")
         if latent_height % patch_size[1] or latent_width % patch_size[2]:
@@ -349,8 +356,8 @@ class CausalInferencePipeline(torch.nn.Module):
                 block_cache["v"].detach_().zero_()
             return
 
-        num_heads = self.generator.model.config.num_heads
-        dim = self.generator.model.config.dim
+        num_heads = int(_model_config_value(self.generator.model, "num_heads"))
+        dim = int(_model_config_value(self.generator.model, "dim"))
 
         print(f"Initializing kv cache with size: {kv_cache_size}")
         self.kv_cache1 = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,7 +11,25 @@ from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
-from pipeline.causal_inference import denoise_block
+from pipeline.causal_inference import CausalInferencePipeline, denoise_block
+
+
+def test_runtime_layout_accepts_mapping_model_config():
+    fake = SimpleNamespace(
+        generator=SimpleNamespace(
+            model=SimpleNamespace(config={"patch_size": [1, 2, 2]})
+        ),
+        num_frame_per_block=3,
+        _layout_printed=False,
+    )
+    layout = CausalInferencePipeline._runtime_layout(fake, 60, 104)
+    assert layout == {
+        "latent_hw": (60, 104),
+        "token_hw": (30, 52),
+        "tokens_per_frame": 1560,
+        "recent_slot_len": 4680,
+        "kv_size_used_for_nonfirst_block": 9360,
+    }
 
 
 def test_reference_blind_gate_follows_upstream_mask_semantics():
