@@ -44,7 +44,8 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${CUT3R_GPU}" \
   --intrinsic_source_width 832 \
   --output_root "${VIEWS_ROOT}"
 
-PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${CUT3R_GPU}" \
+  PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   "${CUT3R_PYTHON}" -m mapkv_proto.cut3r.build_surfel_index \
   --views_json "${VIEWS_ROOT}/views.json" \
   --vmem_root "${VMEM_ROOT}" \
