@@ -8,6 +8,8 @@ from utils.render_warper import convert_mask_video
 
 
 def _model_config_value(model, name):
+    if hasattr(model, name):
+        return getattr(model, name)
     config = model.config
     if isinstance(config, Mapping):
         return config[name]
