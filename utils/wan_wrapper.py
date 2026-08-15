@@ -374,6 +374,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         image_latent_input: Optional[torch.Tensor] = None,
         render_latent_input: Optional[torch.Tensor] = None,
         freqs_offset: int = 0,
+        memory_context=None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -390,8 +391,8 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if kv_cache is not None:
             assert(not self.dual_model), "KV cache is not supported for dual-model mode"
-            flow_pred = self.model(
-                noisy_image_or_video.permute(0, 2, 1, 3, 4).contiguous(),
+            model_kwargs = dict(
+                x=noisy_image_or_video.permute(0, 2, 1, 3, 4).contiguous(),
                 t=input_timestep, context=prompt_embeds,
                 seq_len=self.seq_len,
                 kv_cache=kv_cache,
@@ -400,7 +401,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 image_latent_input=image_latent_permuted,
                 render_latent_input=render_latent_permuted,
                 freqs_offset=freqs_offset,
-            ).permute(0, 2, 1, 3, 4)
+            )
+            if memory_context is not None:
+                model_kwargs["memory_context"] = memory_context
+            flow_pred = self.model(**model_kwargs).permute(0, 2, 1, 3, 4)
             if kv_size[1]<0:
                 return flow_pred
         else:

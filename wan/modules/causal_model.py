@@ -57,6 +57,7 @@ class CausalWanSelfAttention(nn.Module):
         freqs, 
         kv_cache=None,  
         kv_size=(0,0),
+        layer_memory=None,
     ):
         r"""
         Args:
@@ -82,6 +83,7 @@ class CausalWanSelfAttention(nn.Module):
 
         assert kv_cache is not None, "kv_cache must be provided when kv_size > 0" 
         if kv_size[1] < 0:
+            assert layer_memory is None, "Memory injection is forbidden during the context writer pass"
             len_x = roped_query.shape[1]
             kv_cache["k"][:, kv_size[0]:kv_size[0]+len_x] = roped_key
             kv_cache["v"][:, kv_size[0]:kv_size[0]+len_x] = v
@@ -92,13 +94,51 @@ class CausalWanSelfAttention(nn.Module):
             )
         else:
             if kv_size[1]==0:
+                assert layer_memory is None, "Memory injection requires reference and recent cache slots"
                 x = attention(roped_query,roped_key,v)
             else:
-                x = attention(
-                    roped_query,
-                    torch.cat([kv_cache["k"][:, kv_size[0]:kv_size[0]+kv_size[1]], roped_key], dim=1),
-                    torch.cat([kv_cache["v"][:, kv_size[0]:kv_size[0]+kv_size[1]], v], dim=1)
-                )
+                cached_k = kv_cache["k"][:, kv_size[0]:kv_size[0]+kv_size[1]]
+                cached_v = kv_cache["v"][:, kv_size[0]:kv_size[0]+kv_size[1]]
+                base_k = torch.cat([cached_k, roped_key], dim=1)
+                base_v = torch.cat([cached_v, v], dim=1)
+                a_base = attention(roped_query, base_k, base_v)
+
+                if layer_memory is None or layer_memory.alpha == 0.0:
+                    x = a_base
+                else:
+                    if cached_k.shape[1] % 2 != 0:
+                        raise ValueError(
+                            f"Cached KV length {cached_k.shape[1]} cannot contain equal ref/recent slots"
+                        )
+                    slot_len = cached_k.shape[1] // 2
+                    recent_shape = cached_k[:, slot_len:2 * slot_len].shape
+                    if layer_memory.k.shape != recent_shape or layer_memory.v.shape != recent_shape:
+                        raise ValueError(
+                            "Historical KV shape mismatch: "
+                            f"K={tuple(layer_memory.k.shape)} V={tuple(layer_memory.v.shape)} "
+                            f"recent={tuple(recent_shape)}"
+                        )
+                    if layer_memory.k.device != cached_k.device or layer_memory.v.device != cached_v.device:
+                        raise ValueError("Historical KV must be materialized on the attention device")
+                    if layer_memory.k.dtype != cached_k.dtype or layer_memory.v.dtype != cached_v.dtype:
+                        raise ValueError("Historical KV dtype must match the runtime cache dtype")
+
+                    ref_k = cached_k[:, :slot_len]
+                    ref_v = cached_v[:, :slot_len]
+                    aux_k = torch.cat([ref_k, layer_memory.k, roped_key], dim=1)
+                    aux_v = torch.cat([ref_v, layer_memory.v, v], dim=1)
+                    a_mem = attention(roped_query, aux_k, aux_v)
+                    delta = a_mem - a_base
+                    if layer_memory.query_gate is not None:
+                        gate = layer_memory.query_gate
+                        if gate.shape != delta.shape[:2]:
+                            raise ValueError(
+                                f"Query gate shape {tuple(gate.shape)} != {tuple(delta.shape[:2])}"
+                            )
+                        delta = delta * gate[:, :, None, None].to(
+                            device=delta.device, dtype=delta.dtype
+                        )
+                    x = a_base + layer_memory.alpha * delta
  
         x = x.flatten(2)
         x = self.o(x)
@@ -153,6 +193,7 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache=None,
         kv_cache=None,
         kv_size=(0,0),
+        layer_memory=None,
     ):
         r"""
         Args:
@@ -165,7 +206,14 @@ class CausalWanAttentionBlock(nn.Module):
 
         e = (self.modulation + e).chunk(6, dim=1)
 
-        y = self.self_attn(self.norm1(x) * (1 + e[1]) + e[0], seq_lens, freqs_x, kv_cache=kv_cache, kv_size=kv_size)
+        y = self.self_attn(
+            self.norm1(x) * (1 + e[1]) + e[0],
+            seq_lens,
+            freqs_x,
+            kv_cache=kv_cache,
+            kv_size=kv_size,
+            layer_memory=layer_memory,
+        )
 
         x = x + y * e[2]
 
@@ -344,6 +392,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         image_latent_input: torch.Tensor = None,
         render_latent_input: torch.Tensor = None,
         freqs_offset: int = 0,
+        memory_context=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -432,6 +481,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         for block_index, block in enumerate(self.blocks):
             kwargs['kv_cache'] = kv_cache[block_index]
+            kwargs.pop('layer_memory', None)
+            if memory_context is not None:
+                layer_memory = memory_context.for_layer(block_index, len(self.blocks))
+                if layer_memory is not None:
+                    kwargs['layer_memory'] = layer_memory
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x= torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
