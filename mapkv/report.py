@@ -148,6 +148,8 @@ table{{border-collapse:collapse;width:100%}}th,td{{padding:7px;border-bottom:1px
 
 <section><h2>Reproducibility</h2><table>
 <tr><th>GPU</th><td>{html.escape(baseline_metadata['gpu'])} (single GPU)</td></tr>
+<tr><th>Baseline generation commit</th><td><code>{baseline_metadata['git_commit']}</code>; dirty={str(bool(baseline_metadata['git_status'])).lower()} (diff stat saved)</td></tr>
+<tr><th>Report/code commit</th><td><code>{git_commit}</code>; dirty={str(bool(git_status)).lower()}</td></tr>
 <tr><th>InSpatio checkpoint</th><td><code>{html.escape(config['inspatio_checkpoint'])}</code></td></tr>
 <tr><th>CUT3R</th><td><code>{html.escape(cut3r['cut3r_commit'])}</code>; dirty={str(cut3r['cut3r_dirty']).lower()}</td></tr>
 <tr><th>CUT3R checkpoint</th><td><code>{html.escape(config['cut3r_checkpoint'])}</code><br><small>sha256 {cut3r['checkpoint_sha256']}</small></td></tr>
@@ -185,6 +187,7 @@ B1 chunk {metrics['trajectory']['b1_chunk']}; B2 chunk {metrics['trajectory']['b
 
 <section><h2>KV sanity</h2>
 <p>Alpha=0 max difference: {_fmt(metrics['kv_sanity']['alpha0_vs_baseline'])}.
+Preserved baseline max difference: {_fmt(metrics['kv_sanity'].get('preserved_baseline_max_abs_diff'))}.
 Memory branch effect: {metrics['kv_sanity']['memory_branch_effect']}. Capture: clean context / post-RoPE.
 Chunks: {bank['num_chunks']}; layers: {bank['selected_layers']}; KV bytes: {bank['memory_bytes']}.
 Runtime cache unchanged: {metrics['kv_sanity']['runtime_cache_unchanged']}.</p>
@@ -236,6 +239,7 @@ function allReset(){{[...vids,...b2vids].forEach(v=>{{v.pause();v.currentTime=0;
 - Status: **{status}**
 - Run: `{root.name}`
 - Commit: `{git_commit}`
+- Baseline generation commit / dirty: `{baseline_metadata['git_commit']}` / `{bool(baseline_metadata['git_status'])}`
 - GPU: `{baseline_metadata['gpu']}` (single GPU)
 - InSpatio checkpoint: `{config['inspatio_checkpoint']}`
 - CUT3R commit / checkpoint SHA256: `{cut3r['cut3r_commit']}` / `{cut3r['checkpoint_sha256']}`

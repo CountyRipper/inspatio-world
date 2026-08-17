@@ -61,6 +61,16 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _latent_max_abs(left: Path, right: Path) -> float:
+    import torch
+
+    lhs = torch.load(left, map_location="cpu", weights_only=True)
+    rhs = torch.load(right, map_location="cpu", weights_only=True)
+    if lhs.shape != rhs.shape:
+        raise ValueError(f"Latent compatibility shape mismatch: {lhs.shape} != {rhs.shape}")
+    return float((lhs.float() - rhs.float()).abs().max().item())
+
+
 def _materialize_run_contract(
     *, root: Path, case_dir: Path, baseline_root: Path, target_chunk: int
 ) -> None:
@@ -428,6 +438,12 @@ def main() -> None:
                 for name in ("manualcorrect", "wrongkv")
             ),
         }
+        preserved_baseline = case_dir / "baseline" / f"seed_{args.seed}" / "pred_latents.pt"
+        if preserved_baseline.exists():
+            sanity["preserved_baseline_path"] = str(preserved_baseline)
+            sanity["preserved_baseline_max_abs_diff"] = _latent_max_abs(
+                preserved_baseline, baseline_root / "pred_latents.pt"
+            )
         (root / "kv" / "sanity_metrics.json").write_text(
             json.dumps(sanity, indent=2), encoding="utf-8"
         )
