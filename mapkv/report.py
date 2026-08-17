@@ -39,6 +39,7 @@ def generate_report(
     surfel = metrics["surfel"]
     bank = _json(root / "kv" / "bank_stats.json")
     config = _json(root / "config_resolved.json")
+    baseline_metadata = _json(root / "baseline" / "run_metadata.json")
     git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     git_branch = subprocess.check_output(
         ["git", "branch", "--show-current"], text=True
@@ -129,6 +130,15 @@ table{{border-collapse:collapse;width:100%}}th,td{{padding:7px;border-bottom:1px
 <p><b>Conclusion:</b> {html.escape(conclusion)}</p>
 <small>Commit {git_commit} - branch {html.escape(git_branch)} - worktree {dirty_note}</small></section>
 
+<section><h2>Reproducibility</h2><table>
+<tr><th>GPU</th><td>{html.escape(baseline_metadata['gpu'])} (single GPU)</td></tr>
+<tr><th>InSpatio checkpoint</th><td><code>{html.escape(config['inspatio_checkpoint'])}</code></td></tr>
+<tr><th>CUT3R</th><td><code>{html.escape(cut3r['cut3r_commit'])}</code>; dirty={str(cut3r['cut3r_dirty']).lower()}</td></tr>
+<tr><th>CUT3R checkpoint</th><td><code>{html.escape(config['cut3r_checkpoint'])}</code><br><small>sha256 {cut3r['checkpoint_sha256']}</small></td></tr>
+<tr><th>Trajectory sha256</th><td><code>{config['trajectory_sha256']}</code></td></tr>
+<tr><th>Source sha256</th><td><code>{config['source_sha256']}</code></td></tr>
+<tr><th>Seed</th><td>{config['seed']}</td></tr></table></section>
+
 <section><h2>Architecture snapshot</h2>
 <pre>InSpatio base attention
     + alpha * residual memory attention
@@ -204,6 +214,10 @@ function allReset(){{[...vids,...b2vids].forEach(v=>{{v.pause();v.currentTime=0;
 - Status: **{status}**
 - Run: `{root.name}`
 - Commit: `{git_commit}`
+- GPU: `{baseline_metadata['gpu']}` (single GPU)
+- InSpatio checkpoint: `{config['inspatio_checkpoint']}`
+- CUT3R commit / checkpoint SHA256: `{cut3r['cut3r_commit']}` / `{cut3r['checkpoint_sha256']}`
+- Trajectory / source SHA256: `{config['trajectory_sha256']}` / `{config['source_sha256']}`
 - Case / seed: `{config['case']}` / `{config['seed']}`
 - Conclusion: {conclusion}
 

@@ -21,9 +21,11 @@ third_party/mapkv_cut3r_env/bin/pip install accelerate gdown
 Follow CUT3R's own installation instructions for its remaining dependencies
 and CUDA RoPE extension. With PyTorch 2.7, its CUDA kernel may need the narrow
 compatibility edit `tokens.type()` to `tokens.scalar_type()` before compiling.
-This is an external local compatibility patch and is not copied into MapKV.
+The checkpoint loader also needs `weights_only=False` to retain pre-2.6
+behavior because the trusted official checkpoint contains its OmegaConf model
+constructor. These are external local compatibility patches and are not copied
+into MapKV.
 
 CUT3R and its weights retain their upstream copyright and license terms. This
 adapter is intended for the research prototype described here; check upstream
 terms before redistribution or commercial use.
-

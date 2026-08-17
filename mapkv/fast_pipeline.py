@@ -229,6 +229,10 @@ def main() -> None:
     checkpoint = Path(
         args.cut3r_checkpoint or cut3r_root / "src" / "cut3r_512_dpt_4_64.pth"
     ).resolve()
+    inspatio_checkpoint = (
+        asset_root / "checkpoints/InSpatio-World-1.3B/InSpatio-World-1.3B.safetensors"
+    ).resolve()
+    wan_model_folder = (asset_root / "checkpoints/Wan2.1-T2V-1.3B").resolve()
     env = os.environ.copy()
     env.update(
         {
@@ -258,6 +262,9 @@ def main() -> None:
         "injection_mode": "residual_memory_attention",
         "cut3r_root": str(cut3r_root),
         "cut3r_checkpoint": str(checkpoint),
+        "inspatio_checkpoint": str(inspatio_checkpoint),
+        "wan_model_folder": str(wan_model_folder),
+        "cuda_visible_device": str(args.gpu),
         "trajectory_sha256": _sha256(case_dir / "target_poses.npy"),
         "source_sha256": _sha256(case_dir / "static_source.mp4"),
     }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -37,6 +38,14 @@ def _git(root: Path, *args: str) -> str:
     return subprocess.check_output(
         ["git", "-C", str(root), *args], text=True
     ).strip()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _prepare_views(image_paths: list[Path], image_size: int) -> list[dict]:
@@ -270,13 +279,17 @@ class Cut3RAdapter:
             item for item in frame_entries
             if item["chunk_id"] == int(query_source_chunk)
         )
+        cut3r_commit = _git(self.root, "rev-parse", "HEAD")
+        cut3r_dirty = bool(_git(self.root, "status", "--short"))
+        checkpoint_sha256 = _sha256(self.checkpoint)
         sequence_payload = {
             "version": 1,
             "backend": "official_CUT3R",
-            "cut3r_commit": _git(self.root, "rev-parse", "HEAD"),
-            "cut3r_dirty": bool(_git(self.root, "status", "--short")),
+            "cut3r_commit": cut3r_commit,
+            "cut3r_dirty": cut3r_dirty,
             "checkpoint": str(self.checkpoint),
             "checkpoint_bytes": self.checkpoint.stat().st_size,
+            "checkpoint_sha256": checkpoint_sha256,
             "coordinate_frame": "CUT3R_first_view_world",
             "pose_convention": "c2w; camera x-right y-down z-forward",
             "scale_behavior": "arbitrary learned scene scale",
@@ -295,6 +308,10 @@ class Cut3RAdapter:
         )
         stats = {
             "backend": "official_CUT3R",
+            "cut3r_commit": cut3r_commit,
+            "cut3r_dirty": cut3r_dirty,
+            "checkpoint": str(self.checkpoint),
+            "checkpoint_sha256": checkpoint_sha256,
             "frames": len(frame_entries),
             "raw_points": raw_points,
             "accepted_points": accepted_points,
