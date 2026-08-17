@@ -12,9 +12,9 @@ mapkv:
   wrong_chunk: null
   random_seed: 0
   selected_layers: [-4, -3, -2, -1]
-  selected_step_indices: [-1]
-  alpha: 0.10
-  injection_mode: residual_memory_attention
+  selected_step_indices: [0, 1, 2, 3]
+  alpha: 1.0
+  injection_mode: replace_recent_delta
   gate:
     mode: global
     smooth_kernel: 3
@@ -27,7 +27,8 @@ mapkv:
 
 cut3r:
   backend: official
-  mode: offline_causal_prefix
+  mode: offline_fixed_pose_causal_prefix
+  map_pose_source: known_control_c2w
   image_size: 512
   confidence_threshold: 1.5
 
@@ -35,11 +36,15 @@ surfel:
   voxel_size_mode: relative_scene
   voxel_size: null
   relative_scene_fraction: 0.005
-  grid: [20, 32]
+  grid: [30, 52]
+  radius_scale: 0.5
+  merge_normal_cosine: 0.6
 
 retrieval:
   top_k_chunks: 1
   min_history_gap_chunks: 2
   use_view_alignment: true
   use_occlusion: true
-  query_pose_mode: controlled_same_pose
+  query_pose_mode: controlled_same_pose_known
+  eligibility_before_zbuffer: true
+  voting: simple_observing_chunk

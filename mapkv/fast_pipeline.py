@@ -211,8 +211,11 @@ def main() -> None:
     parser.add_argument("--stage", choices=sorted(STAGES), default="full")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output")
-    parser.add_argument("--methods", default="baseline,wrongkv,posekv,surfelkv,manualcorrect")
-    parser.add_argument("--memory-alpha", type=float, default=0.1)
+    parser.add_argument(
+        "--methods",
+        default="baseline,manualcorrect,wrongkv,surfelkv",
+    )
+    parser.add_argument("--memory-alpha", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=1)
     parser.add_argument(
         "--memory-layers", choices=("uniform8", "middle8", "explicit", "all"),
@@ -221,6 +224,8 @@ def main() -> None:
     parser.add_argument("--gate", choices=("global", "ref_blind"), default="global")
     parser.add_argument("--confidence-threshold", type=float, default=1.5)
     parser.add_argument("--relative-voxel-fraction", type=float, default=0.005)
+    parser.add_argument("--radius-scale", type=float, default=0.5)
+    parser.add_argument("--merge-normal-cosine", type=float, default=0.6)
     parser.add_argument("--reuse-baseline", action="store_true")
     parser.add_argument("--reuse-cut3r", action="store_true")
     parser.add_argument("--reuse-surfel", action="store_true")
@@ -235,6 +240,14 @@ def main() -> None:
         raise ValueError("The first whole-chunk injector is top-K=1; use retrieval stage for K>1")
 
     repo = Path(__file__).resolve().parents[1]
+    inference_config = yaml.safe_load(
+        (repo / "configs" / "inference_1.3b.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    selected_steps = list(
+        range(len(inference_config["denoising_step_list"]))
+    )
     common = Path(
         subprocess.check_output(
             ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -247,12 +260,47 @@ def main() -> None:
         if args.case_dir else (repo / "artifacts" / "control" / args.case).resolve()
     )
     manifest = _json(case_dir / "trajectory_manifest.json")
+    phase_payload = _json(case_dir / "phase_labels.json")
+    phases = {
+        item["name"]: item for item in phase_payload["phases"]
+    }
+    b1_phase = phases["B1_hold"]
+    b2_phase = phases["B2_hold"]
+    positive_chunks = list(
+        range(
+            int(b1_phase["start_block"]),
+            int(b1_phase["stop_block_exclusive"]),
+        )
+    )
+    memory_target_chunks = list(
+        range(
+            int(b2_phase["start_block"]),
+            int(b2_phase["stop_block_exclusive"]),
+        )
+    )
     source_chunk = int(manifest["source_chunk"])
     target_chunk = int(manifest["target_chunk"])
     wrong_chunk = int(manifest["wrong_chunk"])
+    if source_chunk not in positive_chunks:
+        raise ValueError(
+            f"Manifest source {source_chunk} is outside B1 cluster "
+            f"{positive_chunks}"
+        )
+    if target_chunk not in memory_target_chunks:
+        raise ValueError(
+            f"Manifest target {target_chunk} is outside B2 plateau "
+            f"{memory_target_chunks}"
+        )
+    first_memory_target = min(memory_target_chunks)
     root = (
         Path(args.output).resolve()
-        if args.output else (repo / "results" / "mapkv_fast" / f"{args.case}_seed{args.seed}").resolve()
+        if args.output
+        else (
+            repo
+            / "results"
+            / "mapkv_fast"
+            / f"{args.case}_seed{args.seed}_core_repair"
+        ).resolve()
     )
     root.mkdir(parents=True, exist_ok=True)
     methods = [item for item in args.methods.split(",") if item]
@@ -287,18 +335,24 @@ def main() -> None:
         "seed": args.seed,
         "source_chunk": source_chunk,
         "target_chunk": target_chunk,
+        "positive_chunks": positive_chunks,
+        "memory_target_chunks": memory_target_chunks,
+        "first_memory_target_chunk": first_memory_target,
         "wrong_chunk": wrong_chunk,
         "source_rgb_index": int(manifest["source_rgb_index"]),
         "target_rgb_index": int(manifest["target_rgb_index"]),
         "reference_blind_fraction": validation["target_reference_blind_fraction"],
         "memory_alpha": args.memory_alpha,
         "memory_layers": args.memory_layers,
+        "selected_step_indices": selected_steps,
         "top_k": args.top_k,
         "gate": args.gate,
         "confidence_threshold": args.confidence_threshold,
         "relative_voxel_fraction": args.relative_voxel_fraction,
-        "query_pose_mode": "controlled_same_pose",
-        "injection_mode": "residual_memory_attention",
+        "radius_scale": args.radius_scale,
+        "merge_normal_cosine": args.merge_normal_cosine,
+        "query_pose_mode": "controlled_same_pose_known",
+        "injection_mode": "replace_recent_delta",
         "cut3r_root": str(cut3r_root),
         "cut3r_checkpoint": str(checkpoint),
         "inspatio_checkpoint": str(inspatio_checkpoint),
@@ -372,8 +426,13 @@ def main() -> None:
                 )
                 + [
                     "--run_name", "alpha0", "--mode", "oracle",
-                    "--source_chunk", str(source_chunk), "--target_chunks", str(target_chunk),
-                    "--alpha", "0", "--injection_mode", "residual_memory_attention",
+                    "--source_chunk", str(source_chunk),
+                    "--target_chunks",
+                    *[str(chunk) for chunk in memory_target_chunks],
+                    "--selected_steps",
+                    *[str(step) for step in selected_steps],
+                    "--alpha", "0",
+                    "--injection_mode", "replace_recent_delta",
                     "--gate_mode", args.gate,
                     "--compare_latents_to", str(baseline_root / "pred_latents.pt"),
                     "--require_replay_tolerance",
@@ -392,9 +451,13 @@ def main() -> None:
             case_dir=case_dir, output_dir=destination, noise_bundle=noise_bundle,
             bank_root=bank_root, seed=args.seed, memory_layers=args.memory_layers,
         ) + [
-            "--run_name", name, "--target_chunks", str(target_chunk),
+            "--run_name", name,
+            "--target_chunks",
+            *[str(chunk) for chunk in memory_target_chunks],
+            "--selected_steps",
+            *[str(step) for step in selected_steps],
             "--alpha", str(args.memory_alpha),
-            "--injection_mode", "residual_memory_attention",
+            "--injection_mode", "replace_recent_delta",
             "--gate_mode", args.gate,
             "--compare_latents_to", str(baseline_root / "pred_latents.pt"),
         ]
@@ -414,31 +477,53 @@ def main() -> None:
             raise ValueError(name)
         _run(name, command, root, env)
 
-    if stage in {"kv_sanity", "full"}:
-        for method in ("manualcorrect", "wrongkv"):
-            if method in methods:
-                generation(method)
+    def write_sanity_metrics() -> None:
         alpha0_metadata = _json(root / "kv" / "alpha0" / "run_metadata.json")
+        diagnostic_methods = [
+            name
+            for name in ("manualcorrect", "wrongkv")
+            if name in methods
+        ]
         sanity = {
             "alpha0_vs_baseline": alpha0_metadata["replay"]["against_saved_latents"]["max_abs_diff"],
             "capture_type": "clean_context",
             "rope_state": "post_rope",
+            "injection_mode": "replace_recent_delta",
+            "alpha": args.memory_alpha,
+            "selected_step_indices": selected_steps,
+            "memory_target_chunks": memory_target_chunks,
             "correct_run": str(root / "generation" / "manualcorrect"),
             "wrong_run": str(root / "generation" / "wrongkv"),
             "branch_active": all(
                 (root / "generation" / name / "run_metadata.json").exists()
-                for name in ("manualcorrect", "wrongkv") if name in methods
+                for name in diagnostic_methods
             ),
-            "correct_target_latent_max_abs_diff": _json(
-                root / "generation" / "manualcorrect" / "run_metadata.json"
-            )["replay"]["against_saved_latents"]["per_chunk_max_abs_diff"][str(target_chunk)],
-            "wrong_target_latent_max_abs_diff": _json(
-                root / "generation" / "wrongkv" / "run_metadata.json"
-            )["replay"]["against_saved_latents"]["per_chunk_max_abs_diff"][str(target_chunk)],
+            "correct_target_latent_max_abs_diff": (
+                _json(
+                    root
+                    / "generation"
+                    / "manualcorrect"
+                    / "run_metadata.json"
+                )["replay"]["against_saved_latents"][
+                    "per_chunk_max_abs_diff"
+                ][str(target_chunk)]
+                if "manualcorrect" in diagnostic_methods
+                else None
+            ),
+            "wrong_target_latent_max_abs_diff": (
+                _json(
+                    root / "generation" / "wrongkv" / "run_metadata.json"
+                )["replay"]["against_saved_latents"][
+                    "per_chunk_max_abs_diff"
+                ][str(target_chunk)]
+                if "wrongkv" in diagnostic_methods
+                else None
+            ),
             "runtime_cache_unchanged": all(
                 _json(root / "generation" / name / "run_metadata.json")["mapkv"]
-                ["cache_audits"][str(target_chunk)]["unchanged"]
-                for name in ("manualcorrect", "wrongkv")
+                ["cache_audits"][str(chunk)]["unchanged"]
+                for name in diagnostic_methods
+                for chunk in memory_target_chunks
             ),
         }
         preserved_baseline = case_dir / "baseline" / f"seed_{args.seed}" / "pred_latents.pt"
@@ -451,6 +536,12 @@ def main() -> None:
             json.dumps(sanity, indent=2), encoding="utf-8"
         )
 
+    if stage == "kv_sanity":
+        for method in ("manualcorrect", "wrongkv"):
+            if method in methods:
+                generation(method)
+        write_sanity_metrics()
+
     if stage in {"cut3r", "full"}:
         if not (args.reuse_cut3r and (root / "cut3r" / "sequence.json").exists()):
             _run(
@@ -462,7 +553,7 @@ def main() -> None:
                     "--cut3r_root", str(cut3r_root),
                     "--checkpoint", str(checkpoint),
                     "--output_dir", str(root / "cut3r"),
-                    "--target_chunk", str(target_chunk),
+                    "--target_chunk", str(first_memory_target),
                     "--query_source_chunk", str(source_chunk),
                     "--confidence_threshold", str(args.confidence_threshold),
                     "--device", "cuda",
@@ -482,6 +573,11 @@ def main() -> None:
                     "--confidence_threshold", str(args.confidence_threshold),
                     "--voxel_size_mode", "relative_scene",
                     "--relative_scene_fraction", str(args.relative_voxel_fraction),
+                    "--grid_height", "30",
+                    "--grid_width", "52",
+                    "--radius_scale", str(args.radius_scale),
+                    "--merge_normal_cosine",
+                    str(args.merge_normal_cosine),
                 ],
                 root,
                 env,
@@ -495,7 +591,10 @@ def main() -> None:
                 "--sequence", str(root / "cut3r" / "sequence.json"),
                 "--surfel_index", str(root / "surfel" / "surfel_index.npz"),
                 "--output_dir", str(root / "retrieval"),
-                "--target_chunk", str(target_chunk),
+                "--target_chunks",
+                *[str(chunk) for chunk in memory_target_chunks],
+                "--positive_chunks",
+                *[str(chunk) for chunk in positive_chunks],
                 "--top_k", str(args.top_k),
                 "--min_history_gap_chunks", "2",
             ],
@@ -504,9 +603,34 @@ def main() -> None:
         )
 
     if stage in {"generation", "full"}:
-        for method in ("posekv", "surfelkv"):
+        if not (root / "retrieval" / "retrieval.json").exists():
+            raise RuntimeError(
+                "Generation requires an offline retrieval plan; run the "
+                "retrieval stage after CUT3R/surfel construction first"
+            )
+        retrieval_payload = _json(root / "retrieval" / "retrieval.json")
+        missed = [
+            entry
+            for entry in retrieval_payload["targets"]
+            if not entry.get("positive_cluster_hit", False)
+        ]
+        if missed:
+            raise RuntimeError(
+                "Refusing KV generation because repaired geometry still "
+                "misses the B1 positive cluster: "
+                + json.dumps(missed, indent=2)
+            )
+
+    if stage in {"generation", "full"}:
+        for method in (
+            "manualcorrect",
+            "wrongkv",
+            "posekv",
+            "surfelkv",
+        ):
             if method in methods:
                 generation(method)
+        write_sanity_metrics()
 
     if stage in {"report", "full"}:
         bank_stats = _json(root / "kv" / "bank_stats.json")
@@ -523,19 +647,25 @@ def main() -> None:
             },
             "geometry": {
                 "backend": "CUT3R",
-                "mode": "offline_causal_prefix",
-                "address": "voxel_surfel",
+                "mode": "offline_fixed_pose_causal_prefix",
+                "pose_source": "known_control_c2w",
+                "predicted_pose_used_for_map": False,
+                "address": "radius_normal_surfel",
                 "prefix_last_chunk": cut3r_stats["prefix_last_chunk"],
             },
             "retrieval": {
-                "mode": "visible_surfel_chunk_vote",
+                "mode": "eligible_first_simple_observation_vote",
                 "top_k": args.top_k,
-                "query_pose_mode": "controlled_same_pose",
+                "query_pose_mode": "controlled_same_pose_known",
+                "positive_cluster": positive_chunks,
+                "target_chunks": memory_target_chunks,
             },
             "injection": {
-                "mode": "residual_memory_attention",
+                "mode": "replace_recent_delta",
                 "alpha": args.memory_alpha,
                 "gate": args.gate,
+                "selected_step_indices": selected_steps,
+                "active_target_chunks": memory_target_chunks,
                 "output_projection_count": 1,
                 "base_cache_replaced": False,
             },
@@ -577,9 +707,9 @@ def main() -> None:
                 args.inspatio_python, "-m", "mapkv.report",
                 "--run_root", str(root), "--status", "CLOSED_LOOP_OK",
                 "--conclusion",
-                "The causal CUT3R-surfel-to-native-KV loop executed; inspect synchronized B2 videos before assigning GO/CONTINUE/NO_GO.",
+                "Known-pose CUT3R, eligible-first surfel retrieval, and strong replace-recent KV injection executed over the complete B2 plateau; inspect the synchronized B2 videos for source-dependent effect.",
                 "--next_action",
-                "Review the B2 windows, then run one partial-overlap 0-to-30-to-0-to-20 case if the same-pose signal is interpretable.",
+                "Decide Q1/Q2/Q3 from the B2 clips; if all are positive, run one 0-to-30-to-0-to-20 partial-overlap case.",
             ],
             root,
             env,

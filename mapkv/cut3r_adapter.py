@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from mapkv_proto.pose_utils import pose_distance, to_cut3r_c2w
+
 
 @dataclass(frozen=True)
 class Cut3RFrame:
@@ -21,6 +23,7 @@ class Cut3RFrame:
     data_path: str
     shape: tuple[int, int]
     camera_pose: np.ndarray
+    predicted_camera_pose: np.ndarray
     intrinsics: np.ndarray
 
 
@@ -119,11 +122,28 @@ def _write_diagnostics(
     plt.close(fig)
 
     poses = np.asarray([item["camera_pose"] for item in frames])
+    predicted = np.asarray(
+        [item["predicted_camera_pose_aligned"] for item in frames]
+    )
     centers = poses[:, :3, 3]
+    predicted_centers = predicted[:, :3, 3]
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].plot([item["chunk_id"] for item in frames], centers)
-    axes[0].set(title="Predicted camera center", xlabel="chunk", ylabel="CUT3R units")
-    axes[0].legend(["x", "y", "z"])
+    chunks = [item["chunk_id"] for item in frames]
+    for axis, label in enumerate(("x", "y", "z")):
+        axes[0].plot(chunks, centers[:, axis], label=f"known {label}")
+        axes[0].plot(
+            chunks,
+            predicted_centers[:, axis],
+            linestyle="--",
+            alpha=0.6,
+            label=f"pred {label}",
+        )
+    axes[0].set(
+        title="Known map pose vs aligned CUT3R prediction",
+        xlabel="chunk",
+        ylabel="CUT3R units",
+    )
+    axes[0].legend(ncol=2, fontsize=7)
     axes[1].plot(centers[:, 0], centers[:, 2], marker="o", markersize=2)
     for item, center in zip(frames, centers):
         axes[1].annotate(str(item["chunk_id"]), (center[0], center[2]), fontsize=6)
@@ -157,7 +177,12 @@ def _write_diagnostics(
 
 
 class Cut3RAdapter:
-    """External-process adapter for official CUT3R feed-forward prefix inference."""
+    """Official CUT3R depth/pointmap adapter with known-pose map placement.
+
+    CUT3R's predicted camera pose is retained only as a diagnostic. Every
+    self-view pointmap is transformed into the map with the controlled c2w
+    from block_mapping.json.
+    """
 
     def __init__(
         self,
@@ -236,6 +261,35 @@ class Cut3RAdapter:
         output_dir = Path(output_dir).resolve()
         frame_dir = output_dir / "frames"
         frame_dir.mkdir(parents=True, exist_ok=True)
+        known_poses = np.asarray(
+            [
+                to_cut3r_c2w(np.asarray(item["c2w"], dtype=np.float64))
+                for item in history
+            ],
+            dtype=np.float32,
+        )
+        predicted_poses = np.asarray(
+            [
+                pose_encoding_to_camera(prediction["camera_pose"].float())[0]
+                .cpu()
+                .numpy()
+                for prediction in predictions
+            ],
+            dtype=np.float32,
+        )
+        # CUT3R predictions have their own world gauge. Align the first pose
+        # only for a readable drift diagnostic; aligned predictions never
+        # place pointmaps or answer retrieval queries.
+        predicted_alignment = known_poses[0] @ np.linalg.inv(predicted_poses[0])
+        predicted_aligned = np.asarray(
+            [predicted_alignment @ pose for pose in predicted_poses],
+            dtype=np.float32,
+        )
+        pose_errors = [
+            pose_distance(known, predicted)
+            for known, predicted in zip(known_poses, predicted_aligned)
+        ]
+
         frame_entries = []
         raw_points = 0
         accepted_points = 0
@@ -244,12 +298,17 @@ class Cut3RAdapter:
         ):
             points_self = prediction["pts3d_in_self_view"].float()
             confidence = prediction["conf_self"].float()
-            c2w = pose_encoding_to_camera(prediction["camera_pose"].float())
-            points_world = geotrf(c2w, points_self)
+            known_c2w = torch.as_tensor(
+                known_poses[frame_id],
+                dtype=points_self.dtype,
+                device=points_self.device,
+            ).unsqueeze(0)
+            points_world = geotrf(known_c2w, points_self)
             intrinsics = _intrinsics_from_pointmap(points_self)
             points_np = points_world[0].cpu().numpy().astype(np.float32)
             confidence_np = confidence[0].cpu().numpy().astype(np.float32)
-            c2w_np = c2w[0].cpu().numpy().astype(np.float32)
+            c2w_np = known_poses[frame_id]
+            predicted_c2w_np = predicted_poses[frame_id]
             intrinsics_np = intrinsics[0].cpu().numpy().astype(np.float32)
             raw_points += int(confidence_np.size)
             accepted_points += int(
@@ -263,8 +322,10 @@ class Cut3RAdapter:
             np.savez_compressed(
                 output_dir / relative_data,
                 pts3d=points_np,
+                pts3d_self=points_self[0].cpu().numpy().astype(np.float32),
                 confidence=confidence_np,
                 c2w=c2w_np,
+                predicted_c2w=predicted_c2w_np,
                 intrinsics=intrinsics_np,
             )
             frame_entries.append(
@@ -276,6 +337,16 @@ class Cut3RAdapter:
                     "data_path": str(relative_data),
                     "shape": list(confidence_np.shape),
                     "camera_pose": c2w_np.tolist(),
+                    "camera_pose_source": "known_control_c2w",
+                    "predicted_camera_pose": predicted_c2w_np.tolist(),
+                    "predicted_camera_pose_aligned": predicted_aligned[
+                        frame_id
+                    ].tolist(),
+                    "predicted_pose_error": {
+                        "combined": float(pose_errors[frame_id][0]),
+                        "translation": float(pose_errors[frame_id][1]),
+                        "rotation_radians": float(pose_errors[frame_id][2]),
+                    },
                     "intrinsics": intrinsics_np.tolist(),
                 }
             )
@@ -288,22 +359,25 @@ class Cut3RAdapter:
         cut3r_dirty = bool(_git(self.root, "status", "--short"))
         checkpoint_sha256 = _sha256(self.checkpoint)
         sequence_payload = {
-            "version": 1,
-            "backend": "official_CUT3R",
+            "version": 2,
+            "backend": "official_CUT3R_known_pose",
             "cut3r_commit": cut3r_commit,
             "cut3r_dirty": cut3r_dirty,
             "checkpoint": str(self.checkpoint),
             "checkpoint_bytes": self.checkpoint.stat().st_size,
             "checkpoint_sha256": checkpoint_sha256,
             "gpu": cut3r_gpu,
-            "coordinate_frame": "CUT3R_first_view_world",
+            "coordinate_frame": "known_control_world",
             "pose_convention": "c2w; camera x-right y-down z-forward",
             "scale_behavior": "arbitrary learned scene scale",
             "confidence_interpretation": "exp confidence; larger is more reliable",
+            "map_pose_source": "known_control_c2w",
+            "cut3r_predicted_pose_used_for_map": False,
+            "reconstruction_mode": "fixed_pose_causal_prefix",
             "prefix_last_chunk": max(item["chunk_id"] for item in frame_entries),
             "target_chunk": int(target_chunk),
             "future_leakage": False,
-            "query_pose_mode": "controlled_same_pose",
+            "query_pose_mode": "controlled_same_pose_known",
             "query_source_chunk": int(query_source_chunk),
             "query_pose": query["camera_pose"],
             "query_intrinsics": query["intrinsics"],
@@ -313,7 +387,7 @@ class Cut3RAdapter:
             json.dumps(sequence_payload, indent=2), encoding="utf-8"
         )
         stats = {
-            "backend": "official_CUT3R",
+            "backend": "official_CUT3R_known_pose",
             "cut3r_commit": cut3r_commit,
             "cut3r_dirty": cut3r_dirty,
             "checkpoint": str(self.checkpoint),
@@ -328,7 +402,15 @@ class Cut3RAdapter:
             "prefix_last_chunk": sequence_payload["prefix_last_chunk"],
             "target_chunk": int(target_chunk),
             "future_leakage": False,
-            "query_pose_mode": "controlled_same_pose",
+            "query_pose_mode": "controlled_same_pose_known",
+            "map_pose_source": "known_control_c2w",
+            "cut3r_predicted_pose_used_for_map": False,
+            "maximum_predicted_translation_drift": float(
+                max(error[1] for error in pose_errors)
+            ),
+            "maximum_predicted_rotation_drift_degrees": float(
+                np.degrees(max(error[2] for error in pose_errors))
+            ),
         }
         (output_dir / "stats.json").write_text(
             json.dumps(stats, indent=2), encoding="utf-8"
@@ -336,12 +418,14 @@ class Cut3RAdapter:
         (output_dir / "coordinate_convention.md").write_text(
             "# CUT3R coordinate convention\n\n"
             "- Provider: official CUT3R feed-forward inference.\n"
-            "- Stored points: world-space pointmaps obtained by applying predicted c2w "
-            "to each self-view pointmap.\n"
+            "- Stored points: CUT3R self-view pointmaps transformed by the known "
+            "controlled c2w for that generated chunk.\n"
             "- Camera pose: c2w; camera coordinates use x-right, y-down, z-forward.\n"
-            "- World frame: CUT3R persistent state anchored by the first generated view.\n"
+            "- World frame: the exact InSpatio control trajectory after the VMem "
+            "Y/Z camera-basis conversion.\n"
             "- Scale: arbitrary learned scene scale; voxel size is therefore relative.\n"
-            "- Query: B2 reuses the predicted B1 pose in controlled_same_pose mode.\n"
+            "- CUT3R predicted poses are diagnostics only and never place geometry.\n"
+            "- Query: B2 reuses the known B1 pose in controlled_same_pose_known mode.\n"
             "- Causality: only generated chunks strictly before B2 were provided.\n",
             encoding="utf-8",
         )
@@ -362,6 +446,9 @@ class Cut3RAdapter:
                     data_path=item["data_path"],
                     shape=tuple(item["shape"]),
                     camera_pose=np.asarray(item["camera_pose"], dtype=np.float32),
+                    predicted_camera_pose=np.asarray(
+                        item["predicted_camera_pose"], dtype=np.float32
+                    ),
                     intrinsics=np.asarray(item["intrinsics"], dtype=np.float32),
                 )
                 for item in frame_entries

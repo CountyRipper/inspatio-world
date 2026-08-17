@@ -13,7 +13,10 @@ from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.retrieval import GeometryChunkRetriever
-from mapkv.surfel_index import SurfelIndex as VoxelSurfelIndex
+from mapkv.surfel_index import (
+    SurfelCell,
+    SurfelIndex as VoxelSurfelIndex,
+)
 from mapkv_proto.trajectory_builder import (
     build_control_phases,
     build_exact_c2w,
@@ -302,9 +305,133 @@ def test_uniform_layers_and_voxel_surfel_retrieval_roundtrip(tmp_path):
         current_chunk=6,
         top_k=1,
     )
-    assert result["selected_chunks"] == [3]
+    # Simple observation voting intentionally does not partition one surfel's
+    # vote by repeated chunk_weights. The tie is deterministic by chunk id.
+    assert result["selected_chunks"] == [1]
+    assert result["voting_mode"] == "simple_observing_chunk_vote"
+    assert result["scores"]["1"] == pytest.approx(result["scores"]["3"])
     assert result["num_visible_surfels"] > 0
     assert diagnostics["coverage"].any()
+
+
+def test_retrieval_without_pose_clusters_uses_single_chunk_clusters():
+    index = VoxelSurfelIndex(
+        0.1,
+        [
+            SurfelCell(
+                voxel_key=(0, 0, 20),
+                xyz=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+                confidence=3.0,
+                normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+                radius=0.2,
+                rgb_preview=None,
+                first_seen_chunk=1,
+                last_seen_chunk=1,
+                observing_chunks=[1],
+                chunk_weights={1: 1.0},
+                view_dirs={
+                    1: np.array([0.0, 0.0, -1.0], dtype=np.float32)
+                },
+                observation_weight=1.0,
+            )
+        ],
+    )
+    retriever = GeometryChunkRetriever(
+        min_history_gap_chunks=2,
+        use_view_alignment=False,
+        use_occlusion=True,
+    )
+    intrinsic = np.array(
+        [[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]]
+    )
+    result, _ = retriever.retrieve(
+        index,
+        np.eye(4),
+        intrinsic,
+        source_image_size=(11, 11),
+        image_size=(11, 11),
+        current_chunk=5,
+        top_k=1,
+        chunk_clusters=None,
+    )
+    assert result["selected_chunks"] == [1]
+    assert result["retrieved"][0]["cluster_chunks"] == [1]
+
+
+def test_current_surfel_filters_recent_geometry_before_zbuffer():
+    def cell(z, chunk):
+        return SurfelCell(
+            voxel_key=(0, 0, int(z * 10)),
+            xyz=np.array([0.0, 0.0, z], dtype=np.float32),
+            confidence=3.0,
+            normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            radius=0.4,
+            rgb_preview=None,
+            first_seen_chunk=chunk,
+            last_seen_chunk=chunk,
+            observing_chunks=[chunk],
+            chunk_weights={chunk: 1.0},
+            view_dirs={
+                chunk: np.array([0.0, 0.0, -1.0], dtype=np.float32)
+            },
+            observation_weight=1.0,
+        )
+
+    # Chunk 4 is nearer at the same pixel but is immediate-recent for target 5.
+    # It must be removed before z-buffering so old chunk 1 remains visible.
+    index = VoxelSurfelIndex(0.1, [cell(2.0, 1), cell(1.0, 4)])
+    retriever = GeometryChunkRetriever(
+        min_history_gap_chunks=2,
+        use_view_alignment=False,
+        use_occlusion=True,
+    )
+    intrinsic = np.array(
+        [[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]]
+    )
+    result, diagnostics = retriever.retrieve(
+        index,
+        np.eye(4),
+        intrinsic,
+        source_image_size=(11, 11),
+        image_size=(11, 11),
+        current_chunk=5,
+        top_k=1,
+    )
+    assert result["eligibility_before_zbuffer"] is True
+    assert result["selected_chunks"] == [1]
+    assert 4 not in result["eligible_chunks"]
+    assert np.all(diagnostics["visible"]["indices"] == 0)
+
+
+def test_radius_normal_fusion_crosses_voxel_boundaries():
+    def observation(x, chunk):
+        return SurfelCell(
+            voxel_key=(0, 0, 20),
+            xyz=np.array([x, 0.0, 2.0], dtype=np.float32),
+            confidence=3.0,
+            normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            radius=0.05,
+            rgb_preview=None,
+            first_seen_chunk=chunk,
+            last_seen_chunk=chunk,
+            observing_chunks=[chunk],
+            chunk_weights={chunk: 1.0},
+            view_dirs={
+                chunk: np.array([0.0, 0.0, -1.0], dtype=np.float32)
+            },
+            observation_weight=1.0,
+        )
+
+    index = VoxelSurfelIndex(0.1, [observation(0.099, 1)])
+    merged = index.merge_observations(
+        [observation(0.101, 3)],
+        position_threshold=0.05,
+        normal_cosine=0.6,
+    )
+    assert merged["merged"] == 1
+    assert merged["cross_voxel_merges"] == 1
+    assert len(index.cells) == 1
+    assert index.cells[0].observing_chunks == [1, 3]
 
 
 def test_surfel_merge_serialization_and_causal_visibility_vote(tmp_path):

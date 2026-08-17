@@ -56,36 +56,97 @@ def evaluate(
         baseline_root / "masks" / f"chunk_{target_chunk:04d}_generated_region.png",
         source.shape[:2],
     )
+    phase_payload = json.loads(
+        (case_dir / "phase_labels.json").read_text(encoding="utf-8")
+    )
+    b2_phase = next(
+        item
+        for item in phase_payload["phases"]
+        if item["name"] == "B2_hold"
+    )
+    b2_chunks = range(
+        int(b2_phase["start_block"]),
+        int(b2_phase["stop_block_exclusive"]),
+    )
     generation = {}
+    method_targets: dict[str, np.ndarray] = {}
+    baseline_target = _image(
+        baseline_root / "keyframes" / f"chunk_{target_chunk:04d}.png"
+    )
     for method in methods:
         method_root = baseline_root if method == "baseline" else run_root / "generation" / method
         target = _image(method_root / "keyframes" / f"chunk_{target_chunk:04d}.png")
+        method_targets[method] = target
         previous = _image(method_root / "keyframes" / f"chunk_{target_chunk - 1:04d}.png")
         metadata = json.loads((method_root / "run_metadata.json").read_text(encoding="utf-8"))
+        replay_diff = (
+            metadata.get("replay", {}).get("against_saved_latents") or {}
+        )
+        per_chunk_diff = replay_diff.get("per_chunk_max_abs_diff", {})
         generation[method] = {
             "b1_b2_whole_frame_l1": float(np.abs(source - target).mean()),
             "b1_b2_generated_region_l1": _masked_l1(source, target, mask),
             "b1_b2_pooled_feature_cosine": _feature_cosine(source, target),
+            "b2_vs_baseline_whole_frame_l1": float(
+                np.abs(baseline_target - target).mean()
+            ),
+            "b2_vs_baseline_generated_region_l1": _masked_l1(
+                baseline_target, target, mask
+            ),
             "target_boundary_l1": float(np.abs(previous - target).mean()),
             "generation_seconds": metadata["timing_seconds"]["total"],
             "target_block_seconds": metadata["timing_seconds"]["per_block"].get(
                 str(target_chunk)
             ),
             "target_latent_max_abs_diff_vs_baseline": (
-                metadata.get("replay", {})
-                .get("against_saved_latents", {})
-                .get("per_chunk_max_abs_diff", {})
-                .get(str(target_chunk))
+                per_chunk_diff.get(str(target_chunk))
                 if method != "baseline" else 0.0
             ),
+            "b2_plateau_latent_max_abs_diff_vs_baseline": {
+                str(chunk): (
+                    per_chunk_diff.get(str(chunk))
+                    if method != "baseline"
+                    else 0.0
+                )
+                for chunk in b2_chunks
+            },
             "memory_activation_records": len(
                 metadata.get("mapkv", {}).get("activation_audit", [])
             ),
         }
+    baseline_scores = generation["baseline"]
+    manual_target = method_targets.get("manualcorrect")
+    for method, values in generation.items():
+        values["b1_b2_generated_region_l1_improvement_vs_baseline"] = float(
+            baseline_scores["b1_b2_generated_region_l1"]
+            - values["b1_b2_generated_region_l1"]
+        )
+        values["b1_b2_whole_frame_l1_improvement_vs_baseline"] = float(
+            baseline_scores["b1_b2_whole_frame_l1"]
+            - values["b1_b2_whole_frame_l1"]
+        )
+        values["b1_b2_feature_cosine_improvement_vs_baseline"] = float(
+            values["b1_b2_pooled_feature_cosine"]
+            - baseline_scores["b1_b2_pooled_feature_cosine"]
+        )
+        values["b2_vs_manualcorrect_whole_frame_l1"] = (
+            float(np.abs(manual_target - method_targets[method]).mean())
+            if manual_target is not None
+            else None
+        )
+        values["b2_vs_manualcorrect_generated_region_l1"] = (
+            _masked_l1(manual_target, method_targets[method], mask)
+            if manual_target is not None
+            else None
+        )
     retrieval_payload = json.loads(
         (run_root / "retrieval" / "retrieval.json").read_text(encoding="utf-8")
     )
-    retrieval = retrieval_payload["targets"][0]
+    retrieval = next(
+        entry
+        for entry in retrieval_payload["targets"]
+        if int(entry["target_chunk"]) == int(target_chunk)
+    )
     cut3r = json.loads((run_root / "cut3r" / "stats.json").read_text(encoding="utf-8"))
     surfel = json.loads((run_root / "surfel" / "stats.json").read_text(encoding="utf-8"))
     kv = json.loads((run_root / "kv" / "bank_stats.json").read_text(encoding="utf-8"))

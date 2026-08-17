@@ -49,7 +49,14 @@ def generate_report(
     generated = metrics["generation"]
     generated_at = datetime.now(timezone.utc).isoformat()
     methods = [
-        name for name in ("baseline", "surfelkv", "wrongkv", "posekv", "manualcorrect")
+        name
+        for name in (
+            "baseline",
+            "manualcorrect",
+            "wrongkv",
+            "surfelkv",
+            "posekv",
+        )
         if name in generated
     ]
     metrics["status"] = status
@@ -70,15 +77,17 @@ def generate_report(
 
     architecture_text = (
         "# Architecture snapshot\n\n"
-        "InSpatio base attention + selected-layer residual memory attention\n"
+        "InSpatio base attention + selected-layer replace-recent delta\n"
         "<- whole historical native post-RoPE K/V chunks\n"
-        "<- visible CUT3R voxel-surfel chunk vote.\n\n"
+        "<- eligible-first known-pose CUT3R radius/normal surfel vote.\n\n"
         f"- Memory layers: {architecture['memory']['layers']}\n"
         f"- Alpha: {architecture['injection']['alpha']}\n"
         f"- Gate: {architecture['injection']['gate']}\n"
         f"- Top-K: {architecture['retrieval']['top_k']}\n"
         f"- Query pose: {architecture['retrieval']['query_pose_mode']}\n"
         f"- Prefix cutoff: chunk {architecture['geometry']['prefix_last_chunk']}\n"
+        f"- Active B2 chunks: {architecture['injection']['active_target_chunks']}\n"
+        f"- Denoising steps: {architecture['injection']['selected_step_indices']}\n"
     )
     (root / "architecture.md").write_text(architecture_text, encoding="utf-8")
 
@@ -86,10 +95,11 @@ def generate_report(
         "<tr>"
         f"<td>{html.escape(name)}</td>"
         f"<td>{_fmt(values['b1_b2_generated_region_l1'])}</td>"
-        f"<td>{_fmt(values['b1_b2_whole_frame_l1'])}</td>"
+        f"<td>{_fmt(values['b1_b2_generated_region_l1_improvement_vs_baseline'])}</td>"
+        f"<td>{_fmt(values['b2_vs_baseline_generated_region_l1'])}</td>"
+        f"<td>{_fmt(values['b2_vs_manualcorrect_generated_region_l1'])}</td>"
         f"<td>{_fmt(values['b1_b2_pooled_feature_cosine'])}</td>"
         f"<td>{_fmt(values['target_boundary_l1'])}</td>"
-        f"<td>{_fmt(values['generation_seconds'], 2)}</td>"
         "</tr>"
         for name, values in generated.items()
     )
@@ -162,21 +172,25 @@ table{{border-collapse:collapse;width:100%}}th,td{{padding:7px;border-bottom:1px
 
 <section><h2>Architecture snapshot</h2>
 <pre>InSpatio base attention
-    + alpha * residual memory attention
+    + alpha * (A_history_recent_slot - A_base)
               ^ native post-RoPE K/V, {len(architecture['memory']['layers'])} layers
               ^ top-{architecture['retrieval']['top_k']} historical chunk
-              ^ CUT3R visible voxel-surfel vote</pre>
+              ^ eligible-first known-pose CUT3R surfel vote</pre>
 <table><tr><th>Payload</th><td>{architecture['memory']['payload']}</td></tr>
 <tr><th>Geometry</th><td>{architecture['geometry']['backend']} / {architecture['geometry']['mode']}</td></tr>
+<tr><th>Map pose</th><td>{architecture['geometry']['pose_source']}; CUT3R predicted pose used={str(architecture['geometry']['predicted_pose_used_for_map']).lower()}</td></tr>
 <tr><th>Query pose</th><td>{architecture['retrieval']['query_pose_mode']}</td></tr>
 <tr><th>Alpha / gate</th><td>{architecture['injection']['alpha']} / {architecture['injection']['gate']}</td></tr>
+<tr><th>Active B2 chunks / steps</th><td>{architecture['injection']['active_target_chunks']} / {architecture['injection']['selected_step_indices']}</td></tr>
 <tr><th>Layers</th><td>{architecture['memory']['layers']}</td></tr></table></section>
 
 <section><h2>Architecture changes in this run</h2>
 <table><tr><th>Component</th><th>Previous</th><th>Current</th><th>Files</th><th>Why</th></tr>
-<tr><td>Self-attention</td><td>base or replace-recent delta</td><td>base + residual MapKV branch</td><td>causal_model.py, memory_attention.py</td><td>v0.4 closed-loop diagnostic</td></tr>
+<tr><td>Self-attention</td><td>residual memory-only attention, alpha 0.1, final step/chunk</td><td>replace-recent delta, alpha {architecture['injection']['alpha']}, all steps and B2 chunks</td><td>fast_pipeline.py, causal_model.py</td><td>strong mechanism intervention</td></tr>
 <tr><td>History</td><td>manual chunk only</td><td>CPU KVChunkBank, runtime uniform8</td><td>kv_bank.py</td><td>native payload lookup</td></tr>
-<tr><td>Retrieval</td><td>manual/pose</td><td>official CUT3R voxel-surfel vote</td><td>cut3r_adapter.py, surfel_index.py, retrieval.py</td><td>geometry address</td></tr></table></section>
+<tr><td>Map pose</td><td>CUT3R predicted pose</td><td>known control c2w; prediction diagnostic only</td><td>cut3r_adapter.py</td><td>remove translation/rotation drift</td></tr>
+<tr><td>Surfel fusion</td><td>same-voxel only</td><td>radius + normal match across voxel boundaries</td><td>surfel_index.py</td><td>accumulate multi-view observations</td></tr>
+<tr><td>Retrieval</td><td>z-buffer then eligibility; partitioned weights</td><td>eligibility before z-buffer; simple observation vote</td><td>retrieval.py</td><td>prevent recent occlusion and vote dilution</td></tr></table></section>
 
 <section><h2>Input and trajectory</h2><div class="grid">
 <img src="assets/posters/source.jpg" alt="source frame">
@@ -203,14 +217,20 @@ Runtime cache unchanged: {metrics['kv_sanity']['runtime_cache_unchanged']}.</p>
 <img src="surfel/surfel_preview.png" alt="surfel"></div>
 <p>CUT3R frames: {cut3r['frames']}; accepted ratio: {_fmt(cut3r['accepted_point_ratio'])};
 surfel cells: {surfel['num_cells']}; voxel size: {_fmt(surfel['voxel_size'])};
-mean observing chunks/cell: {_fmt(surfel['mean_observing_chunks_per_cell'])}.</p>
+mean observing chunks/cell: {_fmt(surfel['mean_observing_chunks_per_cell'])};
+multi-view cells: {_fmt(surfel.get('multi_view_cell_fraction'))};
+cross-voxel merges: {surfel.get('cross_voxel_merges', 'n/a')}.</p>
 <p><a href="cut3r/coordinate_convention.md">Coordinate convention</a></p></section>
 
 <section><h2>Retrieval explanation</h2><div class="grid">
 <img src="retrieval/retrieval_timeline.png" alt="retrieval timeline">
 <img src="retrieval/visible_support.png" alt="visible support"></div>
 <p>Target {retrieval['target_chunk']}; visible surfels {retrieval['num_visible_surfels']};
-selected {retrieval['selected_chunks']}; latency {_fmt(retrieval['retrieval_ms'], 2)} ms.</p>
+visible pixels {retrieval.get('num_visible_pixels')}; selected {retrieval['selected_chunks']};
+top-3 {retrieval.get('top3_chunks')}; B1 cluster {retrieval.get('positive_cluster')};
+cluster hit = {str(retrieval.get('positive_cluster_hit')).lower()};
+coverage = {_fmt(retrieval.get('coverage_fraction'))};
+latency {_fmt(retrieval['retrieval_ms'], 2)} ms.</p>
 <table><tr><th>Chunk</th><th>Score</th><th>Visible support</th><th>Mean confidence</th><th>Gap</th></tr>{retrieved_rows}</table></section>
 
 <section><h2>Video comparison</h2><p>B1/B2 RGB centers: {config['source_rgb_index']} / {config['target_rgb_index']}.</p>
@@ -218,12 +238,13 @@ selected {retrieval['selected_chunks']}; latency {_fmt(retrieval['retrieval_ms']
 <div class="grid">{videos}</div>
 <h3>B2 windows</h3><div class="grid">{b2_videos}</div></section>
 
-<section><h2>Metrics</h2><table><tr><th>Method</th><th>Generated-mask L1 (lower)</th><th>Whole L1 (lower)</th><th>Feature cosine (higher)</th><th>Boundary L1 (lower)</th><th>Total s</th></tr>{rows}</table></section>
+<section><h2>Metrics</h2><table><tr><th>Method</th><th>B1/B2 generated-mask L1 (lower)</th><th>Improvement vs baseline (positive)</th><th>B2 effect vs baseline</th><th>B2 difference vs ManualCorrect</th><th>Feature cosine (higher)</th><th>Boundary L1 (lower)</th></tr>{rows}</table></section>
 
 <section><h2>Findings and next action</h2>
-<p><b>What worked:</b> causal CUT3R to surfel to chunk to KV to B2 generation completed.</p>
-<p><b>What failed:</b> see conclusion above; retrieval and video evidence are shown without an Oracle gate.</p>
-<p><b>What is uncertain:</b> whole-chunk post-RoPE KV may be too coarse even when addressing is correct.</p>
+<p><b>Retrieval correct:</b> {str(retrieval.get('positive_cluster_hit')).lower()} (top-1 {retrieval['selected_chunks']}, B1 cluster {retrieval.get('positive_cluster')}).</p>
+<p><b>ManualCorrect effect:</b> latent max diff {_fmt(generated.get('manualcorrect', {}).get('target_latent_max_abs_diff_vs_baseline'))}; generated-mask improvement {_fmt(generated.get('manualcorrect', {}).get('b1_b2_generated_region_l1_improvement_vs_baseline'))}.</p>
+<p><b>SurfelKV effect:</b> latent max diff {_fmt(generated.get('surfelkv', {}).get('target_latent_max_abs_diff_vs_baseline'))}; B2 difference from ManualCorrect {_fmt(generated.get('surfelkv', {}).get('b2_vs_manualcorrect_generated_region_l1'))}.</p>
+<p><b>Current conclusion:</b> {html.escape(conclusion)}</p>
 <p><b>Next:</b> {html.escape(next_action)}</p></section>
 </main><script>
 const vids=[...document.querySelectorAll('video.sync')];
@@ -265,11 +286,13 @@ function allReset(){{[...vids,...b2vids].forEach(v=>{{v.pause();v.currentTime=0;
 
 ## Key metrics
 
-| Method | Generated-mask L1 | Whole L1 | Feature cosine | Boundary L1 |
-|---|---:|---:|---:|---:|
+| Method | Generated-mask L1 | Improvement vs baseline | B2 effect vs baseline | B2 diff vs Manual | Feature cosine | Boundary L1 |
+|---|---:|---:|---:|---:|---:|---:|
 """ + "\n".join(
         f"| {name} | {_fmt(value['b1_b2_generated_region_l1'])} | "
-        f"{_fmt(value['b1_b2_whole_frame_l1'])} | "
+        f"{_fmt(value['b1_b2_generated_region_l1_improvement_vs_baseline'])} | "
+        f"{_fmt(value['b2_vs_baseline_generated_region_l1'])} | "
+        f"{_fmt(value['b2_vs_manualcorrect_generated_region_l1'])} | "
         f"{_fmt(value['b1_b2_pooled_feature_cosine'])} | "
         f"{_fmt(value['target_boundary_l1'])} |"
         for name, value in generated.items()
