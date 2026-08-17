@@ -47,6 +47,7 @@ def generate_report(
     ).strip()
     git_status = subprocess.check_output(["git", "status", "--short"], text=True).strip()
     generated = metrics["generation"]
+    generated_at = datetime.now(timezone.utc).isoformat()
     methods = [
         name for name in ("baseline", "surfelkv", "wrongkv", "posekv", "manualcorrect")
         if name in generated
@@ -60,7 +61,7 @@ def generate_report(
                 "status": status,
                 "conclusion": conclusion,
                 "next_action": next_action,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": generated_at,
             },
             indent=2,
         ),
@@ -143,6 +144,7 @@ table{{border-collapse:collapse;width:100%}}th,td{{padding:7px;border-bottom:1px
 </style></head><body><main>
 <section><h1>MapKV rapid prototype</h1><p class="status">{status}</p>
 <p><b>Run:</b> {html.escape(root.name)} - <b>Case:</b> {html.escape(config['case'])} - <b>Seed:</b> {config['seed']}</p>
+<p><b>Date:</b> {generated_at} UTC</p>
 <p><b>Conclusion:</b> {html.escape(conclusion)}</p>
 <small>Commit {git_commit} - branch {html.escape(git_branch)} - worktree {dirty_note}</small></section>
 
