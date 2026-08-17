@@ -259,8 +259,11 @@ def main() -> None:
     if "baseline" not in methods:
         methods.insert(0, "baseline")
     cut3r_root = Path(args.cut3r_root or repo / "third_party" / "CUT3R").resolve()
-    cut3r_python = str(
-        Path(args.cut3r_python or repo / "third_party" / "mapkv_cut3r_env" / "bin" / "python").resolve()
+    # Keep the venv launcher path intact. Resolving this symlink selects the
+    # base interpreter and silently drops the venv site-packages.
+    cut3r_python = os.path.abspath(
+        args.cut3r_python
+        or repo / "third_party" / "mapkv_cut3r_env" / "bin" / "python"
     )
     checkpoint = Path(
         args.cut3r_checkpoint or cut3r_root / "src" / "cut3r_512_dpt_4_64.pth"
