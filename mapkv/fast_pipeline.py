@@ -312,15 +312,15 @@ def main() -> None:
             _run("baseline", command, root, env)
         else:
             print("[MapKV] reuse baseline")
-        _run(
-            "kv_bank_stats",
-            [
-                args.inspatio_python, "-m", "mapkv.kv_bank",
-                "--bank", str(bank_root), "--output", str(root / "kv" / "bank_stats.json"),
-            ],
-            root,
-            env,
-        )
+        bank_command = [
+            args.inspatio_python, "-m", "mapkv.kv_bank",
+            "--bank", str(bank_root), "--output", str(root / "kv" / "bank_stats.json"),
+        ]
+        if not (root / "kv" / "capture_manifest.json").exists():
+            bank_command += [
+                "--capture_manifest", str(root / "kv" / "capture_manifest.json")
+            ]
+        _run("kv_bank_stats", bank_command, root, env)
         sanity_root = root / "kv" / "alpha0"
         if not (sanity_root / "run_metadata.json").exists():
             _run(
@@ -389,6 +389,17 @@ def main() -> None:
             "branch_active": all(
                 (root / "generation" / name / "run_metadata.json").exists()
                 for name in ("manualcorrect", "wrongkv") if name in methods
+            ),
+            "correct_target_latent_max_abs_diff": _json(
+                root / "generation" / "manualcorrect" / "run_metadata.json"
+            )["replay"]["against_saved_latents"]["per_chunk_max_abs_diff"][str(target_chunk)],
+            "wrong_target_latent_max_abs_diff": _json(
+                root / "generation" / "wrongkv" / "run_metadata.json"
+            )["replay"]["against_saved_latents"]["per_chunk_max_abs_diff"][str(target_chunk)],
+            "runtime_cache_unchanged": all(
+                _json(root / "generation" / name / "run_metadata.json")["mapkv"]
+                ["cache_audits"][str(target_chunk)]["unchanged"]
+                for name in ("manualcorrect", "wrongkv")
             ),
         }
         (root / "kv" / "sanity_metrics.json").write_text(

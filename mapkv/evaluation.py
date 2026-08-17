@@ -89,6 +89,7 @@ def evaluate(
     cut3r = json.loads((run_root / "cut3r" / "stats.json").read_text(encoding="utf-8"))
     surfel = json.loads((run_root / "surfel" / "stats.json").read_text(encoding="utf-8"))
     kv = json.loads((run_root / "kv" / "bank_stats.json").read_text(encoding="utf-8"))
+    sanity = json.loads((run_root / "kv" / "sanity_metrics.json").read_text(encoding="utf-8"))
     manifest = json.loads((case_dir / "trajectory_manifest.json").read_text(encoding="utf-8"))
     result = {
         "run_id": run_root.name,
@@ -101,7 +102,7 @@ def evaluate(
             "history_gap_chunks": int(target_chunk - source_chunk),
         },
         "kv_sanity": {
-            "alpha0_vs_baseline": 0.0,
+            **sanity,
             "memory_branch_effect": any(
                 generation[name]["target_latent_max_abs_diff_vs_baseline"]
                 not in (None, 0.0)

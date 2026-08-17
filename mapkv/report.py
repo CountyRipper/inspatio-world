@@ -38,6 +38,7 @@ def generate_report(
     cut3r = metrics["cut3r"]
     surfel = metrics["surfel"]
     bank = _json(root / "kv" / "bank_stats.json")
+    capture = _json(root / "kv" / "capture_manifest.json")
     config = _json(root / "config_resolved.json")
     baseline_metadata = _json(root / "baseline" / "run_metadata.json")
     git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -113,6 +114,21 @@ def generate_report(
         f"<td>{item['temporal_gap_chunks']}</td></tr>"
         for item in retrieval.get("retrieved", [])
     )
+    capture_by_chunk = {int(item["chunk_id"]): item for item in capture["chunks"]}
+    capture_rows = []
+    for label, chunk_id in (
+        ("B1/correct", int(config["source_chunk"])),
+        ("wrong", int(config["wrong_chunk"])),
+    ):
+        for layer, values in capture_by_chunk[chunk_id]["layers"].items():
+            capture_rows.append(
+                "<tr>"
+                f"<td>{label} ({chunk_id})</td><td>{layer}</td>"
+                f"<td>{_fmt(values['k_stats']['mean'])} / {_fmt(values['k_stats']['std'])} / {_fmt(values['k_stats']['l2_norm'], 2)}</td>"
+                f"<td>{_fmt(values['v_stats']['mean'])} / {_fmt(values['v_stats']['std'])} / {_fmt(values['v_stats']['l2_norm'], 2)}</td>"
+                f"<td><code>{values['sha256'][:16]}...</code></td></tr>"
+            )
+    capture_rows_html = "\n".join(capture_rows)
     dirty_note = "dirty (git_diff_stat.txt saved)" if git_status else "clean"
     report_html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -167,7 +183,9 @@ B1 chunk {metrics['trajectory']['b1_chunk']}; B2 chunk {metrics['trajectory']['b
 <section><h2>KV sanity</h2>
 <p>Alpha=0 max difference: {_fmt(metrics['kv_sanity']['alpha0_vs_baseline'])}.
 Memory branch effect: {metrics['kv_sanity']['memory_branch_effect']}. Capture: clean context / post-RoPE.
-Chunks: {bank['num_chunks']}; layers: {bank['selected_layers']}; KV bytes: {bank['memory_bytes']}.</p></section>
+Chunks: {bank['num_chunks']}; layers: {bank['selected_layers']}; KV bytes: {bank['memory_bytes']}.
+Runtime cache unchanged: {metrics['kv_sanity']['runtime_cache_unchanged']}.</p>
+<table><tr><th>Chunk</th><th>Layer</th><th>K mean / std / L2</th><th>V mean / std / L2</th><th>File SHA256</th></tr>{capture_rows_html}</table></section>
 
 <section><h2>CUT3R / surfel diagnostics</h2><div class="grid">
 <img src="cut3r/pointcloud_preview.png" alt="point cloud">

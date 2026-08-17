@@ -11,7 +11,7 @@ from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
-from mapkv.kv_bank import resolve_memory_layers
+from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.retrieval import GeometryChunkRetriever
 from mapkv.surfel_index import SurfelIndex as VoxelSurfelIndex
 from mapkv_proto.trajectory_builder import (
@@ -146,6 +146,7 @@ def test_kv_bank_captures_only_clean_recent_slot(tmp_path):
 
     metadata = json.loads((tmp_path / "metadata.json").read_text())
     assert sorted(metadata["chunks"]["0"]["layers"]) == ["2", "3"]
+    assert metadata["chunks"]["0"]["layers"]["2"]["k_stats"]["l2_norm"] > 0
     assert not (tmp_path / "chunk_0000/layer_00.pt").exists()
 
     bank = KVBank(tmp_path)
@@ -159,6 +160,11 @@ def test_kv_bank_captures_only_clean_recent_slot(tmp_path):
     )
     torch.testing.assert_close(payloads[2][0], caches[2]["k"][:, 4:8])
     torch.testing.assert_close(payloads[3][1], caches[3]["v"][:, 4:8])
+    capture = KVChunkBank(tmp_path).capture_manifest()
+    assert capture["capture_type"] == "clean_context"
+    assert capture["chunks"][0]["layers"]["2"]["k_stats"]["mean"] == pytest.approx(
+        caches[2]["k"][:, 4:8].mean().item()
+    )
 
 
 def test_auxiliary_attention_is_strictly_opt_in_and_cache_safe(monkeypatch):

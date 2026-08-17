@@ -21,6 +21,15 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def tensor_statistics(tensor: torch.Tensor) -> dict[str, float]:
+    value = tensor.detach().float()
+    return {
+        "mean": float(value.mean().item()),
+        "std": float(value.std(unbiased=False).item()),
+        "l2_norm": float(torch.linalg.vector_norm(value).item()),
+    }
+
+
 class KVBankWriter:
     """Capture only selected layers from the clean previous-generated slot."""
 
@@ -88,6 +97,8 @@ class KVBankWriter:
                 "shape": list(k.shape),
                 "source_dtype": payload["source_dtype"],
                 "sha256": _sha256_file(path),
+                "k_stats": tensor_statistics(payload["k"]),
+                "v_stats": tensor_statistics(payload["v"]),
                 "memory_bytes": int(
                     k.numel() * k.element_size() + v.numel() * v.element_size()
                 ),

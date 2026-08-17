@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+import torch
 
-from mapkv_proto.kv_bank import KVBank, KVBankWriter
+from mapkv_proto.kv_bank import KVBank, KVBankWriter, tensor_statistics
 
 
 LAYER_MODES = {"uniform8", "middle8", "explicit", "all"}
@@ -105,11 +106,61 @@ class KVChunkBank(KVBank):
         path.write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
 
+    def capture_manifest(self) -> dict:
+        chunks = []
+        for chunk_id in self.available_chunks:
+            item = self.metadata["chunks"][str(chunk_id)]
+            layers = {}
+            for layer_id, layer in sorted(
+                item["layers"].items(), key=lambda pair: int(pair[0])
+            ):
+                k_stats = layer.get("k_stats")
+                v_stats = layer.get("v_stats")
+                if k_stats is None or v_stats is None:
+                    payload = torch.load(
+                        self.root / layer["path"], map_location="cpu", weights_only=True
+                    )
+                    k_stats = tensor_statistics(payload["k"])
+                    v_stats = tensor_statistics(payload["v"])
+                layers[str(layer_id)] = {
+                    "shape": layer["shape"],
+                    "source_dtype": layer["source_dtype"],
+                    "sha256": layer["sha256"],
+                    "memory_bytes": int(layer.get("memory_bytes", 0)),
+                    "k_stats": k_stats,
+                    "v_stats": v_stats,
+                }
+            chunks.append(
+                {
+                    "chunk_id": int(chunk_id),
+                    "latent_frame_ids": item.get("latent_frame_ids"),
+                    "rgb_keyframe_id": item.get("rgb_keyframe_id"),
+                    "capture_type": item.get("capture_type", "clean_context"),
+                    "rope_state": item.get("rope_state", "post_rope"),
+                    "layers": layers,
+                }
+            )
+        return {
+            "version": 1,
+            "capture_type": "clean_context",
+            "rope_state": "post_rope",
+            "selected_layers": list(self.metadata["selected_layers"]),
+            "chunks": chunks,
+        }
+
+    def write_capture_manifest(self, path: str | Path) -> dict:
+        result = self.capture_manifest()
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return result
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect a clean-context KV chunk bank")
     parser.add_argument("--bank", required=True)
     parser.add_argument("--output")
+    parser.add_argument("--capture_manifest")
     parser.add_argument("--resolve_layers", choices=sorted(LAYER_MODES))
     parser.add_argument("--num_layers", type=int)
     parser.add_argument("--explicit", nargs="*", type=int, default=[])
@@ -123,6 +174,8 @@ def main() -> None:
         return
     bank = KVChunkBank(args.bank)
     stats = bank.write_stats(args.output) if args.output else bank.stats()
+    if args.capture_manifest:
+        bank.write_capture_manifest(args.capture_manifest)
     print(json.dumps(stats, indent=2))
 
 
