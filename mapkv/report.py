@@ -174,7 +174,10 @@ table{{border-collapse:collapse;width:100%}}th,td{{padding:7px;border-bottom:1px
 <tr><td>Retrieval</td><td>manual/pose</td><td>official CUT3R voxel-surfel vote</td><td>cut3r_adapter.py, surfel_index.py, retrieval.py</td><td>geometry address</td></tr></table></section>
 
 <section><h2>Input and trajectory</h2><div class="grid">
-<img src="assets/posters/source.jpg" alt="source frame"><img src="cut3r/camera_trajectory.png" alt="trajectory"></div>
+<img src="assets/posters/source.jpg" alt="source frame">
+<img src="assets/plots/trajectory.png" alt="exact trajectory">
+<img src="assets/plots/pair_contact_sheet.png" alt="B1 B2 pair">
+<img src="baseline/masks/chunk_{metrics['trajectory']['b2_chunk']:04d}_generated_region.png" alt="B2 generated-region mask"></div>
 <p>Pure yaw 0 to {metrics['trajectory']['angle_deg']} deg to 0 to {metrics['trajectory']['angle_deg']} deg; pitch/roll/translation = 0.
 B1 chunk {metrics['trajectory']['b1_chunk']}; B2 chunk {metrics['trajectory']['b2_chunk']}; gap {metrics['trajectory']['history_gap_chunks']} chunks.</p>
 <p>Reference-blind fraction: {_fmt(config.get('reference_blind_fraction'))}. CUT3R prefix last chunk:
@@ -189,6 +192,7 @@ Runtime cache unchanged: {metrics['kv_sanity']['runtime_cache_unchanged']}.</p>
 
 <section><h2>CUT3R / surfel diagnostics</h2><div class="grid">
 <img src="cut3r/pointcloud_preview.png" alt="point cloud">
+<img src="cut3r/camera_trajectory.png" alt="CUT3R camera trajectory">
 <img src="cut3r/confidence_histogram.png" alt="confidence">
 <img src="surfel/surfel_preview.png" alt="surfel"></div>
 <p>CUT3R frames: {cut3r['frames']}; accepted ratio: {_fmt(cut3r['accepted_point_ratio'])};

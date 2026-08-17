@@ -73,6 +73,32 @@ def _materialize_run_contract(
         "trajectory_manifest.json",
     ):
         shutil.copy2(case_dir / name, trajectory_root / name)
+    plots = root / "assets" / "plots"
+    plots.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(case_dir / "pair_contact_sheet.png", plots / "pair_contact_sheet.png")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    ypr = np.load(case_dir / "yaw_pitch_roll.npy")
+    poses = np.load(case_dir / "target_poses.npy")
+    manifest = _json(case_dir / "trajectory_manifest.json")
+    translation = np.linalg.norm(poses[:, :3, 3] - poses[0, :3, 3], axis=1)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+    axes[0].plot(ypr[:, 0], label="yaw")
+    axes[0].plot(ypr[:, 1], label="pitch")
+    axes[0].plot(ypr[:, 2], label="roll")
+    axes[0].axvline(manifest["source_rgb_index"], color="#e45756", label="B1")
+    axes[0].axvline(manifest["target_rgb_index"], color="#54a24b", label="B2")
+    axes[0].set(ylabel="degrees", title="Exact controlled trajectory")
+    axes[0].legend(ncol=5)
+    axes[1].plot(translation, color="#4f7cac")
+    axes[1].set(xlabel="RGB frame", ylabel="relative translation")
+    fig.tight_layout()
+    fig.savefig(plots / "trajectory.png", dpi=150)
+    plt.close(fig)
 
     _link(baseline_root / "pred.mp4", baseline_root / "full.mp4")
     _link(baseline_root / "block_mapping.json", baseline_root / "chunk_manifest.json")
