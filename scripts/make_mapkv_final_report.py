@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -135,12 +136,17 @@ def main() -> None:
         for seed in seeds:
             path = case_dir / "final" / f"seed_{seed}" / "metrics.json"
             metrics = load_json(path)
+            baseline_metadata = load_json(
+                case_dir / "baseline" / f"seed_{seed}" / "run_metadata.json"
+            )
+            baseline_replay = baseline_metadata["replay"]["in_process_memory_off"]
             rows.append(
                 {
                     "case_id": trajectory["case_id"],
                     "seed": seed,
                     "benchmark_valid": metrics["benchmark_valid"],
                     "alpha_zero_max_abs_diff": metrics["alpha_zero_max_abs_diff"],
+                    "baseline_replay_max_abs_diff": baseline_replay["max_abs_diff"],
                     "alpha_one_max_abs_diff": metrics["alpha_one_max_abs_diff"],
                     "alpha_one_cache_unchanged": metrics["alpha_one_cache_unchanged"],
                     "baseline": method_row(metrics, "baseline"),
@@ -166,6 +172,9 @@ def main() -> None:
         )
 
     all_valid = all(row["benchmark_valid"] for row in rows)
+    baseline_replay_exact = all(
+        row["baseline_replay_max_abs_diff"] == 0.0 for row in rows
+    )
     alpha_zero_exact = all(row["alpha_zero_max_abs_diff"] == 0.0 for row in rows)
     alpha_one_rows = [row for row in rows if row["alpha_one_max_abs_diff"] is not None]
     alpha_one_active = all(row["alpha_one_max_abs_diff"] > 0.0 for row in alpha_one_rows)
@@ -184,8 +193,17 @@ def main() -> None:
         if all_valid and args.conclusion != "INVALID_CASE"
         else "INVALID_CASE / IMPLEMENTATION_BUG"
     )
+    repo_root = Path(__file__).resolve().parents[1]
+    prototype_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+    ).strip()
     aggregate = {
         "decision": decision,
+        "environment": {
+            "inspatio_base_commit": "2d15b7c742fbc90bfd7e67052a260ff87d97abc3",
+            "prototype_commit": prototype_commit,
+            "vmem_reference_commit": "39291e4f272f6b4f270691d930926ab5930f942e",
+        },
         "answers": {
             "historical_kv_improves_revisit": args.conclusion == "GO",
             "cut3r_surfel_retrieval_approaches_oracle": None,
@@ -196,6 +214,7 @@ def main() -> None:
             "all_pair_valid": all_valid,
         },
         "engineering_checks": {
+            "baseline_memory_off_replay_exact_all_runs": baseline_replay_exact,
             "alpha_zero_exact_all_runs": alpha_zero_exact,
             "alpha_one_active_seed0_runs": alpha_one_active,
             "alpha_one_runtime_cache_unchanged": cache_unchanged,
@@ -240,6 +259,7 @@ def main() -> None:
 
 ## Environment
 - InSpatio base commit: `2d15b7c742fbc90bfd7e67052a260ff87d97abc3`
+- Controlled prototype commit: `{prototype_commit}`
 - VMem reference commit: `39291e4f272f6b4f270691d930926ab5930f942e`
 - CUT3R checkpoint: not used; Phase II remained gated
 - GPU: {first_meta['gpu']}
