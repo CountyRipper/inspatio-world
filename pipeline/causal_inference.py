@@ -65,6 +65,16 @@ def denoise_block(
                 context_frames=context_frames,
             )
 
+    cache_snapshots = None
+    if memory_context is not None and memory_context.alpha != 0.0:
+        cache_snapshots = {
+            int(layer): {
+                "k": kv_cache[int(layer)]["k"].detach().clone(),
+                "v": kv_cache[int(layer)]["v"].detach().clone(),
+            }
+            for layer in memory_context.layer_payloads
+        }
+
     for index, current_timestep in enumerate(denoising_steps):
         is_last_step = (index == len(denoising_steps) - 1)
         timestep = torch.ones([B, F], device=device, dtype=torch.int64) * current_timestep
@@ -106,6 +116,26 @@ def denoise_block(
                 step_noise.flatten(0, 1),
                 next_t * torch.ones([B * F], device=device, dtype=torch.long)
             ).unflatten(0, denoised_pred.shape[:2])
+
+    if cache_snapshots is not None:
+        per_layer = {}
+        maximum = 0.0
+        for layer, before in cache_snapshots.items():
+            k_diff = float(
+                (kv_cache[layer]["k"].float() - before["k"].float()).abs().max().item()
+            )
+            v_diff = float(
+                (kv_cache[layer]["v"].float() - before["v"].float()).abs().max().item()
+            )
+            per_layer[str(layer)] = {"k_max_abs_diff": k_diff, "v_max_abs_diff": v_diff}
+            maximum = max(maximum, k_diff, v_diff)
+        memory_context.cache_audit.update(
+            {"per_layer": per_layer, "max_abs_diff": maximum, "unchanged": maximum == 0.0}
+        )
+        if maximum != 0.0:
+            raise RuntimeError(
+                f"Auxiliary attention mutated runtime kv_cache1 (max_abs_diff={maximum})"
+            )
 
     return denoised_pred, noise_before_last_step
 

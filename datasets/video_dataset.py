@@ -18,6 +18,7 @@ class VideoDataset(torch.utils.data.Dataset):
         self.num_frames = kwargs['min_num_frames']
         self.sample_size = kwargs['video_size']
         self.traj_txt_path = kwargs.get('traj_txt_path', None)
+        self.target_pose_path = kwargs.get('target_pose_path', None)
         self.relative_to_source = kwargs.get('relative_to_source', False)
         self.rotation_only = kwargs.get('rotation_only', False)
         self.adaptive_frame = kwargs.get('adaptive_frame', True)
@@ -37,6 +38,7 @@ class VideoDataset(torch.utils.data.Dataset):
             self.sample_size,
             self.num_frames,
             traj_txt_path=self.traj_txt_path,
+            target_pose_path=self.target_pose_path,
             relative_to_source=self.relative_to_source,
             rotation_only=self.rotation_only,
             adaptive_frame=self.adaptive_frame,

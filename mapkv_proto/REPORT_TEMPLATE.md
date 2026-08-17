@@ -7,12 +7,23 @@
 - GPU:
 - Config:
 
-## Revisit case
+## Benchmark validity
+- Case ID:
+- Controlled/static source:
+- Exact pose artifact/checksum:
+- Pitch/yaw/roll/translation:
+- B1↔B2 pose error:
 - Source chunk:
 - Target chunk:
 - Temporal gap:
+- Active-cache exclusion:
 - Reference-blind fraction:
+- Render/mask same-view check:
+- Validity: VALID / INVALID_CASE
+
+## Revisit case
 - Why this is a generated-region revisit:
+- Baseline headroom:
 
 ## Phase I — Oracle KV
 - Baseline vs AlphaZero equality:
@@ -20,7 +31,7 @@
 - WrongKV visual effect:
 - Best alpha/layer/step:
 - Activation discontinuity:
-- Conclusion: GO / NO-GO
+- Conclusion: GO / NO-GO / INVALID_CASE
 
 ## Phase II — Geometry Retrieval
 - Oracle source chunk:

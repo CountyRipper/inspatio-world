@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-VALID_MODES = {"off", "oracle", "wrong", "pose", "geometry"}
+VALID_MODES = {"off", "oracle", "wrong", "random", "pose", "geometry"}
 VALID_GATES = {"global", "ref_blind", "surfel_ref_blind"}
 
 
@@ -40,6 +40,7 @@ class MapKVConfig:
     source_chunk: int | None = None
     target_chunks: tuple[int, ...] = ()
     wrong_chunk: int | None = None
+    random_seed: int = 0
     selected_layers: tuple[int, ...] = (-4, -3, -2, -1)
     selected_step_indices: tuple[int, ...] = (-1,)
     alpha: float = 0.10
@@ -71,6 +72,7 @@ class MapKVConfig:
             source_chunk=raw.get("source_chunk"),
             target_chunks=tuple(int(x) for x in raw.get("target_chunks", ())),
             wrong_chunk=raw.get("wrong_chunk"),
+            random_seed=int(raw.get("random_seed", 0)),
             selected_layers=tuple(int(x) for x in raw.get("selected_layers", (-4, -3, -2, -1))),
             selected_step_indices=tuple(int(x) for x in raw.get("selected_step_indices", (-1,))),
             alpha=float(raw.get("alpha", 0.10)),

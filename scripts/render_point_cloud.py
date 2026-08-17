@@ -15,6 +15,8 @@ Usage:
 
 import argparse
 import glob
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -269,6 +271,18 @@ def generate_target_c2ws(traj_txt_path, initial_c2w, source_c2ws, num_frames, de
     return target_c2ws
 
 
+def load_exact_target_c2ws(target_pose_path, device):
+    """Load the single source-of-truth absolute c2w sequence."""
+    poses = np.load(target_pose_path)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError(
+            f"target_pose_path must contain [T,4,4] absolute c2w, got {poses.shape}"
+        )
+    if not np.isfinite(poses).all():
+        raise ValueError("target_pose_path contains NaN/Inf")
+    return torch.as_tensor(poses, dtype=torch.float32, device=device)
+
+
 # ── ffmpeg streaming ──
 
 def open_ffmpeg_writer(output_path, width, height, fps=24):
@@ -482,7 +496,7 @@ def read_da3_depth(path):
     return np.frombuffer(depth_uint8.tobytes(), dtype=np.float32).reshape(h, w).copy()
 
 
-def load_rgb_depth_sequence(da3_dir, width, height):
+def _rgb_depth_files(da3_dir):
     frame_dir = os.path.join(da3_dir, "frames")
     depth_dir = os.path.join(da3_dir, "depth")
     frame_files = sorted(
@@ -496,20 +510,41 @@ def load_rgb_depth_sequence(da3_dir, width, height):
             f"Frame/depth count mismatch: {len(frame_files)} frames vs {len(depth_files)} depths"
         )
 
+    return frame_files, depth_files
+
+
+def _load_rgb_depth_pair(frame_path, depth_path, width, height):
+    img_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise RuntimeError(f"Failed to read frame: {frame_path}")
+    if img_bgr.shape[:2] != (height, width):
+        img_bgr = cv2.resize(img_bgr, (width, height), interpolation=cv2.INTER_AREA)
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0
+    depth = read_da3_depth(depth_path).astype(np.float32)
+    if depth.shape != (height, width):
+        depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_NEAREST)
+    return img_rgb.transpose(2, 0, 1), np.clip(depth, 1e-4, 10000.0)[None]
+
+
+def load_rgb_depth_frame(da3_dir, width, height, frame_index):
+    frame_files, depth_files = _rgb_depth_files(da3_dir)
+    if frame_index < 0 or frame_index >= len(frame_files):
+        raise IndexError(
+            f"source_frame_index {frame_index} outside [0, {len(frame_files)})"
+        )
+    frame, depth = _load_rgb_depth_pair(
+        frame_files[frame_index], depth_files[frame_index], width, height
+    )
+    return frame[None], depth[None]
+
+
+def load_rgb_depth_sequence(da3_dir, width, height):
+    frame_files, depth_files = _rgb_depth_files(da3_dir)
     frames, depths = [], []
     for frame_path, depth_path in zip(frame_files, depth_files):
-        img_bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            raise RuntimeError(f"Failed to read frame: {frame_path}")
-        if img_bgr.shape[:2] != (height, width):
-            img_bgr = cv2.resize(img_bgr, (width, height), interpolation=cv2.INTER_AREA)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 127.5 - 1.0
-        frames.append(img_rgb.transpose(2, 0, 1))
-
-        depth = read_da3_depth(depth_path).astype(np.float32)
-        if depth.shape != (height, width):
-            depth = cv2.resize(depth, (width, height), interpolation=cv2.INTER_NEAREST)
-        depths.append(np.clip(depth, 1e-4, 10000.0)[None])
+        frame, depth = _load_rgb_depth_pair(frame_path, depth_path, width, height)
+        frames.append(frame)
+        depths.append(depth)
 
     return np.stack(frames, axis=0), np.stack(depths, axis=0)
 
@@ -542,7 +577,10 @@ def write_tensor_videos(render, mask, video_path, mask_path, width, height, fps)
 
 def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, height=480,
                               fps=24, relative_to_source=False, rotation_only=False,
-                              freeze_repeat=0, freeze_frame=None):
+                              freeze_repeat=0, freeze_frame=None,
+                              target_pose_path=None, source_frame_index=None,
+                              validation_pair=None, render_validation_path=None,
+                              render_batch_size=16):
     """Fast renderer using DA3 RGB/depth images and batched forward splatting."""
     t_start = time.perf_counter()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -552,8 +590,18 @@ def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, hei
     K_orig = load_intrinsic(da3_dir, device)
     K_render = scale_intrinsic(K_orig, width, height)
     initial_c2w, source_c2ws = load_extrinsic_c2w(da3_dir, device)
-    frame_np, depth_np = load_rgb_depth_sequence(da3_dir, width, height)
-    num_frames = frame_np.shape[0]
+    if target_pose_path is not None:
+        if freeze_repeat > 0:
+            raise ValueError("Exact target poses cannot be combined with freeze_repeat")
+        source_frame_index = 0 if source_frame_index is None else source_frame_index
+        frame_np, depth_np = load_rgb_depth_frame(
+            da3_dir, width, height, source_frame_index
+        )
+        target_c2w_tensor = load_exact_target_c2ws(target_pose_path, device)
+        num_frames = len(target_c2w_tensor)
+    else:
+        frame_np, depth_np = load_rgb_depth_sequence(da3_dir, width, height)
+        num_frames = frame_np.shape[0]
     logger.info(f"Loaded {num_frames} RGB/depth frames")
 
     if freeze_repeat > 0:
@@ -578,17 +626,29 @@ def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, hei
         num_frames = frame_np.shape[0]
         logger.info(f"After freeze: {num_frames} total frames")
 
-    target_c2ws = generate_target_c2ws(
-        traj_txt_path,
-        initial_c2w,
-        source_c2ws,
-        num_frames,
-        device,
-        relative_to_source=relative_to_source,
-        rotation_only=rotation_only,
-    )
-    source_tcw = torch.stack([torch.linalg.inv(c2w) for c2w in source_c2ws], dim=0)
-    target_tcw = torch.stack([torch.linalg.inv(c2w) for c2w in target_c2ws], dim=0)
+    if target_pose_path is not None:
+        source_c2w = source_c2ws[source_frame_index]
+        source_tcw = torch.linalg.inv(source_c2w).unsqueeze(0).expand(
+            num_frames, -1, -1
+        )
+        target_c2ws = list(target_c2w_tensor)
+        target_tcw = torch.linalg.inv(target_c2w_tensor)
+    else:
+        target_c2ws = generate_target_c2ws(
+            traj_txt_path,
+            initial_c2w,
+            source_c2ws,
+            num_frames,
+            device,
+            relative_to_source=relative_to_source,
+            rotation_only=rotation_only,
+        )
+        source_tcw = torch.stack(
+            [torch.linalg.inv(c2w) for c2w in source_c2ws], dim=0
+        )
+        target_tcw = torch.stack(
+            [torch.linalg.inv(c2w) for c2w in target_c2ws], dim=0
+        )
     K_batch = K_render.unsqueeze(0).repeat(num_frames, 1, 1)
 
     frame = torch.from_numpy(frame_np).to(device=device, dtype=torch.float32)
@@ -599,15 +659,54 @@ def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, hei
         torch.cuda.synchronize()
     t_warp = time.perf_counter()
     with torch.no_grad():
-        render, mask = warper.forward_warp(
-            frame,
-            None,
-            depth,
-            source_tcw,
-            target_tcw,
-            K_batch,
-            None,
-        )
+        if target_pose_path is None:
+            render, mask = warper.forward_warp(
+                frame,
+                None,
+                depth,
+                source_tcw,
+                target_tcw,
+                K_batch,
+                None,
+            )
+        else:
+            unique_flat, inverse_indices = torch.unique(
+                target_c2w_tensor.reshape(num_frames, -1),
+                dim=0,
+                return_inverse=True,
+            )
+            unique_target_c2w = unique_flat.reshape(-1, 4, 4)
+            unique_target_tcw = torch.linalg.inv(unique_target_c2w)
+            unique_count = len(unique_target_c2w)
+            unique_source_tcw = torch.linalg.inv(source_c2w).unsqueeze(0).expand(
+                unique_count, -1, -1
+            )
+            unique_k = K_render.unsqueeze(0).expand(unique_count, -1, -1)
+            render_chunks = []
+            mask_chunks = []
+            for start in range(0, unique_count, render_batch_size):
+                stop = min(start + render_batch_size, unique_count)
+                count = stop - start
+                render_chunk, mask_chunk = warper.forward_warp(
+                    frame.expand(count, -1, -1, -1),
+                    None,
+                    depth.expand(count, -1, -1, -1),
+                    unique_source_tcw[start:stop],
+                    unique_target_tcw[start:stop],
+                    unique_k[start:stop],
+                    None,
+                )
+                render_chunks.append(render_chunk.cpu())
+                mask_chunks.append(mask_chunk.cpu())
+            unique_render = torch.cat(render_chunks, dim=0)
+            unique_mask = torch.cat(mask_chunks, dim=0)
+            inverse_cpu = inverse_indices.cpu()
+            render = unique_render[inverse_cpu]
+            mask = unique_mask[inverse_cpu]
+            logger.info(
+                f"  Exact-pose deduplication: {num_frames} frames -> "
+                f"{unique_count} unique poses"
+            )
     if device.type == "cuda":
         torch.cuda.synchronize()
     warp_time = time.perf_counter() - t_warp
@@ -618,6 +717,40 @@ def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, hei
     mask_path = os.path.join(output_dir, "mask_offline.mp4")
     write_tensor_videos(render, mask, video_path, mask_path, width, height, fps)
 
+    if validation_pair is not None:
+        first, second = (int(validation_pair[0]), int(validation_pair[1]))
+        if min(first, second) < 0 or max(first, second) >= num_frames:
+            raise IndexError(
+                f"validation_pair {validation_pair} outside {num_frames} frames"
+            )
+        render_delta = (render[first].float() - render[second].float()).abs()
+        mask_delta = (mask[first].float() - mask[second].float()).abs()
+        pose_delta = (
+            target_c2w_tensor[first].float() - target_c2w_tensor[second].float()
+        ).abs()
+        with open(target_pose_path, "rb") as handle:
+            pose_sha256 = hashlib.sha256(handle.read()).hexdigest()
+        validation = {
+            "validation_pair_rgb_indices": [first, second],
+            "target_pose_path": os.path.abspath(target_pose_path),
+            "target_pose_sha256": pose_sha256,
+            "target_pose_max_abs_diff": float(pose_delta.max().item()),
+            "render_raw_max_abs_diff": float(render_delta.max().item()),
+            "render_raw_mean_abs_diff": float(render_delta.mean().item()),
+            "mask_raw_max_abs_diff": float(mask_delta.max().item()),
+            "mask_raw_mean_abs_diff": float(mask_delta.mean().item()),
+            "same_view_pass": bool(
+                pose_delta.max().item() <= 1e-7
+                and render_delta.max().item() <= 1e-7
+                and mask_delta.max().item() <= 1e-7
+            ),
+        }
+        validation_path = render_validation_path or os.path.join(
+            output_dir, "render_revisit_diff.json"
+        )
+        with open(validation_path, "w", encoding="utf-8") as handle:
+            json.dump(validation, handle, indent=2)
+
     logger.info(f"Saved: {video_path}")
     logger.info(f"Saved: {mask_path}")
     logger.info(f"Warper timing: warp={warp_time:.3f}s total={time.perf_counter() - t_start:.3f}s")
@@ -627,7 +760,8 @@ def render_point_cloud_warper(da3_dir, traj_txt_path, output_dir, width=832, hei
 
 def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height=480,
                            point_size=2, fps=24, relative_to_source=False, rotation_only=False,
-                           freeze_repeat=0, freeze_frame=None):
+                           freeze_repeat=0, freeze_frame=None,
+                           target_pose_path=None, source_frame_index=None):
     """Main entry: load data, generate poses, render, save mp4s."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -644,6 +778,21 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
     points_list, colors_list = load_ply_sequence(da3_dir, device)
     num_pcds = len(points_list)
     logger.info(f"Loaded {num_pcds} point clouds")
+
+    if target_pose_path is not None:
+        if freeze_repeat > 0:
+            raise ValueError("Exact target poses cannot be combined with freeze_repeat")
+        source_frame_index = 0 if source_frame_index is None else source_frame_index
+        if source_frame_index < 0 or source_frame_index >= len(points_list):
+            raise IndexError(
+                f"source_frame_index {source_frame_index} outside {len(points_list)} PLY frames"
+            )
+        selected_points = points_list[source_frame_index]
+        selected_colors = colors_list[source_frame_index]
+        target_c2w_tensor = load_exact_target_c2ws(target_pose_path, device)
+        points_list = [selected_points] * len(target_c2w_tensor)
+        colors_list = [selected_colors] * len(target_c2w_tensor)
+        num_pcds = len(target_c2w_tensor)
 
     # Time-freeze: repeat a specific frame to create a pause effect
     if freeze_repeat > 0:
@@ -663,9 +812,14 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
         logger.info(f"After freeze: {num_pcds} total frames")
 
     # Generate target camera poses
-    target_c2ws = generate_target_c2ws(traj_txt_path, initial_c2w, source_c2ws, num_pcds, device,
-                                       relative_to_source=relative_to_source,
-                                       rotation_only=rotation_only)
+    if target_pose_path is not None:
+        target_c2ws = list(target_c2w_tensor)
+    else:
+        target_c2ws = generate_target_c2ws(
+            traj_txt_path, initial_c2w, source_c2ws, num_pcds, device,
+            relative_to_source=relative_to_source,
+            rotation_only=rotation_only,
+        )
     num_frames = len(target_c2ws)
     logger.info(f"Generated {num_frames} target camera poses")
 
@@ -718,7 +872,10 @@ def render_point_cloud_ply(da3_dir, traj_txt_path, output_dir, width=832, height
 
 def render_point_cloud(da3_dir, traj_txt_path, output_dir, width=832, height=480,
                        point_size=2, fps=24, relative_to_source=False, rotation_only=False,
-                       freeze_repeat=0, freeze_frame=None, render_backend="warper"):
+                       freeze_repeat=0, freeze_frame=None, render_backend="warper",
+                       target_pose_path=None, source_frame_index=None,
+                       validation_pair=None, render_validation_path=None,
+                       render_batch_size=16):
     if render_backend == "warper":
         render_point_cloud_warper(
             da3_dir=da3_dir,
@@ -731,6 +888,11 @@ def render_point_cloud(da3_dir, traj_txt_path, output_dir, width=832, height=480
             rotation_only=rotation_only,
             freeze_repeat=freeze_repeat,
             freeze_frame=freeze_frame,
+            target_pose_path=target_pose_path,
+            source_frame_index=source_frame_index,
+            validation_pair=validation_pair,
+            render_validation_path=render_validation_path,
+            render_batch_size=render_batch_size,
         )
     elif render_backend == "ply":
         render_point_cloud_ply(
@@ -745,6 +907,8 @@ def render_point_cloud(da3_dir, traj_txt_path, output_dir, width=832, height=480
             rotation_only=rotation_only,
             freeze_repeat=freeze_repeat,
             freeze_frame=freeze_frame,
+            target_pose_path=target_pose_path,
+            source_frame_index=source_frame_index,
         )
     else:
         raise ValueError(f"Unsupported render backend: {render_backend}")
@@ -757,8 +921,14 @@ def main():
         description="Offline point cloud rendering using DA3 output + traj_txt")
     parser.add_argument("--da3_dir", type=str, required=True,
                         help="DA3 output directory (contains frames_pcd/, intrinsic.txt, extrinsic.txt)")
-    parser.add_argument("--traj_txt_path", type=str, required=True,
-                        help="Trajectory txt file (3 lines: x_up, y_left, r)")
+    trajectory = parser.add_mutually_exclusive_group(required=True)
+    trajectory.add_argument("--traj_txt_path", type=str,
+                            help="Trajectory txt file (3 lines: x_up, y_left, r)")
+    trajectory.add_argument(
+        "--target_pose_path",
+        type=str,
+        help="Exact absolute c2w array [T,4,4]; bypasses txt/spline generation",
+    )
     parser.add_argument("--output_dir", type=str, required=True,
                         help="Output directory for render_offline.mp4 and mask_offline.mp4")
     parser.add_argument("--width", type=int, default=832)
@@ -775,6 +945,16 @@ def main():
                         help="Frame index to freeze (default: middle frame)")
     parser.add_argument("--render_backend", choices=["warper", "ply"], default="warper",
                         help="Rendering backend. warper is faster and is the default.")
+    parser.add_argument("--source_frame_index", type=int, default=None)
+    parser.add_argument(
+        "--validation_pair",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("B1_RGB", "B2_RGB"),
+    )
+    parser.add_argument("--render_validation_path", type=str, default=None)
+    parser.add_argument("--render_batch_size", type=int, default=16)
     args = parser.parse_args()
 
     render_point_cloud(
@@ -790,6 +970,11 @@ def main():
         freeze_repeat=args.freeze_repeat,
         freeze_frame=args.freeze_frame,
         render_backend=args.render_backend,
+        target_pose_path=args.target_pose_path,
+        source_frame_index=args.source_frame_index,
+        validation_pair=args.validation_pair,
+        render_validation_path=args.render_validation_path,
+        render_batch_size=args.render_batch_size,
     )
 
 

@@ -11,6 +11,7 @@ mapkv:
   source_chunk: null
   target_chunks: []
   wrong_chunk: null
+  random_seed: 0
   selected_layers: [-4, -3, -2, -1]
   selected_step_indices: [-1]
   alpha: 0.10

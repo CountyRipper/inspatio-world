@@ -5,6 +5,11 @@ upstream reference/recent cache and stores selected-layer historical KV in a
 separate CPU bank. Memory is injected only as a same-length auxiliary
 recent-slot counterfactual, before the single output projection.
 
+The official `test/example + x_y_circle_cycle.txt` run is an upstream smoke test
+only. It is not decision-eligible: any historical result from that trajectory is
+labelled `INCONCLUSIVE / INVALID_BENCHMARK`. Phase-I GO/NO-GO decisions must use
+the exact-pose repeated-static-frame controls below.
+
 ## Fixed revisions and environments
 
 - InSpatio-World: `2d15b7c742fbc90bfd7e67052a260ff87d97abc3`
@@ -40,52 +45,93 @@ export VMEM_ROOT="$PWD/third_party/vmem"
 export CUT3R_CHECKPOINT="$VMEM_ROOT/extern/CUT3R/src/cut3r_512_dpt_4_64.pth"
 ```
 
-## Phase 0 — deterministic baseline and KV bank
+## Upstream compatibility smoke
 
 ```bash
-bash scripts/run_mapkv_baseline.sh
+bash run_test_pipeline.sh \
+  --input_dir ./test/example \
+  --traj_txt_path ./traj/x_y_circle_cycle.txt \
+  --disable_adaptive_frame \
+  --output_folder ./output/mapkv_proto/upstream_smoke
 ```
 
-This creates the bundle, runs memory-off twice in the same process, records the
-latent `max_abs_diff`, captures only the configured four layers, saves lossless
-keyframes/masks, and writes the five best revisit candidates. Inspect:
+Do not use this video to accept or reject the historical-KV payload.
+
+## Phase 0 — exact-pose controlled baseline and KV bank
+
+First calibrate the native VAE temporal mapping from an upstream run, then build
+a repeated-static-frame pure-yaw case. `target_poses.npy` is absolute `c2w` and
+is the single source of truth for rendering, inference, block mapping, and
+evaluation. The exact path bypasses trajectory text and all spline logic.
+
+```bash
+python scripts/build_mapkv_control_case.py \
+  --case_id yaw15_scene01 \
+  --source_json /path/to/one-scene-source.json \
+  --source_frame_index 240 \
+  --theta 15 \
+  --vae_calibration_metadata /path/to/upstream/run_metadata.json \
+  --render
+
+MAPKV_REQUIRE_EXACT=1 bash scripts/run_mapkv_baseline.sh \
+  --case_dir artifacts/control/yaw15_scene01 --seed 0
+
+bash scripts/run_mapkv_oracle.sh \
+  --case_dir artifacts/control/yaw15_scene01 --seed 0 \
+  --mode alpha_zero --source_chunk 6 --target_chunk 17 \
+  --run_name alpha_zero
+
+python -m mapkv_proto.revisit_pair validate \
+  --case_dir artifacts/control/yaw15_scene01 \
+  --baseline_root artifacts/control/yaw15_scene01/baseline/seed_0 \
+  --alpha_zero_root artifacts/control/yaw15_scene01/oracle/seed_0/runs/alpha_zero \
+  --b1_quality_pass --headroom_pass
+```
+
+The two visual flags are explicit human checks; do not pass them before
+inspecting `pair_contact_sheet.png`. Validation records V1–V10, KV checksums and
+shapes, exact input checksums, same-view render/mask equality, and AlphaZero
+equality. A failed check is `INVALID_CASE`, never payload `NO-GO`.
+
+Inspect:
 
 ```text
-artifacts/baseline/run_metadata.json
-artifacts/baseline/revisit_candidates.json
-artifacts/baseline/revisit_candidates.png
-artifacts/baseline/kv_bank/metadata.json
+artifacts/control/yaw15_scene01/pose_validation.json
+artifacts/control/yaw15_scene01/render_revisit_diff.json
+artifacts/control/yaw15_scene01/pair_validation.json
+artifacts/control/yaw15_scene01/baseline/seed_0/run_metadata.json
+artifacts/control/yaw15_scene01/baseline/seed_0/kv_bank/metadata.json
 ```
-
-Choose a visible generated-region revisit with gap at least three, then choose a
-causally valid unrelated wrong chunk. Do not proceed based only on pose distance;
-inspect the contact sheet and masks.
 
 ## Phase I — Oracle payload/injection
 
-For `B=SOURCE`, `R=TARGET`, and `W=WRONG`:
+The manifest fixes B1/source, B2/target, and wrong chunks before results are
+viewed. After the pair gate passes, run the fixed diagnostic order:
 
 ```bash
-bash scripts/run_mapkv_oracle.sh --mode baseline \
-  --run_name baseline
-
-bash scripts/run_mapkv_oracle.sh --mode alpha_zero \
-  --source_chunk B --target_chunk R --run_name alpha_zero
-
-bash scripts/run_mapkv_oracle.sh --mode wrong \
-  --source_chunk W --target_chunk R --alpha 0.10 --run_name wrong_kv
-
-for alpha in 0.05 0.10 0.20; do
-  bash scripts/run_mapkv_oracle.sh --mode oracle \
-    --source_chunk B --target_chunk R --alpha "${alpha}" \
-    --run_name "oracle_a${alpha/./}"
-done
+bash scripts/run_mapkv_control_matrix.sh \
+  --case_dir artifacts/control/yaw15_scene01 \
+  --seeds 0 --alphas 0.05,0.10,0.20
 ```
 
-The AlphaZero metadata must report zero saved-baseline latent difference. Each
-active run also contains an exact block/step/layer activation audit. Stop here if
-correct OracleKV has no attributable benefit after checking capture, pair choice,
-and one diagnostic `alpha=1.0` run.
+The matrix is resumable. Seed 0 runs AlphaZero, diagnostic Oracle `alpha=1.0`,
+the stable alpha sweep, WrongKV, and RandomKV. Wrong/Random use `alpha=0.10`, so
+only Oracle `alpha=0.10` is used for the primary matched-strength discrimination;
+`alpha=0.20` is a strength sweep.
+
+If yaw15 shows attributable correct-vs-control sensitivity, build two yaw30
+static scenes and run seeds 0–2:
+
+```bash
+bash scripts/run_mapkv_control_matrix.sh \
+  --case_dir artifacts/control/yaw30_scene01 \
+  --seeds 0,1,2 --alphas 0.05,0.10,0.20
+```
+
+Every active run records the exact target block/step/layer audit and asserts the
+runtime KV cache is unchanged. If `alpha=1.0` does not change the target latent,
+the implementation is invalid. Slight metric movement without recognizable
+first-visit identity recovery is not a GO.
 
 ## Phase II — causal two-pass CUT3R retrieval
 
@@ -119,9 +165,25 @@ bash scripts/run_mapkv_geometry.sh --retrieval oracle \
 An empty selected-surface coverage is recorded and falls back to memory-off. It
 never enables memory globally.
 
-## Final evidence bundle
+## Final controlled evidence bundle
 
-After visually assigning both GO/NO-GO decisions and exactly one failure class:
+Generate each per-seed report, then aggregate the two-scene primary matrix:
+
+```bash
+python scripts/make_mapkv_control_report.py \
+  --case_dir artifacts/control/yaw30_scene01 --seed 0 \
+  --conclusion NO-GO --visual_summary "..." --quiet
+
+python scripts/make_mapkv_final_report.py \
+  --case_dirs artifacts/control/yaw30_scene01 artifacts/control/yaw30_scene02 \
+  --seeds 0,1,2 --output_dir artifacts/final \
+  --conclusion NO-GO --visual_summary "..."
+```
+
+When Phase I does not clear, the final bundle deliberately contains Phase-I
+comparison videos and no fabricated PoseKV/GeometryKV comparison. CUT3R remains
+gated. If Phase I is GO, use the Phase-II commands above and then create the
+four-way geometry bundle:
 
 ```bash
 python scripts/make_mapkv_comparison.py \

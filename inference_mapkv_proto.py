@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import shutil
 import subprocess
@@ -51,7 +52,12 @@ def parse_args() -> argparse.Namespace:
         default=".",
         help="Root used by relative paths inside json_path (upstream uses its cwd).",
     )
-    parser.add_argument("--traj_txt_path", required=True)
+    parser.add_argument("--traj_txt_path")
+    parser.add_argument(
+        "--target_pose_path",
+        help="Exact absolute c2w [T,4,4]. When set, txt/spline generation is bypassed.",
+    )
+    parser.add_argument("--case_dir")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--run_name", default="mapkv")
     parser.add_argument("--video_output")
@@ -62,10 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture_kv", action="store_true")
     parser.add_argument("--bank_root")
     parser.add_argument(
-        "--mode", choices=("off", "baseline", "oracle", "wrong", "pose", "geometry")
+        "--mode",
+        choices=("off", "baseline", "oracle", "wrong", "random", "pose", "geometry"),
     )
     parser.add_argument("--source_chunk", type=int)
     parser.add_argument("--wrong_chunk", type=int)
+    parser.add_argument("--random_seed", type=int)
     parser.add_argument("--target_chunks", nargs="+", type=int)
     parser.add_argument("--selected_layers", nargs="+", type=int)
     parser.add_argument("--selected_steps", nargs="+", type=int)
@@ -86,6 +94,14 @@ def _git_output(*args: str) -> str:
         return subprocess.check_output(["git", *args], text=True).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unavailable"
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _prepare_runtime_json(
@@ -118,7 +134,14 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
     for item in config.generator.weight_list:
         item.path = config.wan_model_folder
     config.dataset.json_path = str(runtime_json)
-    config.dataset.traj_txt_path = str(Path(args.traj_txt_path).resolve())
+    if args.target_pose_path:
+        config.dataset.target_pose_path = str(Path(args.target_pose_path).resolve())
+        config.dataset.traj_txt_path = None
+    else:
+        if not args.traj_txt_path:
+            raise ValueError("Either --target_pose_path or --traj_txt_path is required")
+        config.dataset.traj_txt_path = str(Path(args.traj_txt_path).resolve())
+        config.dataset.target_pose_path = None
     config.dataset.adaptive_frame = False
 
     experiment = OmegaConf.load(args.mapkv_config)
@@ -134,6 +157,8 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
         raw["source_chunk"] = args.source_chunk
     if args.wrong_chunk is not None:
         raw["wrong_chunk"] = args.wrong_chunk
+    if args.random_seed is not None:
+        raw["random_seed"] = args.random_seed
     if args.target_chunks is not None:
         raw["target_chunks"] = args.target_chunks
     elif mode != "off" and not raw.get("target_chunks") and args.retrieval_plan:
@@ -235,6 +260,8 @@ def _build_memory_contexts(
                 )
         elif config.mode == "wrong":
             source_chunk = config.wrong_chunk
+        elif config.mode == "random":
+            source_chunk = config.source_chunk
         else:
             if plan is None:
                 raise ValueError(f"{config.mode} mode requires --retrieval_plan")
@@ -243,6 +270,9 @@ def _build_memory_contexts(
             "target_chunk": int(target_chunk),
             "source_chunk": None if source_chunk is None else int(source_chunk),
             "mode": config.mode,
+            "payload_kind": (
+                "token_permuted_historical" if config.mode == "random" else "native"
+            ),
             "coverage_fraction": None if coverage is None else float(coverage.float().mean()),
         }
         if source_chunk is None:
@@ -269,10 +299,29 @@ def _build_memory_contexts(
                 dtype=dtype,
                 pin_memory=config.pin_memory,
             )
+        layer_payloads = payload_cache[source_chunk]
+        if config.mode == "random":
+            first_payload = next(iter(layer_payloads.values()))
+            token_count = int(first_payload[0].shape[1])
+            cpu_generator = torch.Generator(device="cpu")
+            cpu_generator.manual_seed(config.random_seed)
+            permutation_cpu = torch.randperm(token_count, generator=cpu_generator)
+            permutation_sha256 = hashlib.sha256(
+                permutation_cpu.numpy().tobytes()
+            ).hexdigest()
+            layer_payloads = {
+                layer: (
+                    k.index_select(1, permutation_cpu.to(device=k.device)),
+                    v.index_select(1, permutation_cpu.to(device=v.device)),
+                )
+                for layer, (k, v) in layer_payloads.items()
+            }
+            selection["random_seed"] = config.random_seed
+            selection["token_permutation_sha256"] = permutation_sha256
         context = make_memory_context(
             target_block=target_chunk,
             source_chunk=source_chunk,
-            layer_payloads=payload_cache[source_chunk],
+            layer_payloads=layer_payloads,
             selected_layers=config.selected_layers,
             selected_step_indices=config.selected_step_indices,
             alpha=config.alpha,
@@ -317,6 +366,8 @@ def _validate_activation_audit(
 
 def main() -> None:
     args = parse_args()
+    if args.target_pose_path and args.traj_txt_path:
+        raise ValueError("--target_pose_path and --traj_txt_path are mutually exclusive")
     if not torch.cuda.is_available():
         raise RuntimeError("The fixed MapKV prototype requires one CUDA device")
     device = torch.device(args.device)
@@ -359,6 +410,13 @@ def main() -> None:
         drop_last=False,
     )
     batch = next(iter(dataloader))
+    if args.target_pose_path:
+        exact_c2w = np.load(Path(args.target_pose_path).resolve())
+        if exact_c2w.shape != (batch["source_video"].shape[1], 4, 4):
+            raise ValueError(
+                "Exact pose/source length mismatch after dataset loading: "
+                f"{exact_c2w.shape} vs source T={batch['source_video'].shape[1]}"
+            )
 
     encode_started = time.perf_counter()
     render_video = rearrange(
@@ -556,14 +614,62 @@ def main() -> None:
                 f"Replay latent shape mismatch: {tuple(reference.shape)} != {tuple(candidate.shape)}"
             )
         max_abs_diff = float((reference.float() - candidate.float()).abs().max())
+        per_chunk_max_abs_diff = {}
+        for chunk_id, start in enumerate(range(0, output_length, frames_per_block)):
+            per_chunk_max_abs_diff[str(chunk_id)] = float(
+                (
+                    reference[:, start : start + frames_per_block].float()
+                    - candidate[:, start : start + frames_per_block].float()
+                )
+                .abs()
+                .max()
+            )
         replay = {
             "reference": str(Path(args.compare_latents_to).resolve()),
             "max_abs_diff": max_abs_diff,
             "tolerance": args.replay_tolerance,
             "within_tolerance": max_abs_diff <= args.replay_tolerance,
+            "per_chunk_max_abs_diff": per_chunk_max_abs_diff,
         }
         if args.require_replay_tolerance and not replay["within_tolerance"]:
             raise RuntimeError(f"Deterministic replay failed: {replay}")
+
+    benchmark_metadata = None
+    if args.target_pose_path:
+        exact_path = Path(args.target_pose_path).resolve()
+        exact_c2w = np.load(exact_path)
+        batch_tcw = torch.as_tensor(target_tcw).squeeze(0).double().cpu().numpy()
+        dataset_pose_max_abs_diff = float(
+            np.max(np.abs(batch_tcw - np.linalg.inv(exact_c2w)))
+        )
+        if dataset_pose_max_abs_diff > 1e-6:
+            raise RuntimeError(
+                "Dataset target extrinsics diverged from exact pose artifact: "
+                f"{dataset_pose_max_abs_diff}"
+            )
+        runtime_entries = json.loads(runtime_json.read_text(encoding="utf-8"))
+        entry = runtime_entries[0]
+        render_root = Path(entry["vggt_depth_path"]) / "render"
+        prompt_digest = hashlib.sha256(
+            "\n".join(str(item) for item in batch["text"]).encode("utf-8")
+        ).hexdigest()
+        benchmark_metadata = {
+            "decision_eligible": True,
+            "case_dir": None if args.case_dir is None else str(Path(args.case_dir).resolve()),
+            "target_pose_path": str(exact_path),
+            "target_pose_sha256": _sha256_file(exact_path),
+            "dataset_pose_max_abs_diff": dataset_pose_max_abs_diff,
+            "source_rgb_length": int(batch["source_video"].shape[1]),
+            "render_rgb_length": int(batch["render_video"].shape[1]),
+            "mask_rgb_length": int(batch["mask_video"].shape[1]),
+            "input_checksums": {
+                "static_source": _sha256_file(entry["video_path"]),
+                "render": _sha256_file(render_root / "render_offline.mp4"),
+                "mask": _sha256_file(render_root / "mask_offline.mp4"),
+                "prompt": prompt_digest,
+                "noise_bundle": _sha256_file(bundle_path),
+            },
+        }
 
     run_metadata = {
         "run_name": args.run_name,
@@ -585,6 +691,7 @@ def main() -> None:
         "latent_length": int(output_length),
         "decoded_rgb_length": int(pred_video.shape[1]),
         "block_count": num_blocks,
+        "benchmark": benchmark_metadata,
         "runtime_layout": {
             key: list(value) if isinstance(value, tuple) else value
             for key, value in layout.items()
@@ -613,6 +720,10 @@ def main() -> None:
             "gate_mode": mapkv_config.gate.mode,
             "selections": memory_selections,
             "activation_audit": activation_audit,
+            "cache_audits": {
+                str(target): context.cache_audit
+                for target, context in memory_contexts.items()
+            },
         },
         "timing_seconds": {
             "encode": encode_seconds,

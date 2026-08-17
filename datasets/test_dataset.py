@@ -43,11 +43,14 @@ class TestDataset():
     MIN_ANGLE_PER_FRAME = 0.3
     MAX_ANGLE_PER_FRAME = 0.8
 
-    def __init__(self, sample_size, sample_n_frames, cam_idx=1, traj_txt_path=None, relative_to_source=False, rotation_only=False, adaptive_frame=True, freeze_repeat=0, freeze_frame=None):
+    def __init__(self, sample_size, sample_n_frames, cam_idx=1, traj_txt_path=None,
+                 target_pose_path=None, relative_to_source=False, rotation_only=False,
+                 adaptive_frame=True, freeze_repeat=0, freeze_frame=None):
         self.sample_n_frames = sample_n_frames
         self.sample_size = sample_size   # h, w
         self.cam_idx = cam_idx
         self.traj_txt_path = traj_txt_path
+        self.target_pose_path = target_pose_path
         self.relative_to_source = relative_to_source
         self.rotation_only = rotation_only
         self.adaptive_frame = adaptive_frame
@@ -113,26 +116,62 @@ class TestDataset():
             print(f'[Time-freeze] source_video: repeated frame {freeze_idx} x{self.freeze_repeat}, '
                   f'{n_src} -> {source_video.shape[0]} frames')
 
-        # Align frame counts: render/mask may differ slightly from source_video
-        min_frames = min(source_video.shape[0], render_video.shape[0], mask_video.shape[0])
-        source_video = source_video[:min_frames]
-        render_video = render_video[:min_frames]
-        mask_video = mask_video[:min_frames]
-        n_frames = min_frames
-
-        # ===================== load depth for radius computation =====================
-        depth_path = os.path.join(source_conf["vggt_depth_path"], 'depth')
-        depth_files_list = os.listdir(depth_path)
-        depth_files = sorted(depth_files_list, key=lambda x: int(os.path.splitext(x)[0]))
-        # Only need the first depth frame for radius estimation
-        first_depth = np.array(Image.open(os.path.join(depth_path, depth_files[0]))).astype(np.uint16)
-        with open(os.path.join(source_conf["vggt_depth_path"], 'metadata.txt'), 'r') as f:
-            depths_min, depths_max = tuple([float(t) for t in f.readline().strip().split(' ')])
-        first_depth = (first_depth / 65535.0) * (depths_max - depths_min) + depths_min
-        first_depth_min = float(first_depth.min())
+        exact_target_c2w = None
+        if self.target_pose_path is not None:
+            if self.adaptive_frame:
+                raise ValueError("target_pose_path requires adaptive_frame=false")
+            exact_target_c2w = np.load(self.target_pose_path)
+            if exact_target_c2w.ndim != 3 or exact_target_c2w.shape[1:] != (4, 4):
+                raise ValueError(
+                    f"target_pose_path must contain [T,4,4] c2w, got {exact_target_c2w.shape}"
+                )
+            lengths = {
+                "target_poses": len(exact_target_c2w),
+                "source_video": source_video.shape[0],
+                "render_video": render_video.shape[0],
+                "mask_video": mask_video.shape[0],
+            }
+            if len(set(lengths.values())) != 1:
+                raise ValueError(
+                    "Exact-pose inputs must have identical frame counts; "
+                    f"refusing implicit truncation: {lengths}"
+                )
+            n_frames = len(exact_target_c2w)
+        else:
+            # Preserve upstream behavior for trajectory-text runs.
+            min_frames = min(source_video.shape[0], render_video.shape[0], mask_video.shape[0])
+            source_video = source_video[:min_frames]
+            render_video = render_video[:min_frames]
+            mask_video = mask_video[:min_frames]
+            n_frames = min_frames
 
         # ===================== frame-adaptive traj logic =====================
-        if self.traj_txt_path is not None:
+        if exact_target_c2w is not None:
+            target_extrinsics = torch.from_numpy(
+                np.linalg.inv(exact_target_c2w)
+            ).to(dtype=torch.float32)
+            data['target_extrinsics'] = target_extrinsics
+            data['target_pose_path'] = self.target_pose_path
+            print(
+                f"[Exact trajectory] Loaded {n_frames} c2w poses from "
+                f"{self.target_pose_path}; spline path bypassed"
+            )
+        elif self.traj_txt_path is not None:
+            # ===================== load depth for radius computation =====================
+            depth_path = os.path.join(source_conf["vggt_depth_path"], 'depth')
+            depth_files_list = os.listdir(depth_path)
+            depth_files = sorted(depth_files_list, key=lambda x: int(os.path.splitext(x)[0]))
+            first_depth = np.array(
+                Image.open(os.path.join(depth_path, depth_files[0]))
+            ).astype(np.uint16)
+            with open(os.path.join(source_conf["vggt_depth_path"], 'metadata.txt'), 'r') as f:
+                depths_min, depths_max = tuple(
+                    [float(t) for t in f.readline().strip().split(' ')]
+                )
+            first_depth = (
+                (first_depth / 65535.0) * (depths_max - depths_min) + depths_min
+            )
+            first_depth_min = float(first_depth.min())
             radius = first_depth_min * source_conf['radius_ratio']
             print('Foreground mean (radius):', radius)
             with open(self.traj_txt_path, 'r') as file:

@@ -11,6 +11,16 @@ from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
+from mapkv_proto.trajectory_builder import (
+    build_control_phases,
+    build_exact_c2w,
+    build_yaw_samples,
+    monotonic_index,
+    phase_by_name,
+    plateau_middle_chunk,
+    rgb_length_for_latents,
+    validate_exact_case,
+)
 from pipeline.causal_inference import CausalInferencePipeline, denoise_block
 
 
@@ -38,6 +48,38 @@ def test_reference_blind_gate_follows_upstream_mask_semantics():
     assert torch.count_nonzero(reference_blind_gate(valid, (2, 3))) == 0
     gate = reference_blind_gate(invalid, (2, 3), smooth_kernel=1)
     torch.testing.assert_close(gate, torch.ones_like(gate))
+
+
+def test_exact_control_trajectory_is_block_aligned_and_revisits_same_pose():
+    phases, ramp_blocks = build_control_phases(30.0, temporal_stride=4.0)
+    assert ramp_blocks == 5
+    num_blocks = phases[-1].stop_block
+    latent_length = num_blocks * 3
+    rgb_length = rgb_length_for_latents(latent_length, 4.0)
+    yaw, labels = build_yaw_samples(phases, rgb_length)
+    source_chunk = plateau_middle_chunk(phase_by_name(phases, "B1_hold"))
+    target_chunk = plateau_middle_chunk(phase_by_name(phases, "B2_hold"))
+    source_rgb = monotonic_index(source_chunk * 3 + 1, latent_length, rgb_length)
+    target_rgb = monotonic_index(target_chunk * 3 + 1, latent_length, rgb_length)
+    base_c2w = np.eye(4)
+    base_c2w[:3, 3] = [1.0, 2.0, 3.0]
+    target_c2w = build_exact_c2w(base_c2w, yaw)
+    validation = validate_exact_case(
+        target_c2w=target_c2w,
+        yaw_degrees=yaw,
+        pitch_degrees=np.zeros_like(yaw),
+        roll_degrees=np.zeros_like(yaw),
+        source_chunk=source_chunk,
+        target_chunk=target_chunk,
+        source_rgb_index=source_rgb,
+        target_rgb_index=target_rgb,
+        phase_labels=labels,
+    )
+    assert validation["valid"] is True
+    assert validation["temporal_gap_chunks"] >= 4
+    assert validation["B1_B2_rotation_distance_degrees"] < 1e-6
+    assert validation["B1_B2_translation_distance"] == 0.0
+    assert all(0.4 <= speed <= 0.6 for speed in validation["ramp_speeds_degrees_per_rgb_frame"])
 
 
 def test_noise_bundle_roundtrip_and_provider_does_not_use_global_rng(tmp_path):

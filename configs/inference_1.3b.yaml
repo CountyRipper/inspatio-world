@@ -51,6 +51,7 @@ dataset:
   width_tick_size: 16
   height_tick_size: 16
   traj_txt_path: ./traj/x_y_circle_cycle.txt  # Will be overridden by run_test_pipeline.sh
+  target_pose_path: null
   relative_to_source: false
   rotation_only: false
   adaptive_frame: true

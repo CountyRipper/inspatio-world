@@ -138,6 +138,26 @@ class CausalWanSelfAttention(nn.Module):
                         delta = delta * gate[:, :, None, None].to(
                             device=delta.device, dtype=delta.dtype
                         )
+                    if layer_memory.audit_record is not None:
+                        layer_memory.audit_record.update(
+                            {
+                                "attention_base_abs_mean": float(
+                                    a_base.float().abs().mean().item()
+                                ),
+                                "attention_memory_delta_abs_mean": float(
+                                    (a_mem.float() - a_base.float()).abs().mean().item()
+                                ),
+                                "gated_delta_abs_mean": float(
+                                    delta.float().abs().mean().item()
+                                ),
+                                "gated_delta_max_abs": float(
+                                    delta.float().abs().max().item()
+                                ),
+                                "blend_delta_abs_mean": float(
+                                    (layer_memory.alpha * delta.float()).abs().mean().item()
+                                ),
+                            }
+                        )
                     x = a_base + layer_memory.alpha * delta
  
         x = x.flatten(2)

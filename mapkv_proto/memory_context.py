@@ -18,6 +18,7 @@ class ActiveLayerMemory:
     alpha: float
     query_gate: torch.Tensor | None
     source_chunk: int
+    audit_record: dict | None = None
 
 
 def _smooth_gate(gate: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -106,6 +107,7 @@ class MemoryContext:
     active_step: int | None = None
     num_steps: int | None = None
     audit_log: list[dict] = field(default_factory=list, compare=False)
+    cache_audit: dict = field(default_factory=dict, compare=False)
 
     def for_denoising_step(self, step_index: int, num_steps: int) -> "MemoryContext | None":
         selected = resolve_indices(self.selected_step_indices, num_steps, name="denoising step")
@@ -152,21 +154,21 @@ class MemoryContext:
         if self.active_step is None:
             raise RuntimeError("MemoryContext must be activated with for_denoising_step first")
         k, v = self.layer_payloads[block_index]
-        self.audit_log.append(
-            {
-                "target_block": self.target_block,
-                "source_chunk": self.source_chunk,
-                "step_index": self.active_step,
-                "layer_index": block_index,
-                "alpha": self.alpha,
-            }
-        )
+        audit_record = {
+            "target_block": self.target_block,
+            "source_chunk": self.source_chunk,
+            "step_index": self.active_step,
+            "layer_index": block_index,
+            "alpha": self.alpha,
+        }
+        self.audit_log.append(audit_record)
         return ActiveLayerMemory(
             k=k,
             v=v,
             alpha=self.alpha,
             query_gate=self.query_gate,
             source_chunk=self.source_chunk,
+            audit_record=audit_record,
         )
 
     @property
