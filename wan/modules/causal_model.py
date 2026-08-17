@@ -123,42 +123,61 @@ class CausalWanSelfAttention(nn.Module):
                     if layer_memory.k.dtype != cached_k.dtype or layer_memory.v.dtype != cached_v.dtype:
                         raise ValueError("Historical KV dtype must match the runtime cache dtype")
 
-                    ref_k = cached_k[:, :slot_len]
-                    ref_v = cached_v[:, :slot_len]
-                    aux_k = torch.cat([ref_k, layer_memory.k, roped_key], dim=1)
-                    aux_v = torch.cat([ref_v, layer_memory.v, v], dim=1)
-                    a_mem = attention(roped_query, aux_k, aux_v)
-                    delta = a_mem - a_base
+                    if layer_memory.injection_mode == "replace_recent_delta":
+                        ref_k = cached_k[:, :slot_len]
+                        ref_v = cached_v[:, :slot_len]
+                        aux_k = torch.cat([ref_k, layer_memory.k, roped_key], dim=1)
+                        aux_v = torch.cat([ref_v, layer_memory.v, v], dim=1)
+                        a_mem = attention(roped_query, aux_k, aux_v)
+                        memory_signal = a_mem - a_base
+                    elif layer_memory.injection_mode == "residual_memory_attention":
+                        # The base ST-cache remains untouched. Historical native KV is
+                        # attended in a separate branch and blended before self.o.
+                        a_mem = attention(
+                            roped_query,
+                            layer_memory.k,
+                            layer_memory.v,
+                        )
+                        memory_signal = a_mem
+                    else:
+                        raise ValueError(
+                            f"Unsupported memory injection mode: {layer_memory.injection_mode}"
+                        )
                     if layer_memory.query_gate is not None:
                         gate = layer_memory.query_gate
-                        if gate.shape != delta.shape[:2]:
+                        if gate.shape != memory_signal.shape[:2]:
                             raise ValueError(
-                                f"Query gate shape {tuple(gate.shape)} != {tuple(delta.shape[:2])}"
+                                "Query gate shape "
+                                f"{tuple(gate.shape)} != {tuple(memory_signal.shape[:2])}"
                             )
-                        delta = delta * gate[:, :, None, None].to(
-                            device=delta.device, dtype=delta.dtype
+                        memory_signal = memory_signal * gate[:, :, None, None].to(
+                            device=memory_signal.device, dtype=memory_signal.dtype
                         )
                     if layer_memory.audit_record is not None:
                         layer_memory.audit_record.update(
                             {
+                                "injection_mode": layer_memory.injection_mode,
                                 "attention_base_abs_mean": float(
                                     a_base.float().abs().mean().item()
                                 ),
                                 "attention_memory_delta_abs_mean": float(
                                     (a_mem.float() - a_base.float()).abs().mean().item()
                                 ),
+                                "attention_memory_abs_mean": float(
+                                    a_mem.float().abs().mean().item()
+                                ),
                                 "gated_delta_abs_mean": float(
-                                    delta.float().abs().mean().item()
+                                    memory_signal.float().abs().mean().item()
                                 ),
                                 "gated_delta_max_abs": float(
-                                    delta.float().abs().max().item()
+                                    memory_signal.float().abs().max().item()
                                 ),
                                 "blend_delta_abs_mean": float(
-                                    (layer_memory.alpha * delta.float()).abs().mean().item()
+                                    (layer_memory.alpha * memory_signal.float()).abs().mean().item()
                                 ),
                             }
                         )
-                    x = a_base + layer_memory.alpha * delta
+                    x = a_base + layer_memory.alpha * memory_signal
  
         x = x.flatten(2)
         x = self.o(x)

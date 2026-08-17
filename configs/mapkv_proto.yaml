@@ -15,6 +15,7 @@ mapkv:
   selected_layers: [-4, -3, -2, -1]
   selected_step_indices: [-1]
   alpha: 0.10
+  injection_mode: replace_recent_delta
   gate:
     mode: ref_blind
     smooth_kernel: 3

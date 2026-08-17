@@ -1,0 +1,45 @@
+experiment:
+  seed: 0
+  use_saved_noise_bundle: true
+  save_latents: true
+  save_lossless_keyframes: true
+
+mapkv:
+  enabled: false
+  mode: off
+  source_chunk: null
+  target_chunks: []
+  wrong_chunk: null
+  random_seed: 0
+  selected_layers: [-4, -3, -2, -1]
+  selected_step_indices: [-1]
+  alpha: 0.10
+  injection_mode: residual_memory_attention
+  gate:
+    mode: global
+    smooth_kernel: 3
+  bank:
+    root: results/mapkv_fast/kv/bank
+    storage_device: cpu
+    pin_memory: true
+    dtype: bfloat16
+    capture_selected_layers_only: true
+
+cut3r:
+  backend: official
+  mode: offline_causal_prefix
+  image_size: 512
+  confidence_threshold: 1.5
+
+surfel:
+  voxel_size_mode: relative_scene
+  voxel_size: null
+  relative_scene_fraction: 0.005
+  grid: [20, 32]
+
+retrieval:
+  top_k_chunks: 1
+  min_history_gap_chunks: 2
+  use_view_alignment: true
+  use_occlusion: true
+  query_pose_mode: controlled_same_pose

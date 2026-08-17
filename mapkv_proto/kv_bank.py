@@ -88,6 +88,9 @@ class KVBankWriter:
                 "shape": list(k.shape),
                 "source_dtype": payload["source_dtype"],
                 "sha256": _sha256_file(path),
+                "memory_bytes": int(
+                    k.numel() * k.element_size() + v.numel() * v.element_size()
+                ),
             }
         self.chunks[str(chunk_id)] = {
             "chunk_id": chunk_id,
@@ -97,6 +100,8 @@ class KVBankWriter:
             "rgb_keyframe_id": None,
             "pose_metadata": None,
             "rope_layout": "recent_slot_t3_t5",
+            "rope_state": "post_rope",
+            "capture_type": "clean_context",
             "layers": layer_meta,
         }
         self._write_metadata()
@@ -118,6 +123,15 @@ class KVBankWriter:
             "recent_slot_len": self.recent_slot_len,
             "rope_layout": "recent_slot_t3_t5",
             "storage_dtype": str(self.dtype).replace("torch.", ""),
+            "capture_type": "clean_context",
+            "rope_state": "post_rope",
+            "memory_bytes": int(
+                sum(
+                    layer.get("memory_bytes", 0)
+                    for chunk in self.chunks.values()
+                    for layer in chunk.get("layers", {}).values()
+                )
+            ),
             "chunks": self.chunks,
         }
         path = self.root / "metadata.json"

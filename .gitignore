@@ -27,3 +27,7 @@ build/
 # MapKV prototype outputs and pinned external research dependency
 artifacts/
 third_party/vmem/
+third_party/CUT3R/
+third_party/mapkv_cut3r_env/
+third_party/cut3r_tools/
+results/

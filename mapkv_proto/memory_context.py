@@ -19,6 +19,7 @@ class ActiveLayerMemory:
     query_gate: torch.Tensor | None
     source_chunk: int
     audit_record: dict | None = None
+    injection_mode: str = "replace_recent_delta"
 
 
 def _smooth_gate(gate: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -100,6 +101,7 @@ class MemoryContext:
     selected_layers: tuple[int, ...]
     selected_step_indices: tuple[int, ...]
     alpha: float
+    injection_mode: str = "replace_recent_delta"
     gate_mode: str = "ref_blind"
     smooth_kernel: int = 3
     coverage: torch.Tensor | None = None
@@ -169,6 +171,7 @@ class MemoryContext:
             query_gate=self.query_gate,
             source_chunk=self.source_chunk,
             audit_record=audit_record,
+            injection_mode=self.injection_mode,
         )
 
     @property
@@ -184,6 +187,7 @@ def make_memory_context(
     selected_layers: Iterable[int],
     selected_step_indices: Iterable[int],
     alpha: float,
+    injection_mode: str = "replace_recent_delta",
     gate_mode: str,
     smooth_kernel: int,
     coverage: torch.Tensor | None = None,
@@ -197,6 +201,7 @@ def make_memory_context(
         selected_layers=tuple(selected_layers),
         selected_step_indices=tuple(selected_step_indices),
         alpha=float(alpha),
+        injection_mode=injection_mode,
         gate_mode=gate_mode,
         smooth_kernel=smooth_kernel,
         coverage=coverage,

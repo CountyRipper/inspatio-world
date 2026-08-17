@@ -11,6 +11,9 @@ from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
+from mapkv.kv_bank import resolve_memory_layers
+from mapkv.retrieval import GeometryChunkRetriever
+from mapkv.surfel_index import SurfelIndex as VoxelSurfelIndex
 from mapkv_proto.trajectory_builder import (
     build_control_phases,
     build_exact_c2w,
@@ -220,6 +223,82 @@ def test_auxiliary_attention_is_strictly_opt_in_and_cache_safe(monkeypatch):
 
     with pytest.raises(AssertionError, match="writer"):
         module(x, None, freqs, kv_cache=cache, kv_size=(0, -1), layer_memory=active)
+
+
+def test_residual_memory_attention_is_separate_and_cache_safe(monkeypatch):
+    import wan.modules.causal_model as causal_model
+
+    calls = []
+
+    def fake_attention(q, k, v):
+        calls.append(k.shape[1])
+        return q + v.mean(dim=1, keepdim=True)
+
+    monkeypatch.setattr(causal_model, "attention", fake_attention)
+    module = causal_model.CausalWanSelfAttention(dim=4, num_heads=2, qk_norm=False)
+    with torch.no_grad():
+        for projection in (module.q, module.k, module.v, module.o):
+            projection.weight.copy_(torch.eye(4))
+            projection.bias.zero_()
+    x = torch.ones(1, 2, 4)
+    freqs = torch.ones(2, 1, 1, dtype=torch.complex128)
+    cache = {
+        "k": torch.zeros(1, 4, 2, 2),
+        "v": torch.zeros(1, 4, 2, 2),
+    }
+    before = {key: value.clone() for key, value in cache.items()}
+    baseline = module(x, None, freqs, kv_cache=cache, kv_size=(0, 4))
+    audit = {}
+    memory = ActiveLayerMemory(
+        k=torch.ones(1, 2, 2, 2),
+        v=torch.full((1, 2, 2, 2), 3.0),
+        alpha=0.1,
+        query_gate=torch.ones(1, 2),
+        source_chunk=1,
+        audit_record=audit,
+        injection_mode="residual_memory_attention",
+    )
+    output = module(
+        x, None, freqs, kv_cache=cache, kv_size=(0, 4), layer_memory=memory
+    )
+    assert calls == [6, 6, 2]
+    assert not torch.equal(output, baseline)
+    assert audit["injection_mode"] == "residual_memory_attention"
+    for key in cache:
+        torch.testing.assert_close(cache[key], before[key], rtol=0, atol=0)
+
+
+def test_uniform_layers_and_voxel_surfel_retrieval_roundtrip(tmp_path):
+    assert resolve_memory_layers("uniform8", 30) == (0, 4, 8, 12, 17, 21, 25, 29)
+    yy, xx = np.mgrid[-1:1:6j, -1:1:8j]
+    points = np.stack([xx, yy, np.full_like(xx, 2.0)], axis=-1).astype(np.float32)
+    confidence = np.full(points.shape[:2], 3.0, dtype=np.float32)
+    pose = np.eye(4, dtype=np.float32)
+    index = VoxelSurfelIndex(voxel_size=0.15)
+    index.insert_frame(points, confidence, pose, 1, grid_hw=(6, 8))
+    index.insert_frame(points, confidence, pose, 3, grid_hw=(6, 8))
+    index.insert_frame(points, confidence, pose, 3, grid_hw=(6, 8))
+    path = tmp_path / "surfel.npz"
+    index.save(path)
+    restored = VoxelSurfelIndex.load(path)
+    retriever = GeometryChunkRetriever(
+        min_history_gap_chunks=2,
+        use_view_alignment=False,
+        use_occlusion=True,
+    )
+    intrinsic = np.array([[20.0, 0, 16], [0, 20.0, 12], [0, 0, 1]])
+    result, diagnostics = retriever.retrieve(
+        restored,
+        pose,
+        intrinsic,
+        source_image_size=(24, 32),
+        image_size=(24, 32),
+        current_chunk=6,
+        top_k=1,
+    )
+    assert result["selected_chunks"] == [3]
+    assert result["num_visible_surfels"] > 0
+    assert diagnostics["coverage"].any()
 
 
 def test_surfel_merge_serialization_and_causal_visibility_vote(tmp_path):

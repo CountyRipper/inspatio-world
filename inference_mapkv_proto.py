@@ -15,6 +15,7 @@ import json
 import shutil
 import subprocess
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from mapkv_proto.memory_context import make_memory_context
 from mapkv_proto.retrieval import RetrievalPlan
 from mapkv_proto.revisit_pair import build_block_mapping
 from mapkv_proto.visualization import save_gate_overlay
+from mapkv.kv_bank import resolve_memory_layers
 from pipeline import CausalInferencePipeline
 from utils.misc import set_seed
 from utils.render_warper import convert_mask_video
@@ -76,8 +78,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random_seed", type=int)
     parser.add_argument("--target_chunks", nargs="+", type=int)
     parser.add_argument("--selected_layers", nargs="+", type=int)
+    parser.add_argument(
+        "--memory_layers",
+        choices=("uniform8", "middle8", "explicit", "all"),
+        help="Resolve memory layers from the runtime transformer depth.",
+    )
     parser.add_argument("--selected_steps", nargs="+", type=int)
     parser.add_argument("--alpha", type=float)
+    parser.add_argument(
+        "--injection_mode",
+        choices=("replace_recent_delta", "residual_memory_attention"),
+    )
     parser.add_argument(
         "--gate_mode", choices=("global", "ref_blind", "surfel_ref_blind")
     )
@@ -177,6 +188,8 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
         raw["selected_step_indices"] = args.selected_steps
     if args.alpha is not None:
         raw["alpha"] = args.alpha
+    if args.injection_mode is not None:
+        raw["injection_mode"] = args.injection_mode
     if args.gate_mode is not None:
         raw.setdefault("gate", {})["mode"] = args.gate_mode
     if args.bank_root is not None:
@@ -325,6 +338,7 @@ def _build_memory_contexts(
             selected_layers=config.selected_layers,
             selected_step_indices=config.selected_step_indices,
             alpha=config.alpha,
+            injection_mode=config.injection_mode,
             gate_mode=config.gate.mode,
             smooth_kernel=config.gate.smooth_kernel,
             coverage=coverage,
@@ -388,6 +402,15 @@ def main() -> None:
     started = time.perf_counter()
     print(f"[MapKV] Loading pipeline on {device} in bf16; compile=False, TAE=False")
     pipeline = CausalInferencePipeline(config, device=device)
+    if args.memory_layers is not None:
+        mapkv_config = replace(
+            mapkv_config,
+            selected_layers=resolve_memory_layers(
+                args.memory_layers,
+                pipeline.num_transformer_blocks,
+                mapkv_config.selected_layers,
+            ),
+        )
     state_dict = load_file(str(Path(args.checkpoint_path).resolve()))
     incompatible = pipeline.generator.load_state_dict(state_dict, strict=False)
     del state_dict
@@ -705,7 +728,9 @@ def main() -> None:
             "enabled": mapkv_config.enabled,
             "mode": mapkv_config.mode,
             "alpha": mapkv_config.alpha,
+            "injection_mode": mapkv_config.injection_mode,
             "selected_layers_raw": list(mapkv_config.selected_layers),
+            "memory_layers_mode": args.memory_layers or "explicit",
             "selected_layers_resolved": list(
                 resolve_indices(
                     mapkv_config.selected_layers,

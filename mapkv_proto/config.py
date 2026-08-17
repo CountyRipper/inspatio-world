@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 VALID_MODES = {"off", "oracle", "wrong", "random", "pose", "geometry"}
 VALID_GATES = {"global", "ref_blind", "surfel_ref_blind"}
+VALID_INJECTION_MODES = {"replace_recent_delta", "residual_memory_attention"}
 
 
 def resolve_indices(indices: Sequence[int], size: int, *, name: str) -> tuple[int, ...]:
@@ -44,6 +45,7 @@ class MapKVConfig:
     selected_layers: tuple[int, ...] = (-4, -3, -2, -1)
     selected_step_indices: tuple[int, ...] = (-1,)
     alpha: float = 0.10
+    injection_mode: str = "replace_recent_delta"
     gate: GateConfig = field(default_factory=GateConfig)
     bank_root: Path = Path("artifacts/baseline/kv_bank")
     pin_memory: bool = True
@@ -53,6 +55,8 @@ class MapKVConfig:
             raise ValueError(f"Unsupported MapKV mode: {self.mode}")
         if self.alpha < 0:
             raise ValueError("alpha must be non-negative")
+        if self.injection_mode not in VALID_INJECTION_MODES:
+            raise ValueError(f"Unsupported memory injection mode: {self.injection_mode}")
         if not self.selected_layers:
             raise ValueError("selected_layers cannot be empty when MapKV is enabled")
         if not self.selected_step_indices:
@@ -76,6 +80,7 @@ class MapKVConfig:
             selected_layers=tuple(int(x) for x in raw.get("selected_layers", (-4, -3, -2, -1))),
             selected_step_indices=tuple(int(x) for x in raw.get("selected_step_indices", (-1,))),
             alpha=float(raw.get("alpha", 0.10)),
+            injection_mode=str(raw.get("injection_mode", "replace_recent_delta")),
             gate=GateConfig(
                 mode=str(gate_raw.get("mode", "ref_blind")),
                 smooth_kernel=int(gate_raw.get("smooth_kernel", 3)),
