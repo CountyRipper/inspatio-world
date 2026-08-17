@@ -147,7 +147,8 @@ table{{border-collapse:collapse;width:100%}}th,td{{padding:7px;border-bottom:1px
 <small>Commit {git_commit} - branch {html.escape(git_branch)} - worktree {dirty_note}</small></section>
 
 <section><h2>Reproducibility</h2><table>
-<tr><th>GPU</th><td>{html.escape(baseline_metadata['gpu'])} (single GPU)</td></tr>
+<tr><th>InSpatio GPU</th><td>{html.escape(baseline_metadata['gpu'])} (single GPU)</td></tr>
+<tr><th>CUT3R GPU</th><td>{html.escape(cut3r['gpu'])} (separate process, single GPU)</td></tr>
 <tr><th>Baseline generation commit</th><td><code>{baseline_metadata['git_commit']}</code>; dirty={str(bool(baseline_metadata['git_status'])).lower()} (diff stat saved)</td></tr>
 <tr><th>Report/code commit</th><td><code>{git_commit}</code>; dirty={str(bool(git_status)).lower()}</td></tr>
 <tr><th>InSpatio checkpoint</th><td><code>{html.escape(config['inspatio_checkpoint'])}</code></td></tr>
@@ -240,7 +241,7 @@ function allReset(){{[...vids,...b2vids].forEach(v=>{{v.pause();v.currentTime=0;
 - Run: `{root.name}`
 - Commit: `{git_commit}`
 - Baseline generation commit / dirty: `{baseline_metadata['git_commit']}` / `{bool(baseline_metadata['git_status'])}`
-- GPU: `{baseline_metadata['gpu']}` (single GPU)
+- InSpatio / CUT3R GPU: `{baseline_metadata['gpu']}` / `{cut3r['gpu']}` (separate single-GPU processes)
 - InSpatio checkpoint: `{config['inspatio_checkpoint']}`
 - CUT3R commit / checkpoint SHA256: `{cut3r['cut3r_commit']}` / `{cut3r['checkpoint_sha256']}`
 - Trajectory / source SHA256: `{config['trajectory_sha256']}` / `{config['source_sha256']}`

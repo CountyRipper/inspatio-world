@@ -216,6 +216,11 @@ class Cut3RAdapter:
         views = _prepare_views(image_paths, self.image_size)
         model = ARCroco3DStereo.from_pretrained(str(self.checkpoint)).to(self.device)
         model.eval()
+        cut3r_gpu = (
+            torch.cuda.get_device_name(torch.device(self.device))
+            if str(self.device).startswith("cuda") and torch.cuda.is_available()
+            else str(self.device)
+        )
         if len(views) < 4 or len(views) > 64:
             raise ValueError(f"Final CUT3R checkpoint expects 4-64 views, got {len(views)}")
         started = time.perf_counter()
@@ -290,6 +295,7 @@ class Cut3RAdapter:
             "checkpoint": str(self.checkpoint),
             "checkpoint_bytes": self.checkpoint.stat().st_size,
             "checkpoint_sha256": checkpoint_sha256,
+            "gpu": cut3r_gpu,
             "coordinate_frame": "CUT3R_first_view_world",
             "pose_convention": "c2w; camera x-right y-down z-forward",
             "scale_behavior": "arbitrary learned scene scale",
@@ -312,6 +318,7 @@ class Cut3RAdapter:
             "cut3r_dirty": cut3r_dirty,
             "checkpoint": str(self.checkpoint),
             "checkpoint_sha256": checkpoint_sha256,
+            "gpu": cut3r_gpu,
             "frames": len(frame_entries),
             "raw_points": raw_points,
             "accepted_points": accepted_points,
