@@ -694,6 +694,107 @@ class SurfelIndex:
         return cls(voxel_size, cells)
 
 
+def write_oriented_disk_preview(
+    index: SurfelIndex,
+    path: str | Path,
+    *,
+    max_disks: int = 3000,
+    vertices_per_disk: int = 12,
+) -> None:
+    """Render an inspectable VMem-style oriented-disk view without changing geometry."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    valid_indices = [
+        item
+        for item, cell in enumerate(index.cells)
+        if cell.normal is not None
+        and np.isfinite(cell.xyz).all()
+        and np.isfinite(cell.normal).all()
+        and np.isfinite(cell.radius)
+        and cell.radius > 0
+        and np.linalg.norm(cell.normal) > 1e-8
+    ]
+    if len(valid_indices) > max_disks:
+        sample = np.rint(
+            np.linspace(0, len(valid_indices) - 1, max_disks)
+        ).astype(np.int64)
+        valid_indices = [valid_indices[int(item)] for item in sample]
+
+    positive_radii = np.asarray(
+        [index.cells[item].radius for item in valid_indices], dtype=np.float32
+    )
+    radius_cap = (
+        float(np.quantile(positive_radii, 0.95))
+        if positive_radii.size
+        else index.voxel_size
+    )
+    theta = np.linspace(0.0, 2.0 * np.pi, vertices_per_disk, endpoint=False)
+    polygons = []
+    dominant_chunks = []
+    centers = []
+    for item in valid_indices:
+        cell = index.cells[item]
+        normal = np.asarray(cell.normal, dtype=np.float64)
+        normal /= np.linalg.norm(normal)
+        seed_axis = np.array([1.0, 0.0, 0.0])
+        if abs(float(np.dot(normal, seed_axis))) > 0.9:
+            seed_axis = np.array([0.0, 1.0, 0.0])
+        tangent = np.cross(normal, seed_axis)
+        tangent /= np.linalg.norm(tangent)
+        bitangent = np.cross(normal, tangent)
+        radius = min(float(cell.radius), radius_cap)
+        disk = (
+            cell.xyz[None]
+            + radius * np.cos(theta)[:, None] * tangent[None]
+            + radius * np.sin(theta)[:, None] * bitangent[None]
+        )
+        polygons.append(disk[:, [0, 2, 1]])
+        centers.append(cell.xyz[[0, 2, 1]])
+        dominant_chunks.append(max(cell.chunk_weights, key=cell.chunk_weights.get))
+
+    figure = plt.figure(figsize=(9, 7))
+    axis = figure.add_subplot(111, projection="3d")
+    if polygons:
+        dominant = np.asarray(dominant_chunks, dtype=np.float32)
+        normalize = plt.Normalize(
+            vmin=float(dominant.min()),
+            vmax=max(float(dominant.max()), float(dominant.min()) + 1.0),
+        )
+        collection = Poly3DCollection(
+            polygons,
+            facecolors=plt.get_cmap("turbo")(normalize(dominant)),
+            edgecolors="none",
+            alpha=0.58,
+        )
+        axis.add_collection3d(collection)
+        centers_array = np.asarray(centers)
+        lower = np.quantile(centers_array, 0.01, axis=0)
+        upper = np.quantile(centers_array, 0.99, axis=0)
+        margin = np.maximum((upper - lower) * 0.04, index.voxel_size)
+        axis.set_xlim(lower[0] - margin[0], upper[0] + margin[0])
+        axis.set_ylim(lower[1] - margin[1], upper[1] + margin[1])
+        axis.set_zlim(lower[2] - margin[2], upper[2] + margin[2])
+        axis.set_box_aspect(np.maximum(upper - lower, index.voxel_size))
+        scalar = plt.cm.ScalarMappable(norm=normalize, cmap="turbo")
+        scalar.set_array(dominant)
+        figure.colorbar(scalar, ax=axis, shrink=0.7, label="dominant chunk")
+    axis.set(
+        title=f"Oriented surfel disks (sampled {len(polygons)}/{len(index.cells)})",
+        xlabel="x",
+        ylabel="z",
+        zlabel="y",
+    )
+    figure.tight_layout()
+    figure.savefig(path, dpi=170)
+    plt.close(figure)
+
+
 def _relative_voxel_size(
     sequence_path: Path,
     grid_hw: tuple[int, int],
@@ -862,7 +963,11 @@ def build_from_sequence(
     )
     fig.tight_layout()
     fig.savefig(output_dir / "surfel_preview.png", dpi=160)
+    fig.savefig(output_dir / "surfel_center_preview.png", dpi=160)
     plt.close(fig)
+    write_oriented_disk_preview(
+        index, output_dir / "surfel_disk_preview.png"
+    )
     return index
 
 

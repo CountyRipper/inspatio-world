@@ -32,10 +32,12 @@ from datasets.video_dataset import VideoDataset
 from mapkv_proto.config import MapKVConfig, resolve_indices
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
+from mapkv_proto.reference_kv_bank import ReferenceKVBankWriter
 from mapkv_proto.memory_context import make_memory_context
 from mapkv_proto.retrieval import RetrievalPlan
 from mapkv_proto.revisit_pair import build_block_mapping
 from mapkv_proto.visualization import save_gate_overlay
+from mapkv.latent_control import LatentBlockIntervention
 from mapkv.kv_bank import resolve_memory_layers
 from pipeline import CausalInferencePipeline
 from utils.misc import set_seed
@@ -68,10 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise_bundle", required=True)
     parser.add_argument("--create_noise_bundle", action="store_true")
     parser.add_argument("--capture_kv", action="store_true")
+    parser.add_argument("--capture_chunks", nargs="+", type=int)
+    parser.add_argument("--capture_ref_kv", action="store_true")
+    parser.add_argument("--ref_bank_root")
+    parser.add_argument("--ref_chunks", nargs="+", type=int)
+    parser.add_argument("--latent_memory_path")
+    parser.add_argument("--latent_source_chunks", nargs="+", type=int)
+    parser.add_argument("--latent_target_chunks", nargs="+", type=int)
+    parser.add_argument("--latent_strengths", nargs="+", type=float)
     parser.add_argument("--bank_root")
     parser.add_argument(
         "--mode",
-        choices=("off", "baseline", "oracle", "wrong", "random", "pose", "geometry"),
+        choices=("off", "baseline", "oracle", "wrong", "random", "zero", "pose", "geometry"),
     )
     parser.add_argument("--source_chunk", type=int)
     parser.add_argument("--wrong_chunk", type=int)
@@ -87,7 +97,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float)
     parser.add_argument(
         "--injection_mode",
-        choices=("replace_recent_delta", "residual_memory_attention"),
+        choices=(
+            "replace_recent_delta",
+            "replace_ref_delta",
+            "replace_both_delta",
+            "residual_memory_attention",
+        ),
     )
     parser.add_argument(
         "--gate_mode", choices=("global", "ref_blind", "surfel_ref_blind")
@@ -246,6 +261,7 @@ def _build_memory_contexts(
     *,
     config: MapKVConfig,
     retrieval_plan_path: str | None,
+    reference_bank_root: str | None,
     num_layers: int,
     device: torch.device,
     dtype: torch.dtype,
@@ -253,10 +269,22 @@ def _build_memory_contexts(
     if not config.enabled or config.mode == "off":
         return {}, []
     bank = KVBank(config.bank_root)
+    needs_reference_payload = config.injection_mode in {
+        "replace_ref_delta",
+        "replace_both_delta",
+    }
+    reference_bank = None
+    if needs_reference_payload:
+        if not reference_bank_root:
+            raise ValueError(f"{config.injection_mode} requires --ref_bank_root")
+        reference_bank = KVBank(reference_bank_root)
+        if reference_bank.metadata.get("rope_layout") != "reference_slot_t0_t2":
+            raise ValueError("Reference KV bank is not encoded with reference-slot RoPE")
     plan = RetrievalPlan(retrieval_plan_path) if retrieval_plan_path else None
     contexts = {}
     selections = []
     payload_cache = {}
+    reference_payload_cache = {}
     for target_chunk in config.target_chunks:
         coverage = None
         plan_source = None
@@ -273,7 +301,7 @@ def _build_memory_contexts(
                 )
         elif config.mode == "wrong":
             source_chunk = config.wrong_chunk
-        elif config.mode == "random":
+        elif config.mode in {"random", "zero"}:
             source_chunk = config.source_chunk
         else:
             if plan is None:
@@ -284,7 +312,11 @@ def _build_memory_contexts(
             "source_chunk": None if source_chunk is None else int(source_chunk),
             "mode": config.mode,
             "payload_kind": (
-                "token_permuted_historical" if config.mode == "random" else "native"
+                "zeroed_slot"
+                if config.mode == "zero"
+                else (
+                    "token_permuted_historical" if config.mode == "random" else "native"
+                )
             ),
             "coverage_fraction": None if coverage is None else float(coverage.float().mean()),
         }
@@ -313,6 +345,37 @@ def _build_memory_contexts(
                 pin_memory=config.pin_memory,
             )
         layer_payloads = payload_cache[source_chunk]
+        reference_layer_payloads = None
+        if reference_bank is not None:
+            if source_chunk not in reference_payload_cache:
+                reference_payload_cache[source_chunk] = reference_bank.materialize(
+                    source_chunk,
+                    selected_layers=config.selected_layers,
+                    num_layers=num_layers,
+                    device=device,
+                    dtype=dtype,
+                    pin_memory=config.pin_memory,
+                )
+            reference_layer_payloads = reference_payload_cache[source_chunk]
+            selection["reference_rope_layout"] = "reference_slot_t0_t2"
+        if config.mode == "zero":
+            if config.injection_mode in {
+                "replace_recent_delta",
+                "replace_both_delta",
+            }:
+                layer_payloads = {
+                    layer: (torch.zeros_like(k), torch.zeros_like(v))
+                    for layer, (k, v) in layer_payloads.items()
+                }
+            if config.injection_mode in {
+                "replace_ref_delta",
+                "replace_both_delta",
+            }:
+                assert reference_layer_payloads is not None
+                reference_layer_payloads = {
+                    layer: (torch.zeros_like(k), torch.zeros_like(v))
+                    for layer, (k, v) in reference_layer_payloads.items()
+                }
         if config.mode == "random":
             first_payload = next(iter(layer_payloads.values()))
             token_count = int(first_payload[0].shape[1])
@@ -335,6 +398,7 @@ def _build_memory_contexts(
             target_block=target_chunk,
             source_chunk=source_chunk,
             layer_payloads=layer_payloads,
+            reference_layer_payloads=reference_layer_payloads,
             selected_layers=config.selected_layers,
             selected_step_indices=config.selected_step_indices,
             alpha=config.alpha,
@@ -382,6 +446,33 @@ def main() -> None:
     args = parse_args()
     if args.target_pose_path and args.traj_txt_path:
         raise ValueError("--target_pose_path and --traj_txt_path are mutually exclusive")
+    if args.capture_chunks and not args.capture_kv:
+        raise ValueError("--capture_chunks requires --capture_kv")
+    if args.capture_ref_kv and (not args.ref_bank_root or not args.ref_chunks):
+        raise ValueError(
+            "--capture_ref_kv requires both --ref_bank_root and --ref_chunks"
+        )
+    if args.ref_chunks and not args.capture_ref_kv:
+        raise ValueError("--ref_chunks requires --capture_ref_kv")
+    latent_arguments = (
+        args.latent_memory_path,
+        args.latent_source_chunks,
+        args.latent_target_chunks,
+        args.latent_strengths,
+    )
+    if any(item is not None for item in latent_arguments) and not all(
+        item is not None for item in latent_arguments
+    ):
+        raise ValueError(
+            "Latent control requires memory path, source chunks, target chunks, "
+            "and strengths together"
+        )
+    if args.latent_memory_path and not (
+        len(args.latent_source_chunks)
+        == len(args.latent_target_chunks)
+        == len(args.latent_strengths)
+    ):
+        raise ValueError("Latent source/target/strength lists must have equal length")
     if not torch.cuda.is_available():
         raise RuntimeError("The fixed MapKV prototype requires one CUDA device")
     device = torch.device(args.device)
@@ -513,14 +604,56 @@ def main() -> None:
             frames_per_block=frames_per_block,
             tokens_per_frame=layout["tokens_per_frame"],
             dtype=dtype,
+            capture_chunk_ids=args.capture_chunks,
         )
     memory_contexts, memory_selections = _build_memory_contexts(
         config=mapkv_config,
         retrieval_plan_path=args.retrieval_plan,
+        reference_bank_root=args.ref_bank_root,
         num_layers=pipeline.num_transformer_blocks,
         device=device,
         dtype=dtype,
     )
+    latent_block_interventions = {}
+    if args.latent_memory_path:
+        if mapkv_config.enabled:
+            raise ValueError("KV memory and direct latent control must run separately")
+        latent_memory = torch.load(
+            Path(args.latent_memory_path).resolve(),
+            map_location="cpu",
+            weights_only=True,
+        )
+        if isinstance(latent_memory, dict):
+            latent_memory = latent_memory["pred_latents"]
+        if tuple(latent_memory.shape) != noise_shape:
+            raise ValueError(
+                f"Latent memory shape {tuple(latent_memory.shape)} != {noise_shape}"
+            )
+        for source_chunk, target_block, strength in zip(
+            args.latent_source_chunks,
+            args.latent_target_chunks,
+            args.latent_strengths,
+        ):
+            source_chunk = int(source_chunk)
+            target_block = int(target_block)
+            start = source_chunk * frames_per_block
+            stop = start + frames_per_block
+            if source_chunk < 0 or stop > output_length:
+                raise IndexError(f"Latent source chunk {source_chunk} is out of range")
+            if target_block <= source_chunk or target_block >= num_blocks:
+                raise ValueError(
+                    f"Latent target {target_block} must be after source "
+                    f"{source_chunk} and inside [0, {num_blocks})"
+                )
+            latent_block_interventions[target_block] = LatentBlockIntervention(
+                target_block=target_block,
+                source_chunk=source_chunk,
+                clean_latent=latent_memory[:, start:stop].to(
+                    device=device, dtype=dtype
+                ),
+                strength=float(strength),
+            )
+        del latent_memory
 
     torch.cuda.synchronize(device)
     inference_started = time.perf_counter()
@@ -535,6 +668,7 @@ def main() -> None:
             noise_provider=bundle,
             after_context_write=bank_writer,
             memory_contexts=memory_contexts or None,
+            latent_block_interventions=latent_block_interventions or None,
         )
     torch.cuda.synchronize(device)
     inference_seconds = time.perf_counter() - inference_started
@@ -545,7 +679,7 @@ def main() -> None:
     )
     in_process_replay = None
     if args.verify_memory_off_replay:
-        if mapkv_config.enabled or memory_contexts:
+        if mapkv_config.enabled or memory_contexts or latent_block_interventions:
             raise ValueError("--verify_memory_off_replay is valid for memory-off only")
         with torch.no_grad():
             replay_latents = pipeline.inference(
@@ -571,6 +705,65 @@ def main() -> None:
             raise RuntimeError(
                 f"Deterministic in-process replay failed: {in_process_replay}"
             )
+    reference_capture = {"enabled": False, "chunks": []}
+    if args.capture_ref_kv:
+        if in_process_replay is not None:
+            del replay_latents
+        pipeline.kv_cache1 = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        selected_reference_layers = resolve_indices(
+            mapkv_config.selected_layers,
+            pipeline.num_transformer_blocks,
+            name="reference capture layer",
+        )
+        reference_writer = ReferenceKVBankWriter(
+            args.ref_bank_root,
+            selected_layers=selected_reference_layers,
+            num_layers=pipeline.num_transformer_blocks,
+            slot_len=layout["recent_slot_len"],
+            frames_per_block=frames_per_block,
+            tokens_per_frame=layout["tokens_per_frame"],
+            dtype=dtype,
+        )
+        reference_capture_started = time.perf_counter()
+        for chunk_id in args.ref_chunks:
+            chunk_id = int(chunk_id)
+            start = chunk_id * frames_per_block
+            stop = start + frames_per_block
+            if start < 0 or stop > pred_latents.shape[1]:
+                raise IndexError(
+                    f"Reference capture chunk {chunk_id} is outside "
+                    f"[0, {num_blocks})"
+                )
+            clean_block = pred_latents[:, start:stop]
+            payloads = pipeline.encode_clean_latent_as_reference_slot(
+                clean_block,
+                batch["text"],
+                selected_reference_layers,
+            )
+            reference_writer.write_chunk(
+                chunk_id=chunk_id,
+                layer_payloads=payloads,
+                metadata={
+                    "source": "baseline_pred_latents",
+                    "source_latent_range": [start, stop],
+                },
+            )
+            reference_capture["chunks"].append(chunk_id)
+            del payloads
+            torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+        reference_capture.update(
+            {
+                "enabled": True,
+                "bank_root": str(Path(args.ref_bank_root).resolve()),
+                "rope_layout": "reference_slot_t0_t2",
+                "capture_type": "clean_reference_reencode",
+                "selected_layers": list(selected_reference_layers),
+                "seconds": time.perf_counter() - reference_capture_started,
+            }
+        )
     latent_path = output_root / "pred_latents.pt"
     torch.save(pred_latents.detach().cpu(), latent_path)
 
@@ -743,11 +936,31 @@ def main() -> None:
                 resolve_indices(mapkv_config.selected_step_indices, num_steps, name="step")
             ),
             "gate_mode": mapkv_config.gate.mode,
+            "recent_bank_root": str(Path(mapkv_config.bank_root).resolve()),
+            "reference_bank_root": (
+                None if args.ref_bank_root is None else str(Path(args.ref_bank_root).resolve())
+            ),
+            "recent_capture_chunks": args.capture_chunks,
+            "reference_capture": reference_capture,
+            "base_runtime_cache_replaced": False,
             "selections": memory_selections,
             "activation_audit": activation_audit,
             "cache_audits": {
                 str(target): context.cache_audit
                 for target, context in memory_contexts.items()
+            },
+        },
+        "latent_control": {
+            "enabled": bool(latent_block_interventions),
+            "mode": (
+                "direct_clean_x0_block_override"
+                if latent_block_interventions
+                else None
+            ),
+            "memory_path": args.latent_memory_path,
+            "interventions": {
+                str(target): intervention.audit
+                for target, intervention in latent_block_interventions.items()
             },
         },
         "timing_seconds": {

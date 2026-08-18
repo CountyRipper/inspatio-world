@@ -11,7 +11,7 @@ from .config import resolve_indices
 
 @dataclass(frozen=True)
 class ActiveLayerMemory:
-    """One layer's native recent-slot payload, ready for attention."""
+    """One layer's native context-slot payloads, ready for attention."""
 
     k: torch.Tensor
     v: torch.Tensor
@@ -20,6 +20,8 @@ class ActiveLayerMemory:
     source_chunk: int
     audit_record: dict | None = None
     injection_mode: str = "replace_recent_delta"
+    ref_k: torch.Tensor | None = None
+    ref_v: torch.Tensor | None = None
 
 
 def _smooth_gate(gate: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -101,6 +103,7 @@ class MemoryContext:
     selected_layers: tuple[int, ...]
     selected_step_indices: tuple[int, ...]
     alpha: float
+    reference_layer_payloads: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
     injection_mode: str = "replace_recent_delta"
     gate_mode: str = "ref_blind"
     smooth_kernel: int = 3
@@ -156,12 +159,20 @@ class MemoryContext:
         if self.active_step is None:
             raise RuntimeError("MemoryContext must be activated with for_denoising_step first")
         k, v = self.layer_payloads[block_index]
+        ref_k = ref_v = None
+        if self.reference_layer_payloads is not None:
+            if block_index not in self.reference_layer_payloads:
+                raise KeyError(
+                    f"No reference-slot KV payload for selected transformer layer {block_index}"
+                )
+            ref_k, ref_v = self.reference_layer_payloads[block_index]
         audit_record = {
             "target_block": self.target_block,
             "source_chunk": self.source_chunk,
             "step_index": self.active_step,
             "layer_index": block_index,
             "alpha": self.alpha,
+            "injection_mode": self.injection_mode,
         }
         self.audit_log.append(audit_record)
         return ActiveLayerMemory(
@@ -172,6 +183,8 @@ class MemoryContext:
             source_chunk=self.source_chunk,
             audit_record=audit_record,
             injection_mode=self.injection_mode,
+            ref_k=ref_k,
+            ref_v=ref_v,
         )
 
     @property
@@ -189,6 +202,7 @@ def make_memory_context(
     alpha: float,
     injection_mode: str = "replace_recent_delta",
     gate_mode: str,
+    reference_layer_payloads: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     smooth_kernel: int,
     coverage: torch.Tensor | None = None,
 ) -> MemoryContext | None:
@@ -203,6 +217,7 @@ def make_memory_context(
         alpha=float(alpha),
         injection_mode=injection_mode,
         gate_mode=gate_mode,
+        reference_layer_payloads=reference_layer_payloads,
         smooth_kernel=smooth_kernel,
         coverage=coverage,
     )

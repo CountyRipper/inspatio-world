@@ -43,6 +43,7 @@ class KVBankWriter:
         frames_per_block: int,
         tokens_per_frame: int,
         dtype: torch.dtype = torch.bfloat16,
+        capture_chunk_ids: Iterable[int] | None = None,
     ):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -54,11 +55,19 @@ class KVBankWriter:
         self.frames_per_block = int(frames_per_block)
         self.tokens_per_frame = int(tokens_per_frame)
         self.dtype = dtype
+        self.capture_chunk_ids = (
+            None
+            if capture_chunk_ids is None
+            else frozenset(int(chunk) for chunk in capture_chunk_ids)
+        )
         self.chunks: dict[str, dict] = {}
         self._write_metadata()
 
     def __call__(self, *, block_id: int, kv_cache: list[dict], context_frames: torch.Tensor) -> None:
         if block_id <= 0:
+            return
+        chunk_id = block_id - 1
+        if self.capture_chunk_ids is not None and chunk_id not in self.capture_chunk_ids:
             return
         if len(kv_cache) != self.num_layers:
             raise ValueError(f"KV cache has {len(kv_cache)} layers, expected {self.num_layers}")
@@ -68,7 +77,6 @@ class KVBankWriter:
                 f"Non-first writer context has {context_frames.shape[1]} frames, "
                 f"expected {expected_context_frames}"
             )
-        chunk_id = block_id - 1
         chunk_dir = self.root / f"chunk_{chunk_id:04d}"
         chunk_dir.mkdir(parents=True, exist_ok=True)
         start = self.recent_slot_len

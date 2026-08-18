@@ -201,6 +201,7 @@ class CausalInferencePipeline(torch.nn.Module):
         noise_provider=None,
         after_context_write=None,
         memory_contexts: Optional[Mapping[int, object]] = None,
+        latent_block_interventions: Optional[Mapping[int, object]] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -220,7 +221,7 @@ class CausalInferencePipeline(torch.nn.Module):
         num_blocks = num_frames // self.num_frame_per_block
         layout = self._runtime_layout(height, width)
         self.frame_seq_length = layout["tokens_per_frame"]
-        if memory_contexts or after_context_write is not None:
+        if memory_contexts or latent_block_interventions or after_context_write is not None:
             assert self.num_frame_per_block == 3, (
                 "The MapKV prototype currently supports num_frame_per_block=3 only"
             )
@@ -311,6 +312,15 @@ class CausalInferencePipeline(torch.nn.Module):
                 noise_provider=noise_provider,
                 memory_context=block_memory,
             )
+            latent_intervention = (latent_block_interventions or {}).get(block_id)
+            if latent_intervention is not None:
+                if int(latent_intervention.target_block) != block_id:
+                    raise ValueError(
+                        f"Latent intervention target {latent_intervention.target_block} "
+                        f"does not match block {block_id}"
+                    )
+                denoised_pred = latent_intervention.apply(denoised_pred)
+
 
 
             # Step 3.2: record the model's output
@@ -330,6 +340,87 @@ class CausalInferencePipeline(torch.nn.Module):
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
         return video
+
+    @torch.no_grad()
+    def encode_clean_latent_as_reference_slot(
+        self,
+        clean_latent: torch.Tensor,
+        text_prompts: List[str],
+        selected_layers,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Encode generated x0 with the true reference-slot t0-t2 RoPE layout."""
+        if clean_latent.ndim != 5:
+            raise ValueError(
+                f"clean_latent must be [B,F,C,H,W], got {tuple(clean_latent.shape)}"
+            )
+        batch, frames, _, height, width = clean_latent.shape
+        if frames != self.num_frame_per_block:
+            raise ValueError(
+                f"Reference re-encode requires {self.num_frame_per_block} frames, got {frames}"
+            )
+        selected = tuple(dict.fromkeys(int(layer) for layer in selected_layers))
+        if not selected or min(selected) < 0 or max(selected) >= self.num_transformer_blocks:
+            raise ValueError(
+                f"Reference re-encode layers {selected} are invalid for "
+                f"{self.num_transformer_blocks} transformer blocks"
+            )
+
+        layout = self._runtime_layout(height, width)
+        slot_len = layout["recent_slot_len"]
+        num_heads = int(_model_config_value(self.generator.model, "num_heads"))
+        dim = int(_model_config_value(self.generator.model, "dim"))
+        cache = [
+            {
+                "k": torch.zeros(
+                    [batch, slot_len, num_heads, dim // num_heads],
+                    device=clean_latent.device,
+                    dtype=clean_latent.dtype,
+                ),
+                "v": torch.zeros(
+                    [batch, slot_len, num_heads, dim // num_heads],
+                    device=clean_latent.device,
+                    dtype=clean_latent.dtype,
+                ),
+            }
+            for _ in range(self.num_transformer_blocks)
+        ]
+        zeros = torch.zeros_like(clean_latent)
+        reference_context = torch.cat(
+            [clean_latent, zeros[:, :, :4], zeros], dim=2
+        )
+        timestep_zero = torch.zeros(
+            [batch, frames],
+            device=clean_latent.device,
+            dtype=torch.int64,
+        )
+        conditional_dict = self.text_encoder(text_prompts=text_prompts)
+        # The causal model uses render_latent_input is not None to distinguish
+        # a pre-concatenated 36-channel context-writer input from a 16-channel
+        # denoising input. Its value is intentionally ignored for kv_size < 0.
+        writer_render_sentinel = torch.zeros(
+            (batch, frames, 20, height, width), device=clean_latent.device,
+            dtype=clean_latent.dtype,
+        )
+        self.generator(
+            noisy_image_or_video=reference_context,
+            conditional_dict=conditional_dict,
+            timestep=timestep_zero,
+            kv_cache=cache,
+            render_latent_input=writer_render_sentinel,
+            kv_size=(0, -1),
+            freqs_offset=0,
+        )
+        result = {}
+        for layer in selected:
+            k = cache[layer]["k"][:, :slot_len]
+            v = cache[layer]["v"][:, :slot_len]
+            if k.shape != v.shape or k.shape[1] != slot_len:
+                raise RuntimeError(
+                    f"Reference-slot writer produced invalid layer {layer}: "
+                    f"K={tuple(k.shape)} V={tuple(v.shape)}"
+                )
+            result[layer] = (k, v)
+        return result
 
     def _runtime_layout(self, latent_height, latent_width):
         patch_size = tuple(_model_config_value(self.generator.model, "patch_size"))

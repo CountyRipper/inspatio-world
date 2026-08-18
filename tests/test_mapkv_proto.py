@@ -8,11 +8,15 @@ import pytest
 import torch
 
 from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
+from mapkv.latent_control import LatentBlockIntervention
+from mapkv.surfel_index import write_oriented_disk_preview
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.retrieval import GeometryChunkRetriever
+from mapkv.slot_evaluation import _select_best_slot
+from mapkv_proto.reference_kv_bank import ReferenceKVBankWriter
 from mapkv.surfel_index import (
     SurfelCell,
     SurfelIndex as VoxelSurfelIndex,
@@ -506,3 +510,224 @@ def test_surfel_merge_serialization_and_causal_visibility_vote(tmp_path):
     assert chunk_two_coverage.sum() == 0, "occluded chunk must have empty coverage"
     with pytest.raises(ValueError, match="causally valid"):
         loaded.coverage_for_chunk(rendered, chunk_id=4, target_chunk=5)
+
+
+def test_reference_and_both_slot_counterfactuals_are_exact_and_cache_safe(monkeypatch):
+    import wan.modules.causal_model as causal_model
+
+    calls = []
+
+    def fake_attention(q, k, v):
+        calls.append({"k": k.clone(), "v": v.clone()})
+        return q + v.mean(dim=1, keepdim=True)
+
+    monkeypatch.setattr(causal_model, "attention", fake_attention)
+    module = causal_model.CausalWanSelfAttention(dim=4, num_heads=2, qk_norm=False)
+    with torch.no_grad():
+        for projection in (module.q, module.k, module.v, module.o):
+            projection.weight.copy_(torch.eye(4))
+            projection.bias.zero_()
+
+    x = torch.ones(1, 2, 4)
+    freqs = torch.ones(2, 1, 1, dtype=torch.complex128)
+    cache = {
+        "k": torch.arange(16, dtype=torch.float32).view(1, 4, 2, 2),
+        "v": torch.cat(
+            [
+                torch.full((1, 2, 2, 2), 10.0),
+                torch.full((1, 2, 2, 2), 20.0),
+            ],
+            dim=1,
+        ),
+    }
+    before = {name: value.clone() for name, value in cache.items()}
+    historical_recent = torch.full((1, 2, 2, 2), 100.0)
+    historical_ref = torch.full((1, 2, 2, 2), 200.0)
+
+    ref_memory = ActiveLayerMemory(
+        k=historical_recent,
+        v=historical_recent,
+        ref_k=historical_ref,
+        ref_v=historical_ref,
+        alpha=1.0,
+        query_gate=torch.ones(1, 2),
+        source_chunk=1,
+        injection_mode="replace_ref_delta",
+    )
+    module(x, None, freqs, kv_cache=cache, kv_size=(0, 4), layer_memory=ref_memory)
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[1]["v"][:, :2], historical_ref)
+    torch.testing.assert_close(calls[1]["v"][:, 2:4], cache["v"][:, 2:4])
+
+    calls.clear()
+    both_memory = ActiveLayerMemory(
+        k=historical_recent,
+        v=historical_recent,
+        ref_k=historical_ref,
+        ref_v=historical_ref,
+        alpha=1.0,
+        query_gate=torch.ones(1, 2),
+        source_chunk=1,
+        injection_mode="replace_both_delta",
+    )
+    module(x, None, freqs, kv_cache=cache, kv_size=(0, 4), layer_memory=both_memory)
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[1]["v"][:, :2], historical_ref)
+    torch.testing.assert_close(calls[1]["v"][:, 2:4], historical_recent)
+    for name in cache:
+        torch.testing.assert_close(cache[name], before[name], rtol=0, atol=0)
+
+
+def test_reference_slot_reencode_uses_t0_t2_writer_layout():
+    class FakeTextEncoder:
+        def __call__(self, text_prompts):
+            assert text_prompts == ["static scene"]
+            return {"prompt_embeds": torch.zeros(1, 1, 4)}
+
+    class FakeGenerator:
+        def __init__(self):
+            self.model = SimpleNamespace(num_heads=2, dim=4)
+            self.call = None
+
+        def __call__(self, **kwargs):
+            self.call = kwargs
+            context = kwargs["noisy_image_or_video"]
+            assert context.shape == (1, 3, 36, 2, 2)
+            assert kwargs["kv_size"] == (0, -1)
+            assert kwargs["freqs_offset"] == 0
+            assert kwargs["render_latent_input"].shape == (1, 3, 20, 2, 2)
+            assert torch.count_nonzero(kwargs["render_latent_input"]) == 0
+            assert kwargs["timestep"].shape == (1, 3)
+            assert torch.count_nonzero(kwargs["timestep"]) == 0
+            for layer, cache in enumerate(kwargs["kv_cache"]):
+                cache["k"].fill_(layer + 1)
+                cache["v"].fill_(layer + 11)
+            return torch.zeros(1)
+
+    fake = SimpleNamespace(
+        num_frame_per_block=3,
+        num_transformer_blocks=2,
+        generator=FakeGenerator(),
+        text_encoder=FakeTextEncoder(),
+        _runtime_layout=lambda height, width: {
+            "recent_slot_len": 6,
+            "tokens_per_frame": 2,
+        },
+    )
+    clean = torch.randn(1, 3, 16, 2, 2)
+    payloads = CausalInferencePipeline.encode_clean_latent_as_reference_slot(
+        fake, clean, ["static scene"], (0, 1)
+    )
+    assert tuple(payloads) == (0, 1)
+    assert torch.count_nonzero(payloads[0][0] != 1) == 0
+    assert torch.count_nonzero(payloads[1][1] != 12) == 0
+
+
+def test_reference_kv_bank_records_rope_layout_and_roundtrips(tmp_path):
+    writer = ReferenceKVBankWriter(
+        tmp_path,
+        selected_layers=(0, 1),
+        num_layers=2,
+        slot_len=3,
+        frames_per_block=3,
+        tokens_per_frame=1,
+        dtype=torch.float32,
+    )
+    payloads = {
+        layer: (
+            torch.full((1, 3, 1, 2), float(layer + 1)),
+            torch.full((1, 3, 1, 2), float(layer + 10)),
+        )
+        for layer in (0, 1)
+    }
+    writer.write_chunk(chunk_id=4, layer_payloads=payloads)
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert metadata["slot_kind"] == "reference"
+    assert metadata["rope_layout"] == "reference_slot_t0_t2"
+    assert metadata["chunks"]["4"]["capture_type"] == "clean_reference_reencode"
+    loaded = KVBank(tmp_path).materialize(
+        4,
+        selected_layers=(0, 1),
+        num_layers=2,
+        device="cpu",
+        dtype=torch.float32,
+        pin_memory=False,
+    )
+    torch.testing.assert_close(loaded[1][0], payloads[1][0])
+
+
+def test_direct_latent_control_has_exact_hard_and_soft_limits():
+    predicted = torch.zeros(1, 3, 2, 2, 2)
+    memory = torch.ones_like(predicted)
+    hard = LatentBlockIntervention(
+        target_block=7,
+        source_chunk=2,
+        clean_latent=memory,
+        strength=1.0,
+    )
+    soft = LatentBlockIntervention(
+        target_block=7,
+        source_chunk=2,
+        clean_latent=memory,
+        strength=0.25,
+    )
+    torch.testing.assert_close(hard.apply(predicted), memory, rtol=0, atol=0)
+    torch.testing.assert_close(
+        soft.apply(predicted), torch.full_like(predicted, 0.25), rtol=0, atol=0
+    )
+    assert hard.audit["mode"] == "direct_clean_x0_block_override"
+    assert hard.audit["output_delta_l1"] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="shape"):
+        hard.apply(torch.zeros(1, 2, 2, 2, 2))
+
+
+def test_oriented_disk_surfel_preview_is_visualization_only(tmp_path):
+    cell = SurfelCell(
+        voxel_key=(0, 0, 2),
+        xyz=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+        confidence=3.0,
+        normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+        radius=0.2,
+        rgb_preview=None,
+        first_seen_chunk=1,
+        last_seen_chunk=3,
+        observing_chunks=[1, 3],
+        chunk_weights={1: 1.0, 3: 2.0},
+        view_dirs={},
+        observation_weight=3.0,
+    )
+    index = VoxelSurfelIndex(0.1, [cell])
+    before = index.cells[0].xyz.copy()
+    output = tmp_path / "disk.png"
+    write_oriented_disk_preview(index, output, max_disks=10)
+    assert output.exists() and output.stat().st_size > 0
+    np.testing.assert_array_equal(index.cells[0].xyz, before)
+
+
+def test_slot_selection_does_not_call_both_required_for_a_near_tie():
+    groups = {
+        "recent": {
+            "source_specificity_error_margin": 0.320,
+            "correct_improvement_vs_baseline": 0.140,
+            "correct_intervention_l1": 0.160,
+            "correct_b1_b2_generated_region_l1": 0.020,
+        },
+        "reference": {
+            "source_specificity_error_margin": 0.010,
+            "correct_improvement_vs_baseline": 0.010,
+            "correct_intervention_l1": 0.066,
+            "correct_b1_b2_generated_region_l1": 0.151,
+        },
+        "both": {
+            "source_specificity_error_margin": 0.325,
+            "correct_improvement_vs_baseline": 0.137,
+            "correct_intervention_l1": 0.160,
+            "correct_b1_b2_generated_region_l1": 0.023,
+        },
+    }
+    ranking = [
+        (0.462, 0.160, "both"),
+        (0.460, 0.160, "recent"),
+        (0.020, 0.066, "reference"),
+    ]
+    assert _select_best_slot(groups, ranking) == "recent"

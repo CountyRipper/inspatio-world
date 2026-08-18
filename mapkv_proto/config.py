@@ -5,9 +5,14 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-VALID_MODES = {"off", "oracle", "wrong", "random", "pose", "geometry"}
+VALID_MODES = {"off", "oracle", "wrong", "random", "zero", "pose", "geometry"}
 VALID_GATES = {"global", "ref_blind", "surfel_ref_blind"}
-VALID_INJECTION_MODES = {"replace_recent_delta", "residual_memory_attention"}
+VALID_INJECTION_MODES = {
+    "replace_recent_delta",
+    "replace_ref_delta",
+    "replace_both_delta",
+    "residual_memory_attention",
+}
 
 
 def resolve_indices(indices: Sequence[int], size: int, *, name: str) -> tuple[int, ...]:
