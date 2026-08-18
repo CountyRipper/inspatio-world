@@ -39,6 +39,10 @@ from mapkv_proto.revisit_pair import build_block_mapping
 from mapkv_proto.visualization import save_gate_overlay
 from mapkv.latent_control import LatentBlockIntervention
 from mapkv.kv_bank import resolve_memory_layers
+from mapkv.warp_reencode import (
+    build_warp_reencode_plans,
+    save_warp_reencode_artifacts,
+)
 from pipeline import CausalInferencePipeline
 from utils.misc import set_seed
 from utils.render_warper import convert_mask_video
@@ -110,6 +114,10 @@ def parse_args() -> argparse.Namespace:
         choices=("global", "ref_blind", "surfel", "surfel_ref_blind"),
     )
     parser.add_argument("--retrieval_plan")
+    parser.add_argument("--warp_reencode_recent", action="store_true")
+    parser.add_argument("--warp_source_latents")
+    parser.add_argument("--warp_intrinsics_path")
+    parser.add_argument("--warp_feather_kernel", type=int, default=3)
     parser.add_argument("--compare_latents_to")
     parser.add_argument("--verify_memory_off_replay", action="store_true")
     parser.add_argument("--replay_tolerance", type=float, default=0.0)
@@ -502,6 +510,20 @@ def main() -> None:
         == len(args.latent_strengths)
     ):
         raise ValueError("Latent source/target/strength lists must have equal length")
+    if args.warp_reencode_recent:
+        if not args.warp_source_latents or not args.warp_intrinsics_path:
+            raise ValueError(
+                "--warp_reencode_recent requires --warp_source_latents and "
+                "--warp_intrinsics_path"
+            )
+        if not args.target_pose_path:
+            raise ValueError("Warp-reencode requires the exact --target_pose_path")
+        if args.retrieval_plan:
+            raise ValueError(
+                "Warp-reencode freezes the manual source and cannot use a retrieval plan"
+            )
+        if args.latent_memory_path:
+            raise ValueError("Warp-reencode and direct latent control are separate runs")
     if not torch.cuda.is_available():
         raise RuntimeError("The fixed MapKV prototype requires one CUDA device")
     device = torch.device(args.device)
@@ -635,14 +657,56 @@ def main() -> None:
             dtype=dtype,
             capture_chunk_ids=args.capture_chunks,
         )
-    memory_contexts, memory_selections = _build_memory_contexts(
-        config=mapkv_config,
-        retrieval_plan_path=args.retrieval_plan,
-        reference_bank_root=args.ref_bank_root,
-        num_layers=pipeline.num_transformer_blocks,
-        device=device,
-        dtype=dtype,
-    )
+    virtual_recent_contexts = {}
+    if args.warp_reencode_recent:
+        if not mapkv_config.enabled or mapkv_config.mode != "oracle":
+            raise ValueError(
+                "Warp-reencode requires enabled manual oracle mode with a fixed source"
+            )
+        if mapkv_config.source_chunk is None:
+            raise ValueError("Warp-reencode requires --source_chunk")
+        if mapkv_config.injection_mode != "replace_recent_delta":
+            raise ValueError("Warp-reencode supports replace_recent_delta only")
+        if mapkv_config.gate.mode != "global":
+            raise ValueError(
+                "Warp-reencode blends in latent space and uses a global KV delta gate"
+            )
+        selected_writer_layers = resolve_indices(
+            mapkv_config.selected_layers,
+            pipeline.num_transformer_blocks,
+            name="warp-reencode layer",
+        )
+        virtual_recent_contexts, memory_selections = build_warp_reencode_plans(
+            source_latents_path=args.warp_source_latents,
+            source_chunk=mapkv_config.source_chunk,
+            target_chunks=mapkv_config.target_chunks,
+            target_pose_path=args.target_pose_path,
+            intrinsics_path=args.warp_intrinsics_path,
+            latent_length=output_length,
+            rgb_length=int(batch["source_video"].shape[1]),
+            frames_per_block=frames_per_block,
+            latent_hw=(int(target_latent.shape[-2]), int(target_latent.shape[-1])),
+            image_hw=(
+                int(source_video_bcthw.shape[-2]),
+                int(source_video_bcthw.shape[-1]),
+            ),
+            selected_layers=selected_writer_layers,
+            selected_step_indices=mapkv_config.selected_step_indices,
+            alpha=mapkv_config.alpha,
+            feather_kernel=args.warp_feather_kernel,
+            device=device,
+            dtype=dtype,
+        )
+        memory_contexts = {}
+    else:
+        memory_contexts, memory_selections = _build_memory_contexts(
+            config=mapkv_config,
+            retrieval_plan_path=args.retrieval_plan,
+            reference_bank_root=args.ref_bank_root,
+            num_layers=pipeline.num_transformer_blocks,
+            device=device,
+            dtype=dtype,
+        )
     latent_block_interventions = {}
     if args.latent_memory_path:
         if mapkv_config.enabled:
@@ -697,18 +761,26 @@ def main() -> None:
             noise_provider=bundle,
             after_context_write=bank_writer,
             memory_contexts=memory_contexts or None,
+            virtual_recent_contexts=virtual_recent_contexts or None,
             latent_block_interventions=latent_block_interventions or None,
         )
     torch.cuda.synchronize(device)
     inference_seconds = time.perf_counter() - inference_started
     if not bool(torch.isfinite(pred_latents).all()):
         raise FloatingPointError("Generated latents contain NaN or Inf")
+    active_memory_contexts = dict(memory_contexts)
+    active_memory_contexts.update(pipeline.last_virtual_memory_contexts)
     activation_audit = _validate_activation_audit(
-        memory_contexts, pipeline.num_transformer_blocks, num_steps
+        active_memory_contexts, pipeline.num_transformer_blocks, num_steps
     )
     in_process_replay = None
     if args.verify_memory_off_replay:
-        if mapkv_config.enabled or memory_contexts or latent_block_interventions:
+        if (
+            mapkv_config.enabled
+            or memory_contexts
+            or virtual_recent_contexts
+            or latent_block_interventions
+        ):
             raise ValueError("--verify_memory_off_replay is valid for memory-off only")
         with torch.no_grad():
             replay_latents = pipeline.inference(
@@ -802,6 +874,14 @@ def main() -> None:
         pred_video = (pred_video * 0.5 + 0.5).clamp(0, 1)
     torch.cuda.synchronize(device)
     decode_seconds = time.perf_counter() - decode_started
+    warp_reencode_manifest = None
+    if virtual_recent_contexts:
+        warp_reencode_manifest = save_warp_reencode_artifacts(
+            plans=virtual_recent_contexts,
+            vae=pipeline.vae,
+            output_root=output_root,
+            device=device,
+        )
 
     video_uint8 = (
         pred_video[0].permute(0, 2, 3, 1).float().cpu() * 255.0
@@ -976,7 +1056,19 @@ def main() -> None:
             "activation_audit": activation_audit,
             "cache_audits": {
                 str(target): context.cache_audit
-                for target, context in memory_contexts.items()
+                for target, context in active_memory_contexts.items()
+            },
+            "warp_reencode": {
+                "enabled": bool(virtual_recent_contexts),
+                "source_latents": args.warp_source_latents,
+                "intrinsics_path": args.warp_intrinsics_path,
+                "feather_kernel": args.warp_feather_kernel,
+                "writer_isolated_from_runtime_cache": True,
+                "manifest": warp_reencode_manifest,
+                "audits": {
+                    str(target): audit
+                    for target, audit in pipeline.last_virtual_recent_audits.items()
+                },
             },
         },
         "latent_control": {

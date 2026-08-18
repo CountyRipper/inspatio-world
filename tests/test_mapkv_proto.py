@@ -21,6 +21,11 @@ from mapkv_proto.memory_context import (
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.retrieval import GeometryChunkRetriever
 from mapkv.slot_evaluation import _select_best_slot
+from mapkv.warp_reencode import (
+    WarpReencodePlan,
+    build_rotation_target_to_source_grid,
+    warp_latent,
+)
 from mapkv_proto.reference_kv_bank import ReferenceKVBankWriter
 from mapkv_proto.retrieval import RetrievalPlan
 from mapkv.surfel_index import (
@@ -164,6 +169,69 @@ def test_rotation_only_metric_warp_is_identity_for_equal_poses():
     np.testing.assert_allclose(homography, np.eye(3), atol=1e-8)
     np.testing.assert_allclose(warped, image, atol=1e-7)
     np.testing.assert_array_equal(valid, np.ones((6, 8), dtype=np.float32))
+
+
+def test_rotation_grid_matches_metric_homography_and_identity_sampling():
+    intrinsics = np.array(
+        [[10.0, 0.0, 4.0], [0.0, 10.0, 3.0], [0.0, 0.0, 1.0]]
+    )
+    source = np.eye(4)
+    target = np.eye(4)
+    angle = np.deg2rad(10.0)
+    target[:3, :3] = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ]
+    )
+    grid, valid, homography = build_rotation_target_to_source_grid(
+        source, target, intrinsics, intrinsics, (6, 8)
+    )
+    image = np.zeros((6, 8, 3), dtype=np.float32)
+    _, _, metric_homography = _rotation_warp(
+        image, source, target, intrinsics
+    )
+    np.testing.assert_allclose(homography, metric_homography, atol=1e-8)
+    assert valid.float().mean() < 1.0
+
+    identity_grid, identity_valid, identity_h = (
+        build_rotation_target_to_source_grid(
+            source, source, intrinsics, intrinsics, (6, 8)
+        )
+    )
+    latent = torch.arange(3 * 2 * 6 * 8, dtype=torch.float32).reshape(
+        1, 3, 2, 6, 8
+    )
+    warped = warp_latent(latent, identity_grid.repeat(3, 1, 1, 1))
+    torch.testing.assert_close(warped, latent, rtol=0, atol=1e-5)
+    torch.testing.assert_close(identity_valid, torch.ones_like(identity_valid))
+    np.testing.assert_allclose(identity_h, np.eye(3), atol=1e-8)
+
+
+def test_virtual_recent_uses_history_only_inside_camera_coverage():
+    intrinsics = np.array(
+        [[10.0, 0.0, 4.0], [0.0, 10.0, 3.0], [0.0, 0.0, 1.0]]
+    )
+    grid, _, _ = build_rotation_target_to_source_grid(
+        np.eye(4), np.eye(4), intrinsics, intrinsics, (6, 8)
+    )
+    coverage = torch.zeros(1, 3, 6, 8)
+    coverage[..., :4] = 1.0
+    plan = WarpReencodePlan(
+        target_block=5,
+        source_chunk=1,
+        historical_latent=torch.ones(1, 3, 2, 6, 8),
+        target_to_source_grid=grid.repeat(3, 1, 1, 1),
+        coverage=coverage,
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+    )
+    current = torch.zeros(1, 3, 2, 6, 8)
+    virtual = plan.compose(current)
+    torch.testing.assert_close(virtual[..., :4], torch.ones_like(virtual[..., :4]))
+    torch.testing.assert_close(virtual[..., 4:], torch.zeros_like(virtual[..., 4:]))
+    assert plan.audit["coverage_fraction"] == pytest.approx(0.5)
 
 
 def test_noise_bundle_roundtrip_and_provider_does_not_use_global_rng(tmp_path):
@@ -780,6 +848,53 @@ def test_reference_slot_reencode_uses_t0_t2_writer_layout():
     assert tuple(payloads) == (0, 1)
     assert torch.count_nonzero(payloads[0][0] != 1) == 0
     assert torch.count_nonzero(payloads[1][1] != 12) == 0
+
+
+def test_virtual_recent_reencode_uses_native_t3_t5_writer_layout():
+    class FakeGenerator:
+        def __init__(self):
+            self.model = SimpleNamespace(num_heads=2, dim=4)
+            self.call = None
+
+        def __call__(self, **kwargs):
+            self.call = kwargs
+            context = kwargs["noisy_image_or_video"]
+            assert context.shape == (1, 6, 36, 2, 2)
+            assert kwargs["kv_size"] == (0, -1)
+            assert kwargs["freqs_offset"] == 0
+            assert kwargs["timestep"].shape == (1, 3)
+            for layer, cache in enumerate(kwargs["kv_cache"]):
+                cache["k"][:, :6].fill_(layer + 1)
+                cache["v"][:, :6].fill_(layer + 11)
+                cache["k"][:, 6:12].fill_(layer + 101)
+                cache["v"][:, 6:12].fill_(layer + 111)
+            return torch.zeros(1)
+
+    fake = SimpleNamespace(
+        num_frame_per_block=3,
+        num_transformer_blocks=2,
+        generator=FakeGenerator(),
+        _runtime_layout=lambda height, width: {
+            "recent_slot_len": 6,
+            "kv_size_used_for_nonfirst_block": 12,
+            "tokens_per_frame": 2,
+        },
+    )
+    reference = torch.zeros(1, 3, 36, 2, 2)
+    recent = torch.randn(1, 3, 16, 2, 2)
+    payloads, audit = CausalInferencePipeline.encode_clean_latent_as_recent_slot(
+        fake,
+        reference_context=reference,
+        clean_recent_latent=recent,
+        conditional_dict={"prompt_embeds": torch.zeros(1, 1, 4)},
+        selected_layers=(0, 1),
+        render_block=torch.zeros(1, 3, 20, 2, 2),
+    )
+    assert tuple(payloads) == (0, 1)
+    assert torch.count_nonzero(payloads[0][0] != 101) == 0
+    assert torch.count_nonzero(payloads[1][1] != 112) == 0
+    assert audit["rope_layout"] == "recent_slot_t3_t5"
+    assert audit["runtime_cache_mutated"] is False
 
 
 def test_reference_kv_bank_records_rope_layout_and_roundtrips(tmp_path):

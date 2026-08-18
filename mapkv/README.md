@@ -73,3 +73,25 @@ declared B1-locality ablation are stored separately. The latter restricts
 candidates to the manifest B1 plateau only to isolate *where* memory acts; it
 does not change CUT3R, surfel fusion, visibility, or score parameters and is
 never reported as unconstrained retrieval.
+
+## Camera-aligned Warp-and-Reencode Recent
+
+The changed-view diagnostic freezes the historical source to B1 chunk 8 and
+replaces direct post-RoPE replay with:
+
+    B1 clean latent + exact B1/B2 c2w
+    -> target-to-source rotation warp on the VAE latent grid
+    -> blend with runtime Recent outside valid coverage
+    -> isolated native [Ref, Virtual Recent] timestep-zero writer
+    -> target-layout recent K/V
+    -> replace_recent_delta
+
+Run or reuse the deterministic experiment and build its synchronized report:
+
+    bash scripts/run_mapkv_warp_reencode.sh --stage full --seed 0 --gpu 0
+
+The default output is
+results/mapkv_fast/yaw30to20_scene01_seed0_warp_reencode. The runner reuses
+the established same-GPU Baseline and fixed-chunk-8 HardKV controls, asserts
+their configuration, and verifies that the Warp-Reencode prefix through chunk
+20 is exactly equal to Baseline.

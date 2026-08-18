@@ -189,6 +189,8 @@ class CausalInferencePipeline(torch.nn.Module):
         self._layout_printed = False
         self.last_query_gates = {}
         self.last_block_latencies = {}
+        self.last_virtual_memory_contexts = {}
+        self.last_virtual_recent_audits = {}
 
     def inference(
         self,
@@ -201,6 +203,7 @@ class CausalInferencePipeline(torch.nn.Module):
         noise_provider=None,
         after_context_write=None,
         memory_contexts: Optional[Mapping[int, object]] = None,
+        virtual_recent_contexts: Optional[Mapping[int, object]] = None,
         latent_block_interventions: Optional[Mapping[int, object]] = None,
     ) -> torch.Tensor:
         """
@@ -221,7 +224,12 @@ class CausalInferencePipeline(torch.nn.Module):
         num_blocks = num_frames // self.num_frame_per_block
         layout = self._runtime_layout(height, width)
         self.frame_seq_length = layout["tokens_per_frame"]
-        if memory_contexts or latent_block_interventions or after_context_write is not None:
+        if (
+            memory_contexts
+            or virtual_recent_contexts
+            or latent_block_interventions
+            or after_context_write is not None
+        ):
             assert self.num_frame_per_block == 3, (
                 "The MapKV prototype currently supports num_frame_per_block=3 only"
             )
@@ -256,6 +264,8 @@ class CausalInferencePipeline(torch.nn.Module):
         last_pred = None
         self.last_query_gates = {}
         self.last_block_latencies = {}
+        self.last_virtual_memory_contexts = {}
+        self.last_virtual_recent_audits = {}
         for block_id, num_block_frame in enumerate(all_num_frames):
             block_start_time = time.time()
             noisy_input = noise[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
@@ -282,6 +292,38 @@ class CausalInferencePipeline(torch.nn.Module):
                 assert kv_size == layout["kv_size_used_for_nonfirst_block"]
 
             block_memory = (memory_contexts or {}).get(block_id)
+            virtual_plan = (virtual_recent_contexts or {}).get(block_id)
+            if block_memory is not None and virtual_plan is not None:
+                raise ValueError(
+                    f"Block {block_id} cannot use stored-KV and warp-reencode memory together"
+                )
+            if virtual_plan is not None:
+                if block_id == 0 or last_pred is None:
+                    raise ValueError("Virtual recent memory requires a previous generated block")
+                if int(virtual_plan.target_block) != block_id:
+                    raise ValueError(
+                        f"Virtual recent target {virtual_plan.target_block} "
+                        f"does not match block {block_id}"
+                    )
+                if int(virtual_plan.source_chunk) >= block_id - 1:
+                    raise ValueError(
+                        "Virtual recent source must be older than the immediate previous chunk"
+                    )
+                virtual_recent = virtual_plan.compose(last_pred)
+                layer_payloads, writer_audit = (
+                    self.encode_clean_latent_as_recent_slot(
+                        reference_context=ref_block,
+                        clean_recent_latent=virtual_recent,
+                        conditional_dict=conditional_dict,
+                        selected_layers=virtual_plan.selected_layers,
+                        render_block=render_block,
+                    )
+                )
+                block_memory = virtual_plan.make_memory_context(
+                    layer_payloads, writer_audit
+                )
+                self.last_virtual_memory_contexts[block_id] = block_memory
+                self.last_virtual_recent_audits[block_id] = virtual_plan.audit
             if block_memory is not None:
                 if block_id == 0:
                     raise ValueError("Memory cannot be activated on the first block")
@@ -340,6 +382,119 @@ class CausalInferencePipeline(torch.nn.Module):
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
         return video
+
+    @torch.no_grad()
+    def encode_clean_latent_as_recent_slot(
+        self,
+        *,
+        reference_context: torch.Tensor,
+        clean_recent_latent: torch.Tensor,
+        conditional_dict,
+        selected_layers,
+        render_block: torch.Tensor,
+    ) -> tuple[dict[int, tuple[torch.Tensor, torch.Tensor]], dict]:
+        """Run the native [Ref, Recent] t=0 writer in an isolated cache.
+
+        reference_context is the already padded 36-channel reference block.
+        The supplied clean latent is padded exactly like runtime last_pred and
+        occupies frames t3-t5, so extracted K has native recent-slot RoPE.
+        """
+        if reference_context.ndim != 5 or clean_recent_latent.ndim != 5:
+            raise ValueError("Reference and virtual recent context must be BFCHW")
+        batch, frames, channels, height, width = clean_recent_latent.shape
+        if frames != self.num_frame_per_block:
+            raise ValueError(
+                f"Recent re-encode requires {self.num_frame_per_block} frames, got {frames}"
+            )
+        if channels != 16:
+            raise ValueError(f"Virtual recent latent must have 16 channels, got {channels}")
+        if tuple(reference_context.shape) != (batch, frames, 36, height, width):
+            raise ValueError(
+                "Padded reference context shape mismatch: "
+                f"{tuple(reference_context.shape)}"
+            )
+        selected = tuple(dict.fromkeys(int(layer) for layer in selected_layers))
+        if not selected or min(selected) < 0 or max(selected) >= self.num_transformer_blocks:
+            raise ValueError(
+                f"Recent re-encode layers {selected} are invalid for "
+                f"{self.num_transformer_blocks} transformer blocks"
+            )
+        layout = self._runtime_layout(height, width)
+        slot_len = layout["recent_slot_len"]
+        cache_len = layout["kv_size_used_for_nonfirst_block"]
+        num_heads = int(_model_config_value(self.generator.model, "num_heads"))
+        dim = int(_model_config_value(self.generator.model, "dim"))
+        cache = [
+            {
+                "k": torch.zeros(
+                    [batch, cache_len, num_heads, dim // num_heads],
+                    device=clean_recent_latent.device,
+                    dtype=clean_recent_latent.dtype,
+                ),
+                "v": torch.zeros(
+                    [batch, cache_len, num_heads, dim // num_heads],
+                    device=clean_recent_latent.device,
+                    dtype=clean_recent_latent.dtype,
+                ),
+            }
+            for _ in range(self.num_transformer_blocks)
+        ]
+        zeros = torch.zeros_like(clean_recent_latent)
+        padded_recent = torch.cat(
+            [clean_recent_latent, zeros[:, :, :4], zeros], dim=2
+        )
+        context = torch.cat([reference_context, padded_recent], dim=1)
+        timestep_zero = torch.zeros(
+            [batch, frames],
+            device=clean_recent_latent.device,
+            dtype=torch.int64,
+        )
+        self.generator(
+            noisy_image_or_video=context,
+            conditional_dict=conditional_dict,
+            timestep=timestep_zero,
+            kv_cache=cache,
+            render_latent_input=render_block,
+            kv_size=(0, -1),
+            freqs_offset=0,
+        )
+        result = {}
+        layer_stats = {}
+        for layer in selected:
+            k = cache[layer]["k"][:, slot_len:2 * slot_len].detach().clone()
+            v = cache[layer]["v"][:, slot_len:2 * slot_len].detach().clone()
+            if k.shape != v.shape or k.shape[1] != slot_len:
+                raise RuntimeError(
+                    f"Recent-slot writer produced invalid layer {layer}: "
+                    f"K={tuple(k.shape)} V={tuple(v.shape)}"
+                )
+            result[layer] = (k, v)
+            layer_stats[str(layer)] = {
+                "k_abs_mean": float(k.float().abs().mean().item()),
+                "v_abs_mean": float(v.float().abs().mean().item()),
+                "shape": list(k.shape),
+            }
+        element_size = clean_recent_latent.element_size()
+        writer_audit = {
+            "mode": "native_clean_timestep_zero_context_writer",
+            "context_shape": list(context.shape),
+            "reference_slot_range": [0, slot_len],
+            "recent_slot_range": [slot_len, 2 * slot_len],
+            "rope_layout": "recent_slot_t3_t5",
+            "runtime_cache_mutated": False,
+            "temporary_cache_bytes": int(
+                self.num_transformer_blocks
+                * 2
+                * batch
+                * cache_len
+                * num_heads
+                * (dim // num_heads)
+                * element_size
+            ),
+            "selected_layers": list(selected),
+            "layer_stats": layer_stats,
+        }
+        return result, writer_audit
 
     @torch.no_grad()
     def encode_clean_latent_as_reference_slot(
