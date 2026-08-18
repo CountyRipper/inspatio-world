@@ -209,6 +209,7 @@ class WarpReencodePlan:
     source_target_translation: tuple[float, ...] = ()
     recent_target_to_source_grid: torch.Tensor | None = None
     recent_coverage: torch.Tensor | None = None
+    query_gate_mode: str = "global"
     mode: str = "block_on_warp_reencode"
     geometry_audit: dict = field(default_factory=dict)
     audit: dict = field(default_factory=dict)
@@ -314,6 +315,10 @@ class WarpReencodePlan:
         writer_audit: dict,
     ) -> MemoryContext:
         self.audit["writer"] = writer_audit
+        if self.query_gate_mode not in {"global", "surfel_exact"}:
+            raise ValueError(
+                f"Unsupported Virtual Recent query gate: {self.query_gate_mode}"
+            )
         context = make_memory_context(
             target_block=self.target_block,
             source_chunk=self.source_chunk,
@@ -322,11 +327,24 @@ class WarpReencodePlan:
             selected_step_indices=self.selected_step_indices,
             alpha=self.alpha,
             injection_mode="replace_recent_delta",
-            gate_mode="global",
+            gate_mode=self.query_gate_mode,
             smooth_kernel=1,
+            coverage=(
+                self.coverage
+                if self.query_gate_mode == "surfel_exact"
+                else None
+            ),
         )
         if context is None:
-            raise RuntimeError("Global virtual recent context unexpectedly disabled")
+            raise RuntimeError("Virtual recent context unexpectedly disabled")
+        self.audit.update(
+            {
+                "attention_query_gate_mode": self.query_gate_mode,
+                "query_gate_uses_latent_composition_mask": (
+                    self.query_gate_mode == "surfel_exact"
+                ),
+            }
+        )
         self.memory_context = context
         return context
 
@@ -537,17 +555,24 @@ def build_continuous_virtual_recent_plans(
     device: torch.device,
     dtype: torch.dtype,
     min_history_gap_chunks: int = 2,
+    warp_short_term_recent: bool = True,
+    query_gate_mode: str = "global",
 ) -> tuple[dict[int, WarpReencodePlan], list[dict]]:
     """Build visibility-driven Virtual Recent plans for every causal block.
 
-    Historical B1 and the runtime short-term Recent are both reprojected into
-    each target block's camera layout. Only projected source-chunk surfel
-    support selects the historical branch; no target-block schedule or alpha
-    ramp is used.
+    Historical B1 is reprojected into each target block's camera layout.
+    ``warp_short_term_recent=True`` preserves the original failed CAVR
+    ablation; the repaired path keeps raw native last_pred as the fallback.
+    Projected source-chunk surfel support controls activation, and optionally
+    gates the counterfactual attention delta through ``surfel_exact``.
     """
     if min_history_gap_chunks < 2:
         raise ValueError(
             "Long-term memory must exclude the immediate recent chunk"
+        )
+    if query_gate_mode not in {"global", "surfel_exact"}:
+        raise ValueError(
+            f"Unsupported continuous query gate mode: {query_gate_mode}"
         )
     source_path = Path(source_latents_path).resolve()
     payload = torch.load(source_path, map_location="cpu", weights_only=True)
@@ -656,15 +681,18 @@ def build_continuous_virtual_recent_plans(
                     latent_hw,
                 )
             )
-            recent_grid, recent_mask, _ = (
-                build_rotation_target_to_source_grid(
-                    recent_pose,
-                    target_pose,
-                    latent_intrinsics,
-                    latent_intrinsics,
-                    latent_hw,
+            if warp_short_term_recent:
+                recent_grid, recent_mask, _ = (
+                    build_rotation_target_to_source_grid(
+                        recent_pose,
+                        target_pose,
+                        latent_intrinsics,
+                        latent_intrinsics,
+                        latent_hw,
+                    )
                 )
-            )
+                recent_grids.append(recent_grid)
+                recent_valid.append(recent_mask)
             surfel_mask, geometry = _surfel_coverage_for_pose(
                 surfel_index=surfel_index,
                 source_chunk=int(source_chunk),
@@ -675,8 +703,6 @@ def build_continuous_virtual_recent_plans(
                 target_hw=latent_hw,
             )
             historical_grids.append(history_grid)
-            recent_grids.append(recent_grid)
-            recent_valid.append(recent_mask)
             surfel_masks.append(surfel_mask * history_mask)
             homographies.append(homography)
             rotations.append(
@@ -700,10 +726,16 @@ def build_continuous_virtual_recent_plans(
         coverage = feather_coverage(
             hard_memory_coverage, feather_kernel
         ).to(device=device)
+        if warp_short_term_recent:
+            mode = "continuous_geometry_reprojected_virtual_recent"
+        elif query_gate_mode == "global":
+            mode = "continuous_raw_recent_warp_reencode"
+        else:
+            mode = "masked_continuous_warp_reencode"
         selection = {
             "target_chunk": target_chunk,
             "source_chunk": int(source_chunk),
-            "mode": "continuous_geometry_reprojected_virtual_recent",
+            "mode": mode,
             "payload_kind": "target_aligned_virtual_recent_native_kv",
             "coverage_fraction": float(coverage.mean().item()),
             "hard_coverage_fraction": float(
@@ -715,15 +747,26 @@ def build_continuous_virtual_recent_plans(
             "source_target_rotation_degrees": rotations,
             "source_latents_path": str(source_path),
             "activation_policy": "visible_source_surfel_support",
+            "short_term_recent": (
+                "camera_warped" if warp_short_term_recent else "raw_last_pred"
+            ),
+            "attention_query_gate": query_gate_mode,
+            "same_mask_controls_latent_and_attention": (
+                query_gate_mode == "surfel_exact"
+            ),
             "geometry_frames": per_frame_geometry,
         }
         if not bool(hard_memory_coverage.any()):
             selection["status"] = "memory_off_no_visible_support"
             selections.append(selection)
             continue
-        recent_coverage = torch.stack(recent_valid).unsqueeze(0).to(
-            device=device
-        )
+        recent_grid_tensor = None
+        recent_coverage = None
+        if warp_short_term_recent:
+            recent_grid_tensor = torch.stack(recent_grids).to(device=device)
+            recent_coverage = torch.stack(recent_valid).unsqueeze(0).to(
+                device=device
+            )
         plan = WarpReencodePlan(
             target_block=target_chunk,
             source_chunk=int(source_chunk),
@@ -740,11 +783,10 @@ def build_continuous_virtual_recent_plans(
             source_to_target_homographies=tuple(homographies),
             source_target_rotation_degrees=tuple(rotations),
             source_target_translation=tuple(translations),
-            recent_target_to_source_grid=torch.stack(recent_grids).to(
-                device=device
-            ),
+            recent_target_to_source_grid=recent_grid_tensor,
             recent_coverage=recent_coverage,
-            mode="continuous_geometry_reprojected_virtual_recent",
+            query_gate_mode=query_gate_mode,
+            mode=mode,
             geometry_audit={
                 "coordinate_frame": sequence.get("coordinate_frame"),
                 "pose_source": "known_control_c2w_to_cut3r_c2w",

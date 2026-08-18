@@ -96,19 +96,31 @@ the established same-GPU Baseline and fixed-chunk-8 HardKV controls, asserts
 their configuration, and verifies that the Warp-Reencode prefix through chunk
 20 is exactly equal to Baseline.
 
-## Continuous Geometry-Reprojected Virtual Recent
+## Masked Continuous Warp-Reencode Recent
 
-Run the visibility-driven architecture with:
+Run the repaired visibility-driven architecture with:
 
-    bash scripts/run_mapkv_continuous_cavr.sh --stage full --seed 0 --gpu 0
+    bash scripts/run_mapkv_masked_continuous_wre.sh --stage full --seed 0 --gpu 0
 
-It reuses the same fixed B1 chunk and frozen known-pose surfel index, but
-queries source-chunk visibility for every causally eligible block. Both B1 and
-runtime `last_pred` are warped into the current camera layout before the
-native timestep-zero recent writer. Blocks with empty historical support keep
-the original InSpatio path.
+It reuses the same fixed B1 chunk and frozen known-pose surfel index, and
+queries source-chunk visibility for every causally eligible block. Only B1 is
+camera-warped. Runtime `last_pred` remains in the native short-term Recent
+distribution:
 
-The current controlled result retains B1 fidelity but does not pass the
-transition/locality gate: whole-slot re-encoding causes block-boundary
-ghosting while surfel coverage grows. Canonical-K re-addressing is therefore
-intentionally not implemented yet.
+    VirtualRecent = M_history * warp(B1 -> camera_t)
+                  + (1 - M_history) * raw_last_pred
+
+The native timestep-zero writer produces counterfactual recent K/V. The
+masked method then applies exactly the same feathered geometry mask at query
+resolution:
+
+    A_out = A_base + tokenize(M_history) * (A_virtual - A_base)
+
+The runner compares Baseline, the successful fixed-B2 Block-on WRE,
+Continuous RawRecent with a global delta, and Masked Continuous WRE. Its
+default output is
+`results/mapkv_fast/yaw30to20_scene01_seed0_masked_continuous_wre`.
+
+The previous warped-short-term/global-delta failure remains reproducible by
+passing `--continuous_recent_fallback warped --continuous_query_gate global`
+to `inference_mapkv_proto.py`; its existing result directory is not replaced.

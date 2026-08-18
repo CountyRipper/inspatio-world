@@ -136,6 +136,19 @@ class MemoryContext:
             gate = reference_blind_gate(
                 mask_block, token_hw, smooth_kernel=self.smooth_kernel
             )
+        elif self.gate_mode == "surfel_exact":
+            if self.coverage is None:
+                raise ValueError("surfel_exact gate requires a coverage mask")
+            # Warp-Reencode already feathers M_history in latent space.  This
+            # path only tokenizes that same mask; unlike the older surfel gate,
+            # it deliberately adds no second dilation or smoothing operation.
+            gate = normalize_coverage(
+                self.coverage,
+                batch=batch,
+                frames=frames,
+                token_hw=token_hw,
+                device=mask_block.device,
+            )
         elif self.gate_mode in {"surfel", "surfel_ref_blind"}:
             if self.coverage is None:
                 raise ValueError(f"{self.gate_mode} gate requires a coverage mask")
@@ -215,7 +228,7 @@ def make_memory_context(
     coverage: torch.Tensor | None = None,
 ) -> MemoryContext | None:
     if (
-        gate_mode in {"surfel", "surfel_ref_blind"}
+        gate_mode in {"surfel", "surfel_ref_blind", "surfel_exact"}
         and coverage is not None
         and not bool(coverage.any())
     ):

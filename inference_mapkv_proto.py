@@ -117,6 +117,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval_plan")
     parser.add_argument("--warp_reencode_recent", action="store_true")
     parser.add_argument("--continuous_virtual_recent", action="store_true")
+    parser.add_argument(
+        "--continuous_recent_fallback",
+        choices=("raw", "warped"),
+        default="raw",
+        help="Use native last_pred (repaired) or camera-warped last_pred (legacy CAVR).",
+    )
+    parser.add_argument(
+        "--continuous_query_gate",
+        choices=("global", "surfel"),
+        default="surfel",
+        help="Apply Virtual Recent delta globally or only at M_history query tokens.",
+    )
     parser.add_argument("--warp_source_latents")
     parser.add_argument("--warp_intrinsics_path")
     parser.add_argument("--warp_surfel_index")
@@ -726,6 +738,14 @@ def main() -> None:
                     surfel_index_path=args.warp_surfel_index,
                     surfel_sequence_path=args.warp_surfel_sequence,
                     min_history_gap_chunks=args.warp_min_history_gap,
+                    warp_short_term_recent=(
+                        args.continuous_recent_fallback == "warped"
+                    ),
+                    query_gate_mode=(
+                        "surfel_exact"
+                        if args.continuous_query_gate == "surfel"
+                        else "global"
+                    ),
                 )
             )
         else:
@@ -1113,6 +1133,16 @@ def main() -> None:
                 "surfel_sequence": args.warp_surfel_sequence,
                 "min_history_gap_chunks": args.warp_min_history_gap,
                 "feather_kernel": args.warp_feather_kernel,
+                "short_term_recent": (
+                    args.continuous_recent_fallback
+                    if args.continuous_virtual_recent
+                    else "raw"
+                ),
+                "attention_query_gate": (
+                    args.continuous_query_gate
+                    if args.continuous_virtual_recent
+                    else "global"
+                ),
                 "writer_isolated_from_runtime_cache": True,
                 "manifest": warp_reencode_manifest,
                 "audits": {

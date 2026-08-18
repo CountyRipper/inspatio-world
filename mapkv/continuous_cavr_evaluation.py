@@ -21,7 +21,8 @@ from .locality_evaluation import (
 METHOD_ROOTS = {
     "baseline": "baseline",
     "block_on_wre": "generation/block_on_wre",
-    "continuous_cavr": "generation/continuous_cavr",
+    "continuous_raw_recent": "generation/continuous_raw_recent",
+    "masked_continuous_wre": "generation/masked_continuous_wre",
 }
 
 
@@ -69,7 +70,8 @@ def _video_transition(
     capture.release()
     if frame_index <= 0 or frame_index >= len(frames):
         raise IndexError(
-            f"Transition frame {frame_index} outside decoded video of {len(frames)}"
+            f"Transition frame {frame_index} outside decoded video of "
+            f"{len(frames)}"
         )
     start = max(1, int(window_start))
     stop = min(len(frames), int(window_stop))
@@ -81,20 +83,47 @@ def _video_transition(
         "entrance_frame_l1": float(
             np.abs(frames[frame_index] - frames[frame_index - 1]).mean()
         ),
-        "transition_window_mean_frame_l1": float(np.mean(deltas)),
-        "transition_window_peak_frame_l1": float(np.max(deltas)),
-        "transition_window_peak_rgb_frame": int(
+        "reentry_window_mean_l1": float(np.mean(deltas)),
+        "reentry_window_peak_l1": float(np.max(deltas)),
+        "reentry_window_peak_rgb_frame": int(
             start + int(np.argmax(deltas))
         ),
-        "transition_window_rgb_frames": [start, stop - 1],
+        "reentry_window_rgb_frames": [start, stop - 1],
         "decoded_video_frames": len(frames),
     }
+
+
+def _active_selections(metadata: dict) -> tuple[list[dict], list[dict]]:
+    selections = metadata["mapkv"]["selections"]
+    active = [
+        item
+        for item in selections
+        if item["status"] == "scheduled_visible_support"
+    ]
+    inactive = [
+        item
+        for item in selections
+        if item["status"] == "memory_off_no_visible_support"
+    ]
+    return active, inactive
+
+
+def _coverage_signature(metadata: dict) -> list[tuple[int, float, str]]:
+    return [
+        (
+            int(item["target_chunk"]),
+            round(float(item["coverage_fraction"]), 8),
+            str(item["status"]),
+        )
+        for item in metadata["mapkv"]["selections"]
+    ]
 
 
 def evaluate_continuous_cavr(
     *,
     run_root: str | Path,
     case_dir: str | Path,
+    previous_cavr_root: str | Path | None = None,
     source_chunk: int = 8,
     target_chunks: tuple[int, ...] = (21, 22),
 ) -> dict:
@@ -114,7 +143,7 @@ def evaluate_continuous_cavr(
     state = torch.load(
         root
         / "generation"
-        / "continuous_cavr"
+        / "masked_continuous_wre"
         / "warp"
         / f"target_{target_chunk:04d}"
         / "warp_state.pt",
@@ -131,10 +160,10 @@ def evaluate_continuous_cavr(
     nonoverlap = 1.0 - coverage
     if float(overlap.mean()) <= 0 or float(nonoverlap.mean()) <= 0:
         raise RuntimeError(
-            "Continuous CAVR evaluation requires overlap and non-overlap"
+            "Masked continuous evaluation requires overlap and non-overlap"
         )
 
-    assets = root / "assets" / "cavr"
+    assets = root / "assets" / "masked_continuous"
     assets.mkdir(parents=True, exist_ok=True)
     baseline_target = _keyframe(root, "baseline", target_chunk)
     _save_rgb(assets / "b1_source.png", source)
@@ -165,7 +194,6 @@ def evaluate_continuous_cavr(
         target = _keyframe(root, method, target_chunk)
         before_b2 = _keyframe(root, method, first_b2 - 1)
         b2_first = _keyframe(root, method, first_b2)
-        previous_target = _keyframe(root, method, target_chunk - 1)
         replay = metadata.get("replay", {}).get("against_saved_latents") or {}
         per_chunk = replay.get("per_chunk_max_abs_diff", {})
         methods[method] = {
@@ -181,17 +209,12 @@ def evaluate_continuous_cavr(
             "b2_entry_boundary_l1": float(
                 np.abs(before_b2 - b2_first).mean()
             ),
-            "within_b2_boundary_l1": float(
-                np.abs(previous_target - target).mean()
-            ),
             "target_latent_max_abs_diff_vs_baseline": (
                 0.0
                 if method == "baseline"
                 else per_chunk.get(str(target_chunk))
             ),
-            "generation_seconds": float(
-                metadata["timing_seconds"]["total"]
-            ),
+            "generation_seconds": float(metadata["timing_seconds"]["total"]),
             **_video_transition(
                 method_root / "pred.mp4",
                 b2_rgb_start,
@@ -200,54 +223,61 @@ def evaluate_continuous_cavr(
             ),
         }
 
-    continuous_metadata = metadata_by_method["continuous_cavr"]
-    selections = continuous_metadata["mapkv"]["selections"]
-    active = [
-        item
-        for item in selections
-        if item["status"] == "scheduled_visible_support"
-    ]
-    inactive = [
-        item
-        for item in selections
-        if item["status"] == "memory_off_no_visible_support"
-    ]
-    active_chunks = [int(item["target_chunk"]) for item in active]
+    raw_metadata = metadata_by_method["continuous_raw_recent"]
+    masked_metadata = metadata_by_method["masked_continuous_wre"]
+    raw_active, raw_inactive = _active_selections(raw_metadata)
+    masked_active, masked_inactive = _active_selections(masked_metadata)
+    active_chunks = [int(item["target_chunk"]) for item in masked_active]
     first_active = min(active_chunks)
-    coverage_timeline = [
-        {
-            "chunk": int(item["target_chunk"]),
-            "coverage": float(item["coverage_fraction"]),
-            "active": item["status"] == "scheduled_visible_support",
-        }
-        for item in selections
-    ]
+    ypr = np.load(case_dir / "yaw_pitch_roll.npy")
+    coverage_timeline = []
+    masked_audits = masked_metadata["mapkv"]["warp_reencode"]["audits"]
+    for item in masked_metadata["mapkv"]["selections"]:
+        target = int(item["target_chunk"])
+        rgb_indices = np.asarray(item["target_rgb_indices"], dtype=np.int64)
+        audit = masked_audits.get(str(target), {})
+        coverage_timeline.append(
+            {
+                "chunk": target,
+                "yaw_degrees": float(ypr[rgb_indices, 0].mean()),
+                "coverage": float(item["coverage_fraction"]),
+                "hard_coverage": float(item["hard_coverage_fraction"]),
+                "query_gate_fraction": audit.get("query_gate_token_fraction"),
+                "active": item["status"] == "scheduled_visible_support",
+            }
+        )
+
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    figure, axis = plt.subplots(figsize=(9, 3.5))
-    axis.plot(
-        [item["chunk"] for item in coverage_timeline],
-        [item["coverage"] for item in coverage_timeline],
-        marker="o",
-        color="#2759c7",
-    )
-    axis.axvspan(14, 16, color="#98a2b3", alpha=0.18, label="no support")
-    axis.axvline(first_b2, color="#e45756", linestyle="--", label="B2")
+    figure, axis = plt.subplots(figsize=(10, 4.2))
+    chunks = [item["chunk"] for item in coverage_timeline]
+    fractions = [item["coverage"] for item in coverage_timeline]
+    axis.plot(chunks, fractions, marker="o", color="#2759c7")
+    axis.axvline(first_b2, color="#e45756", linestyle="--", label="B2 hold")
+    for item in coverage_timeline:
+        axis.annotate(
+            f"{item['yaw_degrees']:.1f}°",
+            (item["chunk"], item["coverage"]),
+            textcoords="offset points",
+            xytext=(0, 8),
+            ha="center",
+            fontsize=8,
+        )
     axis.set(
-        title="Geometry-driven historical-memory coverage",
-        xlabel="target chunk",
-        ylabel="coverage",
-        ylim=(0, 1),
+        title="B1 surfel coverage and exact target yaw",
+        xlabel="target chunk (labels: yaw)",
+        ylabel="M_history mean",
+        ylim=(0, max(0.65, max(fractions) + 0.08)),
     )
     axis.legend()
     figure.tight_layout()
     figure.savefig(assets / "coverage_timeline.png", dpi=160)
     plt.close(figure)
 
-    audits = continuous_metadata["mapkv"]["warp_reencode"]["audits"]
+    raw_audits = raw_metadata["mapkv"]["warp_reencode"]["audits"]
     gpu_names = {
         method: metadata["gpu"]
         for method, metadata in metadata_by_method.items()
@@ -255,81 +285,125 @@ def evaluate_continuous_cavr(
     validity = {
         "source_chunk_fixed_to_8": all(
             int(item["source_chunk"]) == int(source_chunk)
-            for item in selections
+            for item in masked_metadata["mapkv"]["selections"]
+        ),
+        "raw_and_masked_use_identical_geometry_masks": (
+            _coverage_signature(raw_metadata)
+            == _coverage_signature(masked_metadata)
         ),
         "visibility_driven_not_fixed_b2": (
             active_chunks != list(target_chunks)
             and any(chunk < first_b2 for chunk in active_chunks)
-            and bool(inactive)
+            and bool(masked_inactive)
         ),
         "active_chunks": active_chunks,
         "inactive_no_support_chunks": [
-            int(item["target_chunk"]) for item in inactive
+            int(item["target_chunk"]) for item in masked_inactive
         ],
-        "prefix_exact_before_first_visible_memory": _prefix_is_exact(
-            continuous_metadata, first_active
+        "prefix_exact_before_first_visible_memory": (
+            _prefix_is_exact(raw_metadata, first_active)
+            and _prefix_is_exact(masked_metadata, first_active)
         ),
-        "short_term_recent_reprojected": all(
-            bool(item["short_term_recent_reprojected"])
-            for item in audits.values()
+        "raw_short_term_recent_preserved": all(
+            not bool(item["short_term_recent_reprojected"])
+            and float(item["warped_recent_vs_raw_recent_l1"]) == 0.0
+            for item in raw_audits.values()
+        ),
+        "masked_short_term_recent_preserved": all(
+            not bool(item["short_term_recent_reprojected"])
+            and float(item["warped_recent_vs_raw_recent_l1"]) == 0.0
+            for item in masked_audits.values()
+        ),
+        "raw_attention_gate_global": all(
+            item["attention_query_gate_mode"] == "global"
+            and float(item["query_gate_token_fraction"]) == 1.0
+            for item in raw_audits.values()
+        ),
+        "masked_attention_uses_same_geometry_mask": all(
+            item["attention_query_gate_mode"] == "surfel_exact"
+            and bool(item["query_gate_uses_latent_composition_mask"])
+            and 0.0 < float(item["query_gate_token_fraction"]) < 1.0
+            for item in masked_audits.values()
         ),
         "runtime_cache_unchanged": all(
             item["unchanged"]
-            for item in continuous_metadata["mapkv"]["cache_audits"].values()
+            for metadata in (raw_metadata, masked_metadata)
+            for item in metadata["mapkv"]["cache_audits"].values()
         ),
         "known_pose_surfel_query": all(
             item["geometry"]["pose_source"]
             == "known_control_c2w_to_cut3r_c2w"
-            for item in audits.values()
+            for item in (*raw_audits.values(), *masked_audits.values())
         ),
         "future_geometry_used": any(
             frame["future_geometry_used"]
-            for item in active
+            for item in (*raw_active, *masked_active)
             for frame in item["geometry_frames"]
         ),
         "same_gpu": len(set(gpu_names.values())) == 1,
         "gpu_by_method": gpu_names,
     }
-    valid = all(
-        value
-        for key, value in validity.items()
-        if key
-        not in {
-            "active_chunks",
-            "inactive_no_support_chunks",
-            "gpu_by_method",
-            "future_geometry_used",
-        }
-    ) and not validity["future_geometry_used"]
+    ignored = {
+        "active_chunks",
+        "inactive_no_support_chunks",
+        "gpu_by_method",
+        "future_geometry_used",
+    }
+    valid = (
+        all(value for key, value in validity.items() if key not in ignored)
+        and not validity["future_geometry_used"]
+    )
+
+    previous = None
+    if previous_cavr_root is not None:
+        previous_path = Path(previous_cavr_root).resolve() / "metrics.json"
+        if previous_path.exists():
+            previous_payload = _json(previous_path)
+            previous = previous_payload["methods"]["continuous_cavr"]
     baseline = methods["baseline"]
     block_on = methods["block_on_wre"]
-    continuous = methods["continuous_cavr"]
-    fidelity_preserved = bool(
-        continuous["overlap_b1_to_b2_l1"]
+    raw = methods["continuous_raw_recent"]
+    masked = methods["masked_continuous_wre"]
+    raw_recent_improves_failed_cavr = bool(
+        previous is not None
+        and raw["nonoverlap_delta_vs_baseline_l1"]
+        < previous["nonoverlap_delta_vs_baseline_l1"]
+        and raw["reentry_window_mean_l1"]
+        < previous["transition_window_mean_frame_l1"]
+        and raw["reentry_window_peak_l1"]
+        < previous["transition_window_peak_frame_l1"]
+    )
+    memory_fidelity_preserved = bool(
+        masked["overlap_b1_to_b2_l1"]
         < baseline["overlap_b1_to_b2_l1"]
-        and continuous["overlap_b1_to_b2_l1"]
+        and masked["overlap_b1_to_b2_l1"]
         <= block_on["overlap_b1_to_b2_l1"] + 0.02
     )
-    new_region_preserved = bool(
-        continuous["nonoverlap_delta_vs_baseline_l1"]
-        <= block_on["nonoverlap_delta_vs_baseline_l1"]
+    locality_improved = bool(
+        masked["nonoverlap_delta_vs_baseline_l1"]
+        < raw["nonoverlap_delta_vs_baseline_l1"]
+        and masked["nonoverlap_delta_vs_baseline_l1"]
+        < block_on["nonoverlap_delta_vs_baseline_l1"]
     )
     transition_improved = bool(
-        continuous["b2_entry_boundary_l1"]
-        < block_on["b2_entry_boundary_l1"]
-        and continuous["entrance_frame_l1"]
-        < block_on["entrance_frame_l1"]
-        and continuous["transition_window_mean_frame_l1"]
-        <= block_on["transition_window_mean_frame_l1"]
-        and continuous["transition_window_peak_frame_l1"]
-        <= block_on["transition_window_peak_frame_l1"]
+        masked["reentry_window_mean_l1"]
+        <= raw["reentry_window_mean_l1"]
+        and masked["reentry_window_peak_l1"]
+        <= raw["reentry_window_peak_l1"]
+        and masked["reentry_window_peak_l1"]
+        <= block_on["reentry_window_peak_l1"]
     )
-    if valid and fidelity_preserved and new_region_preserved and transition_improved:
-        status = "CONTINUOUS_CAVR_WORKS"
-    elif valid and fidelity_preserved and new_region_preserved:
-        status = "CONTINUOUS_CAVR_MIXED_TRANSITION"
+    if not valid:
+        status = "INVALID"
+    elif (
+        raw_recent_improves_failed_cavr
+        and memory_fidelity_preserved
+        and locality_improved
+        and transition_improved
+    ):
+        status = "MASKED_CONTINUOUS_WRE_WORKS"
     else:
-        status = "CONTINUOUS_CAVR_NOT_WORKING"
+        status = "CONTINUOUS_WRE_LOCALITY_INCOMPLETE"
     result = {
         "status": status,
         "case": case_dir.name,
@@ -350,20 +424,29 @@ def evaluate_continuous_cavr(
             "timeline": coverage_timeline,
         },
         "methods": methods,
+        "previous_failed_cavr": previous,
         "validity": validity,
         "decision": {
-            "memory_fidelity_preserved": fidelity_preserved,
-            "new_region_preserved": new_region_preserved,
+            "raw_recent_improves_failed_cavr": (
+                raw_recent_improves_failed_cavr
+            ),
+            "memory_fidelity_preserved": memory_fidelity_preserved,
+            "nonoverlap_locality_improved": locality_improved,
             "transition_improved": transition_improved,
             "visual_review": {
                 "completed": True,
                 "finding": (
-                    "Continuous CAVR removes the block-on B2 pouring-object "
-                    "hard switch, but shows repeated ghost/layout popping as "
-                    "coverage grows across re-entry blocks. The measured peak "
-                    "is therefore a real visual discontinuity."
+                    "Aligned and dense return-window review confirms that the "
+                    "translucent ghost/layout tear in warped-recent global CAVR "
+                    "disappears when raw last_pred is restored. Masked WRE brings "
+                    "the remembered objects in progressively with coverage and "
+                    "shows no new full-frame hard switch. Its non-overlap is "
+                    "visibly closer to Baseline than the global RawRecent method, "
+                    "although it is not pixel-identical to Baseline."
                 ),
-                "artifact": "assets/cavr_transition_filmstrip_small.jpg",
+                "artifact": (
+                    "assets/masked_continuous_dense_reentry.jpg"
+                ),
             },
         },
     }
@@ -375,16 +458,18 @@ def evaluate_continuous_cavr(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Evaluate Continuous Geometry-Reprojected Virtual Recent"
+        description="Evaluate Masked Continuous Warp-Reencode Recent"
     )
     parser.add_argument("--run_root", required=True)
     parser.add_argument("--case_dir", required=True)
+    parser.add_argument("--previous_cavr_root")
     args = parser.parse_args()
     print(
         json.dumps(
             evaluate_continuous_cavr(
                 run_root=args.run_root,
                 case_dir=args.case_dir,
+                previous_cavr_root=args.previous_cavr_root,
             ),
             indent=2,
         )

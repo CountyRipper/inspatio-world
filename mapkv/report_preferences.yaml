@@ -1,0 +1,25 @@
+report:
+  language: zh-CN
+  label_latest_method_in_chinese: true
+  complete_revisit_video_required: true
+  complete_revisit_scope: B1_visit_through_B2_revisit
+  short_reentry_clip_is_supplemental: true
+  embed_videos_as_base64: false
+
+surfel:
+  primary_color_source: generated_historical_rgb_observations
+  primary_views:
+    - rgb_world_overview
+    - rgb_target_camera_zbuffer
+  secondary_audit_views:
+    - chunk_id
+    - depth
+    - confidence
+    - oriented_disk
+  preferred_style: pending_user_selection
+  candidate_styles:
+    - A_rgb_world_splats
+    - B_rgb_oriented_disks
+    - C_rgb_target_camera_zbuffer
+    - D_rgb_b1_target_zbuffer
+    - E_rgb_b1_target_overlay

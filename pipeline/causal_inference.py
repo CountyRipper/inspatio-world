@@ -339,6 +339,18 @@ class CausalInferencePipeline(torch.nn.Module):
                     mask_block, layout["token_hw"]
                 )
                 self.last_query_gates[block_id] = block_memory.query_gate.detach().cpu()
+                if virtual_plan is not None:
+                    gate = block_memory.query_gate.float()
+                    virtual_plan.audit.update(
+                        {
+                            "query_gate_token_fraction": float(
+                                gate.mean().item()
+                            ),
+                            "query_gate_token_min": float(gate.min().item()),
+                            "query_gate_token_max": float(gate.max().item()),
+                            "query_gate_token_shape": list(gate.shape),
+                        }
+                    )
 
             denoised_pred, _ = denoise_block(
                 self.generator, self.scheduler, noisy_input, conditional_dict,

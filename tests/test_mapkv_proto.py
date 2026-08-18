@@ -6,11 +6,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv.latent_control import LatentBlockIntervention
 from mapkv.locality_evaluation import _rotation_warp
 from mapkv.surfel_index import write_oriented_disk_preview
+from mapkv.surfel_rgb_options import sample_historical_rgb
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
 from mapkv_proto.memory_context import (
@@ -92,6 +94,75 @@ def test_surfel_gate_uses_geometry_without_reference_mask():
     assert torch.count_nonzero(gate) > 0
     torch.testing.assert_close(gate[:, 0], gate[:, 1])
     torch.testing.assert_close(gate[:, 1], gate[:, 2])
+
+
+def test_surfel_exact_gate_tokenizes_same_mask_without_dilation():
+    coverage = torch.zeros(1, 3, 4, 4)
+    coverage[:, :, 1, 1] = 1.0
+    context = MemoryContext(
+        target_block=4,
+        source_chunk=1,
+        layer_payloads={},
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        alpha=1.0,
+        gate_mode="surfel_exact",
+        smooth_kernel=1,
+        coverage=coverage,
+    )
+    gated = context.with_query_gate(
+        torch.ones(1, 3, 1, 4, 4), (4, 4)
+    )
+    gate = gated.query_gate.reshape(1, 3, 4, 4).float()
+    torch.testing.assert_close(gate, coverage)
+    assert int(torch.count_nonzero(gate)) == 3
+
+
+def test_surfel_rgb_is_sampled_from_real_first_seen_observation(tmp_path):
+    image_path = tmp_path / "generated.png"
+    Image.new("RGB", (16, 16), (17, 83, 201)).save(image_path)
+    sequence_path = tmp_path / "sequence.json"
+    sequence_path.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "chunk_id": 0,
+                        "shape": [16, 16],
+                        "image_path": str(image_path),
+                        "camera_pose": np.eye(4).tolist(),
+                        "intrinsics": [
+                            [8.0, 0.0, 8.0],
+                            [0.0, 8.0, 8.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cell = SurfelCell(
+        voxel_key=(0, 0, 10),
+        xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        confidence=2.0,
+        normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+        radius=0.1,
+        rgb_preview=None,
+        first_seen_chunk=0,
+        last_seen_chunk=0,
+        observing_chunks=[0],
+        chunk_weights={0: 1.0},
+        view_dirs={0: np.array([0.0, 0.0, -1.0], dtype=np.float32)},
+        observation_weight=1.0,
+    )
+    colors, valid, chunks, stats = sample_historical_rgb(
+        VoxelSurfelIndex(0.1, [cell]), sequence_path
+    )
+    assert valid.tolist() == [True]
+    assert chunks.tolist() == [0]
+    assert colors.tolist() == [[17, 83, 201]]
+    assert stats["invented_colors"] is False
 
 
 def test_exact_control_trajectory_is_block_aligned_and_revisits_same_pose():
@@ -923,6 +994,39 @@ def test_continuous_virtual_recent_reprojects_short_term_fallback():
     assert plan.audit["recent_warp_coverage_fraction"] == pytest.approx(1.0)
 
 
+def test_repaired_continuous_virtual_recent_keeps_raw_short_term_fallback():
+    recent = torch.randn(1, 3, 2, 4, 4)
+    plan = WarpReencodePlan(
+        target_block=4,
+        source_chunk=1,
+        historical_latent=torch.randn_like(recent),
+        target_to_source_grid=torch.zeros(3, 4, 4, 2),
+        coverage=torch.zeros(1, 3, 4, 4),
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        recent_target_to_source_grid=None,
+        query_gate_mode="surfel_exact",
+        mode="masked_continuous_warp_reencode",
+    )
+    virtual = plan.compose(recent)
+    torch.testing.assert_close(virtual, recent)
+    torch.testing.assert_close(plan.artifacts["warped_recent"], recent.cpu())
+    assert plan.audit["short_term_recent_reprojected"] is False
+    assert plan.audit["warped_recent_vs_raw_recent_l1"] == 0.0
+
+    plan.coverage[:, :, 1, 1] = 1.0
+    payloads = {
+        0: (
+            torch.zeros(1, 3, 1, 2),
+            torch.zeros(1, 3, 1, 2),
+        )
+    }
+    context = plan.make_memory_context(payloads, {"runtime_cache_mutated": False})
+    assert context.gate_mode == "surfel_exact"
+    torch.testing.assert_close(context.coverage, plan.coverage)
+    assert plan.audit["query_gate_uses_latent_composition_mask"] is True
+
+
 def test_continuous_plan_is_visibility_driven_and_causal(tmp_path):
     latents = torch.randn(1, 12, 16, 4, 4)
     latent_path = tmp_path / "latents.pt"
@@ -1000,6 +1104,41 @@ def test_continuous_plan_is_visibility_driven_and_causal(tmp_path):
     assert all(
         item["geometry_frames"][0]["future_geometry_used"] is False
         for item in selections
+    )
+
+    repaired, repaired_selections = build_continuous_virtual_recent_plans(
+        source_latents_path=latent_path,
+        source_chunk=0,
+        target_pose_path=pose_path,
+        intrinsics_path=intrinsic_path,
+        surfel_index_path=index_path,
+        surfel_sequence_path=sequence_path,
+        latent_length=12,
+        rgb_length=16,
+        frames_per_block=3,
+        latent_hw=(4, 4),
+        image_hw=(4, 4),
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        alpha=1.0,
+        feather_kernel=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        min_history_gap_chunks=2,
+        warp_short_term_recent=False,
+        query_gate_mode="surfel_exact",
+    )
+    assert all(
+        plan.recent_target_to_source_grid is None
+        and plan.query_gate_mode == "surfel_exact"
+        and plan.mode == "masked_continuous_warp_reencode"
+        for plan in repaired.values()
+    )
+    assert all(
+        item["short_term_recent"] == "raw_last_pred"
+        and item["attention_query_gate"] == "surfel_exact"
+        and item["same_mask_controls_latent_and_attention"] is True
+        for item in repaired_selections
     )
 
 
