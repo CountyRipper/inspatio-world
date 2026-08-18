@@ -95,3 +95,20 @@ results/mapkv_fast/yaw30to20_scene01_seed0_warp_reencode. The runner reuses
 the established same-GPU Baseline and fixed-chunk-8 HardKV controls, asserts
 their configuration, and verifies that the Warp-Reencode prefix through chunk
 20 is exactly equal to Baseline.
+
+## Continuous Geometry-Reprojected Virtual Recent
+
+Run the visibility-driven architecture with:
+
+    bash scripts/run_mapkv_continuous_cavr.sh --stage full --seed 0 --gpu 0
+
+It reuses the same fixed B1 chunk and frozen known-pose surfel index, but
+queries source-chunk visibility for every causally eligible block. Both B1 and
+runtime `last_pred` are warped into the current camera layout before the
+native timestep-zero recent writer. Blocks with empty historical support keep
+the original InSpatio path.
+
+The current controlled result retains B1 fidelity but does not pass the
+transition/locality gate: whole-slot re-encoding causes block-boundary
+ghosting while surfel coverage grows. Canonical-K re-addressing is therefore
+intentionally not implemented yet.

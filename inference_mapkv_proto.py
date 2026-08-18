@@ -40,6 +40,7 @@ from mapkv_proto.visualization import save_gate_overlay
 from mapkv.latent_control import LatentBlockIntervention
 from mapkv.kv_bank import resolve_memory_layers
 from mapkv.warp_reencode import (
+    build_continuous_virtual_recent_plans,
     build_warp_reencode_plans,
     save_warp_reencode_artifacts,
 )
@@ -115,8 +116,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--retrieval_plan")
     parser.add_argument("--warp_reencode_recent", action="store_true")
+    parser.add_argument("--continuous_virtual_recent", action="store_true")
     parser.add_argument("--warp_source_latents")
     parser.add_argument("--warp_intrinsics_path")
+    parser.add_argument("--warp_surfel_index")
+    parser.add_argument("--warp_surfel_sequence")
+    parser.add_argument("--warp_min_history_gap", type=int, default=2)
     parser.add_argument("--warp_feather_kernel", type=int, default=3)
     parser.add_argument("--compare_latents_to")
     parser.add_argument("--verify_memory_off_replay", action="store_true")
@@ -220,7 +225,11 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
     if args.bank_root is not None:
         raw.setdefault("bank", {})["root"] = args.bank_root
     mapkv = MapKVConfig.from_mapping(raw)
-    if mapkv.enabled and not mapkv.target_chunks:
+    if (
+        mapkv.enabled
+        and not mapkv.target_chunks
+        and not args.continuous_virtual_recent
+    ):
         raise ValueError("MapKV is enabled but target_chunks is empty")
     return config, experiment, mapkv
 
@@ -510,10 +519,14 @@ def main() -> None:
         == len(args.latent_strengths)
     ):
         raise ValueError("Latent source/target/strength lists must have equal length")
-    if args.warp_reencode_recent:
+    if args.warp_reencode_recent and args.continuous_virtual_recent:
+        raise ValueError(
+            "Block-on Warp-Reencode and Continuous CAVR are mutually exclusive"
+        )
+    if args.warp_reencode_recent or args.continuous_virtual_recent:
         if not args.warp_source_latents or not args.warp_intrinsics_path:
             raise ValueError(
-                "--warp_reencode_recent requires --warp_source_latents and "
+                "Virtual Recent requires --warp_source_latents and "
                 "--warp_intrinsics_path"
             )
         if not args.target_pose_path:
@@ -524,6 +537,13 @@ def main() -> None:
             )
         if args.latent_memory_path:
             raise ValueError("Warp-reencode and direct latent control are separate runs")
+    if args.continuous_virtual_recent and (
+        not args.warp_surfel_index or not args.warp_surfel_sequence
+    ):
+        raise ValueError(
+            "Continuous CAVR requires --warp_surfel_index and "
+            "--warp_surfel_sequence"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("The fixed MapKV prototype requires one CUDA device")
     device = torch.device(args.device)
@@ -658,7 +678,7 @@ def main() -> None:
             capture_chunk_ids=args.capture_chunks,
         )
     virtual_recent_contexts = {}
-    if args.warp_reencode_recent:
+    if args.warp_reencode_recent or args.continuous_virtual_recent:
         if not mapkv_config.enabled or mapkv_config.mode != "oracle":
             raise ValueError(
                 "Warp-reencode requires enabled manual oracle mode with a fixed source"
@@ -676,16 +696,18 @@ def main() -> None:
             pipeline.num_transformer_blocks,
             name="warp-reencode layer",
         )
-        virtual_recent_contexts, memory_selections = build_warp_reencode_plans(
+        common_virtual_kwargs = dict(
             source_latents_path=args.warp_source_latents,
             source_chunk=mapkv_config.source_chunk,
-            target_chunks=mapkv_config.target_chunks,
             target_pose_path=args.target_pose_path,
             intrinsics_path=args.warp_intrinsics_path,
             latent_length=output_length,
             rgb_length=int(batch["source_video"].shape[1]),
             frames_per_block=frames_per_block,
-            latent_hw=(int(target_latent.shape[-2]), int(target_latent.shape[-1])),
+            latent_hw=(
+                int(target_latent.shape[-2]),
+                int(target_latent.shape[-1]),
+            ),
             image_hw=(
                 int(source_video_bcthw.shape[-2]),
                 int(source_video_bcthw.shape[-1]),
@@ -697,6 +719,22 @@ def main() -> None:
             device=device,
             dtype=dtype,
         )
+        if args.continuous_virtual_recent:
+            virtual_recent_contexts, memory_selections = (
+                build_continuous_virtual_recent_plans(
+                    **common_virtual_kwargs,
+                    surfel_index_path=args.warp_surfel_index,
+                    surfel_sequence_path=args.warp_surfel_sequence,
+                    min_history_gap_chunks=args.warp_min_history_gap,
+                )
+            )
+        else:
+            virtual_recent_contexts, memory_selections = (
+                build_warp_reencode_plans(
+                    **common_virtual_kwargs,
+                    target_chunks=mapkv_config.target_chunks,
+                )
+            )
         memory_contexts = {}
     else:
         memory_contexts, memory_selections = _build_memory_contexts(
@@ -1060,8 +1098,20 @@ def main() -> None:
             },
             "warp_reencode": {
                 "enabled": bool(virtual_recent_contexts),
+                "mode": (
+                    "continuous_geometry_reprojected_virtual_recent"
+                    if args.continuous_virtual_recent
+                    else (
+                        "block_on_warp_reencode"
+                        if args.warp_reencode_recent
+                        else None
+                    )
+                ),
                 "source_latents": args.warp_source_latents,
                 "intrinsics_path": args.warp_intrinsics_path,
+                "surfel_index": args.warp_surfel_index,
+                "surfel_sequence": args.warp_surfel_sequence,
+                "min_history_gap_chunks": args.warp_min_history_gap,
                 "feather_kernel": args.warp_feather_kernel,
                 "writer_isolated_from_runtime_cache": True,
                 "manifest": warp_reencode_manifest,

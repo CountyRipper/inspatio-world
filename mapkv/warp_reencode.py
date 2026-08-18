@@ -13,7 +13,13 @@ import torch.nn.functional as F
 from PIL import Image
 
 from mapkv_proto.memory_context import MemoryContext, make_memory_context
-from mapkv_proto.pose_utils import rotation_geodesic, scale_intrinsics
+from mapkv_proto.pose_utils import (
+    rotation_geodesic,
+    scale_intrinsics,
+    to_cut3r_c2w,
+)
+
+from .surfel_index import SurfelIndex
 
 
 def load_intrinsics(path: str | Path) -> np.ndarray:
@@ -201,6 +207,10 @@ class WarpReencodePlan:
     source_to_target_homographies: tuple[np.ndarray, ...] = ()
     source_target_rotation_degrees: tuple[float, ...] = ()
     source_target_translation: tuple[float, ...] = ()
+    recent_target_to_source_grid: torch.Tensor | None = None
+    recent_coverage: torch.Tensor | None = None
+    mode: str = "block_on_warp_reencode"
+    geometry_audit: dict = field(default_factory=dict)
     audit: dict = field(default_factory=dict)
     artifacts: dict[str, torch.Tensor] = field(default_factory=dict)
     memory_context: MemoryContext | None = None
@@ -215,6 +225,12 @@ class WarpReencodePlan:
             device=current_recent.device, dtype=current_recent.dtype
         )
         warped = warp_latent(historical, self.target_to_source_grid)
+        if self.recent_target_to_source_grid is None:
+            warped_recent = current_recent
+        else:
+            warped_recent = warp_latent(
+                current_recent, self.recent_target_to_source_grid
+            )
         coverage = self.coverage.to(
             device=current_recent.device, dtype=torch.float32
         )
@@ -226,15 +242,24 @@ class WarpReencodePlan:
                 f"recent {tuple(current_recent.shape)}"
             )
         blend = coverage.to(dtype=current_recent.dtype)
-        virtual = blend * warped + (1.0 - blend) * current_recent
+        virtual = blend * warped + (1.0 - blend) * warped_recent
         self.artifacts = {
             "historical": historical.detach().cpu(),
             "warped": warped.detach().cpu(),
             "current_recent": current_recent.detach().cpu(),
+            "warped_recent": warped_recent.detach().cpu(),
             "virtual_recent": virtual.detach().cpu(),
             "coverage": coverage.detach().cpu(),
             "target_to_source_grid": self.target_to_source_grid.detach().cpu(),
         }
+        if self.recent_target_to_source_grid is not None:
+            self.artifacts["recent_target_to_source_grid"] = (
+                self.recent_target_to_source_grid.detach().cpu()
+            )
+        if self.recent_coverage is not None:
+            self.artifacts["recent_coverage"] = (
+                self.recent_coverage.detach().cpu()
+            )
         weighted_denominator = float(coverage.sum().item()) * current_recent.shape[2]
         historical_delta = float(
             (
@@ -245,13 +270,26 @@ class WarpReencodePlan:
         )
         self.audit.update(
             {
-                "mode": "camera_aligned_warp_and_reencode_recent",
+                "mode": self.mode,
                 "target_block": int(self.target_block),
                 "source_chunk": int(self.source_chunk),
                 "coverage_fraction": float(coverage.mean().item()),
                 "historical_vs_current_recent_overlap_l1": historical_delta,
                 "virtual_vs_current_recent_l1": float(
                     (virtual.float() - current_recent.float()).abs().mean().item()
+                ),
+                "short_term_recent_reprojected": (
+                    self.recent_target_to_source_grid is not None
+                ),
+                "warped_recent_vs_raw_recent_l1": float(
+                    (
+                        warped_recent.float() - current_recent.float()
+                    ).abs().mean().item()
+                ),
+                "recent_warp_coverage_fraction": (
+                    None
+                    if self.recent_coverage is None
+                    else float(self.recent_coverage.float().mean().item())
                 ),
                 "source_rgb_indices": list(self.source_rgb_indices),
                 "target_rgb_indices": list(self.target_rgb_indices),
@@ -265,6 +303,7 @@ class WarpReencodePlan:
                     matrix.tolist()
                     for matrix in self.source_to_target_homographies
                 ],
+                "geometry": dict(self.geometry_audit),
             }
         )
         return virtual
@@ -432,6 +471,295 @@ def build_warp_reencode_plans(
     return plans, selections
 
 
+def _surfel_coverage_for_pose(
+    *,
+    surfel_index: SurfelIndex,
+    source_chunk: int,
+    target_chunk: int,
+    query_pose: np.ndarray,
+    intrinsics: np.ndarray,
+    source_image_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+) -> tuple[torch.Tensor, dict]:
+    """Project source-chunk surfels after eligibility filtering."""
+    eligible = [
+        cell
+        for cell in surfel_index.cells
+        if int(source_chunk) in {int(chunk) for chunk in cell.observing_chunks}
+    ]
+    if any(int(cell.first_seen_chunk) > int(source_chunk) for cell in eligible):
+        raise RuntimeError(
+            "A source-observed surfel was created after the source chunk"
+        )
+    visible = surfel_index.visible_cells(
+        query_pose,
+        intrinsics,
+        target_hw,
+        source_image_size=source_image_hw,
+        eligible_max_chunk=int(target_chunk) - 2,
+        eligible_chunks={int(source_chunk)},
+        use_occlusion=True,
+    )
+    coverage = np.zeros(target_hw, dtype=np.float32)
+    pixels = np.asarray(visible["pixels"], dtype=np.int32)
+    if len(pixels):
+        coverage[pixels[:, 0], pixels[:, 1]] = 1.0
+    return torch.from_numpy(coverage), {
+        "source_chunk": int(source_chunk),
+        "target_chunk": int(target_chunk),
+        "eligibility_before_zbuffer": True,
+        "eligible_source_observed_surfels": len(eligible),
+        "num_eligible_surfels": int(visible["num_eligible_cells"]),
+        "num_visible_surfels": int(visible["num_visible_cells"]),
+        "num_visible_pixels": int(len(pixels)),
+        "raw_coverage_fraction": float(coverage.mean()),
+        "future_geometry_used": False,
+    }
+
+
+def build_continuous_virtual_recent_plans(
+    *,
+    source_latents_path: str | Path,
+    source_chunk: int,
+    target_pose_path: str | Path,
+    intrinsics_path: str | Path,
+    surfel_index_path: str | Path,
+    surfel_sequence_path: str | Path,
+    latent_length: int,
+    rgb_length: int,
+    frames_per_block: int,
+    latent_hw: tuple[int, int],
+    image_hw: tuple[int, int],
+    selected_layers: Iterable[int],
+    selected_step_indices: Iterable[int],
+    alpha: float,
+    feather_kernel: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    min_history_gap_chunks: int = 2,
+) -> tuple[dict[int, WarpReencodePlan], list[dict]]:
+    """Build visibility-driven Virtual Recent plans for every causal block.
+
+    Historical B1 and the runtime short-term Recent are both reprojected into
+    each target block's camera layout. Only projected source-chunk surfel
+    support selects the historical branch; no target-block schedule or alpha
+    ramp is used.
+    """
+    if min_history_gap_chunks < 2:
+        raise ValueError(
+            "Long-term memory must exclude the immediate recent chunk"
+        )
+    source_path = Path(source_latents_path).resolve()
+    payload = torch.load(source_path, map_location="cpu", weights_only=True)
+    if isinstance(payload, dict):
+        payload = payload["pred_latents"]
+    if payload.ndim != 5 or int(payload.shape[1]) != int(latent_length):
+        raise ValueError(
+            f"Source latent shape {tuple(payload.shape)} is incompatible with "
+            f"latent length {latent_length}"
+        )
+    num_blocks = int(latent_length) // int(frames_per_block)
+    source_start = int(source_chunk) * int(frames_per_block)
+    source_stop = source_start + int(frames_per_block)
+    if source_start < 0 or source_stop > latent_length:
+        raise IndexError(
+            f"Source chunk {source_chunk} is outside latent sequence"
+        )
+    historical = payload[:, source_start:source_stop].to(
+        device=device, dtype=dtype
+    )
+    poses = np.load(Path(target_pose_path).resolve()).astype(np.float64)
+    if poses.shape != (rgb_length, 4, 4):
+        raise ValueError(
+            f"Pose artifact {poses.shape} != expected {(rgb_length, 4, 4)}"
+        )
+    raw_intrinsics = load_intrinsics(intrinsics_path)
+    intrinsic_source_hw = infer_intrinsic_image_hw(raw_intrinsics)
+    image_intrinsics = scale_intrinsics(
+        raw_intrinsics,
+        source_hw=intrinsic_source_hw,
+        target_hw=image_hw,
+    )
+    latent_intrinsics = scale_intrinsics(
+        image_intrinsics,
+        source_hw=image_hw,
+        target_hw=latent_hw,
+    )
+    source_rgb = tuple(
+        latent_to_rgb_index(index, latent_length, rgb_length)
+        for index in range(source_start, source_stop)
+    )
+    source_poses = poses[np.asarray(source_rgb, dtype=np.int64)]
+
+    sequence_path = Path(surfel_sequence_path).resolve()
+    sequence = json.loads(sequence_path.read_text(encoding="utf-8"))
+    if sequence.get("cut3r_predicted_pose_used_for_map", True):
+        raise ValueError(
+            "Continuous CAVR requires known-pose CUT3R geometry"
+        )
+    source_frame = next(
+        (
+            item
+            for item in sequence["frames"]
+            if int(item["chunk_id"]) == int(source_chunk)
+        ),
+        None,
+    )
+    if source_frame is None:
+        raise ValueError(
+            f"Source chunk {source_chunk} is absent from CUT3R prefix"
+        )
+    surfel_intrinsics = np.asarray(
+        source_frame["intrinsics"], dtype=np.float64
+    )
+    surfel_source_hw = tuple(
+        int(value) for value in source_frame["shape"]
+    )
+    surfel_index = SurfelIndex.load(Path(surfel_index_path).resolve())
+
+    selected_layers = tuple(int(layer) for layer in selected_layers)
+    selected_steps = tuple(int(step) for step in selected_step_indices)
+    plans: dict[int, WarpReencodePlan] = {}
+    selections: list[dict] = []
+    first_eligible = int(source_chunk) + int(min_history_gap_chunks)
+    for target_chunk in range(first_eligible, num_blocks):
+        target_start = target_chunk * frames_per_block
+        target_stop = target_start + frames_per_block
+        recent_start = (target_chunk - 1) * frames_per_block
+        target_rgb = tuple(
+            latent_to_rgb_index(index, latent_length, rgb_length)
+            for index in range(target_start, target_stop)
+        )
+        recent_rgb = tuple(
+            latent_to_rgb_index(index, latent_length, rgb_length)
+            for index in range(recent_start, target_start)
+        )
+        target_poses = poses[np.asarray(target_rgb, dtype=np.int64)]
+        recent_poses = poses[np.asarray(recent_rgb, dtype=np.int64)]
+        historical_grids = []
+        recent_grids = []
+        recent_valid = []
+        homographies = []
+        rotations = []
+        translations = []
+        surfel_masks = []
+        per_frame_geometry = []
+        for source_pose, recent_pose, target_pose in zip(
+            source_poses, recent_poses, target_poses
+        ):
+            history_grid, history_mask, homography = (
+                build_rotation_target_to_source_grid(
+                    source_pose,
+                    target_pose,
+                    latent_intrinsics,
+                    latent_intrinsics,
+                    latent_hw,
+                )
+            )
+            recent_grid, recent_mask, _ = (
+                build_rotation_target_to_source_grid(
+                    recent_pose,
+                    target_pose,
+                    latent_intrinsics,
+                    latent_intrinsics,
+                    latent_hw,
+                )
+            )
+            surfel_mask, geometry = _surfel_coverage_for_pose(
+                surfel_index=surfel_index,
+                source_chunk=int(source_chunk),
+                target_chunk=target_chunk,
+                query_pose=to_cut3r_c2w(target_pose),
+                intrinsics=surfel_intrinsics,
+                source_image_hw=surfel_source_hw,
+                target_hw=latent_hw,
+            )
+            historical_grids.append(history_grid)
+            recent_grids.append(recent_grid)
+            recent_valid.append(recent_mask)
+            surfel_masks.append(surfel_mask * history_mask)
+            homographies.append(homography)
+            rotations.append(
+                float(
+                    np.degrees(
+                        rotation_geodesic(
+                            source_pose[:3, :3], target_pose[:3, :3]
+                        )
+                    )
+                )
+            )
+            translations.append(
+                float(
+                    np.linalg.norm(
+                        source_pose[:3, 3] - target_pose[:3, 3]
+                    )
+                )
+            )
+            per_frame_geometry.append(geometry)
+        hard_memory_coverage = torch.stack(surfel_masks).unsqueeze(0)
+        coverage = feather_coverage(
+            hard_memory_coverage, feather_kernel
+        ).to(device=device)
+        selection = {
+            "target_chunk": target_chunk,
+            "source_chunk": int(source_chunk),
+            "mode": "continuous_geometry_reprojected_virtual_recent",
+            "payload_kind": "target_aligned_virtual_recent_native_kv",
+            "coverage_fraction": float(coverage.mean().item()),
+            "hard_coverage_fraction": float(
+                hard_memory_coverage.mean().item()
+            ),
+            "source_rgb_indices": list(source_rgb),
+            "recent_rgb_indices": list(recent_rgb),
+            "target_rgb_indices": list(target_rgb),
+            "source_target_rotation_degrees": rotations,
+            "source_latents_path": str(source_path),
+            "activation_policy": "visible_source_surfel_support",
+            "geometry_frames": per_frame_geometry,
+        }
+        if not bool(hard_memory_coverage.any()):
+            selection["status"] = "memory_off_no_visible_support"
+            selections.append(selection)
+            continue
+        recent_coverage = torch.stack(recent_valid).unsqueeze(0).to(
+            device=device
+        )
+        plan = WarpReencodePlan(
+            target_block=target_chunk,
+            source_chunk=int(source_chunk),
+            historical_latent=historical,
+            target_to_source_grid=torch.stack(historical_grids).to(
+                device=device
+            ),
+            coverage=coverage,
+            selected_layers=selected_layers,
+            selected_step_indices=selected_steps,
+            alpha=float(alpha),
+            source_rgb_indices=source_rgb,
+            target_rgb_indices=target_rgb,
+            source_to_target_homographies=tuple(homographies),
+            source_target_rotation_degrees=tuple(rotations),
+            source_target_translation=tuple(translations),
+            recent_target_to_source_grid=torch.stack(recent_grids).to(
+                device=device
+            ),
+            recent_coverage=recent_coverage,
+            mode="continuous_geometry_reprojected_virtual_recent",
+            geometry_audit={
+                "coordinate_frame": sequence.get("coordinate_frame"),
+                "pose_source": "known_control_c2w_to_cut3r_c2w",
+                "surfel_index": str(Path(surfel_index_path).resolve()),
+                "surfel_sequence": str(sequence_path),
+                "source_candidate_only": True,
+                "per_frame": per_frame_geometry,
+            },
+        )
+        plans[target_chunk] = plan
+        selection["status"] = "scheduled_visible_support"
+        selections.append(selection)
+    return plans, selections
+
+
 def _tensor_sha256(tensor: torch.Tensor) -> str:
     array = tensor.detach().contiguous().cpu().float().numpy()
     return hashlib.sha256(array.tobytes()).hexdigest()
@@ -455,11 +783,22 @@ def save_warp_reencode_artifacts(
 ) -> dict:
     root = Path(output_root).resolve() / "warp"
     root.mkdir(parents=True, exist_ok=True)
+    plan_modes = {plan.mode for plan in plans.values()}
     manifest = {
-        "mode": "camera_aligned_warp_and_reencode_recent",
+        "mode": (
+            next(iter(plan_modes))
+            if len(plan_modes) == 1
+            else "mixed_virtual_recent"
+        ),
         "targets": [],
     }
-    names = ("historical", "warped", "current_recent", "virtual_recent")
+    names = (
+        "historical",
+        "warped",
+        "current_recent",
+        "warped_recent",
+        "virtual_recent",
+    )
     for target, plan in sorted(plans.items()):
         if not plan.artifacts:
             raise RuntimeError(f"Warp plan for target {target} was not materialized")
@@ -482,6 +821,20 @@ def save_warp_reencode_artifacts(
             Image.Resampling.BILINEAR,
         )
         coverage_image.save(target_root / "coverage.png")
+        if "recent_coverage" in plan.artifacts:
+            recent_coverage = plan.artifacts["recent_coverage"].float().mean(
+                dim=(0, 1)
+            )
+            if recent_coverage.ndim == 3:
+                recent_coverage = recent_coverage.mean(dim=0)
+            Image.fromarray(
+                (recent_coverage.numpy().clip(0, 1) * 255)
+                .round()
+                .astype(np.uint8)
+            ).resize(
+                (int(decoded.shape[-1]), int(decoded.shape[-2])),
+                Image.Resampling.BILINEAR,
+            ).save(target_root / "recent_coverage.png")
         torch.save(
             {
                 key: value
@@ -514,6 +867,7 @@ def save_warp_reencode_artifacts(
 
 __all__ = [
     "WarpReencodePlan",
+    "build_continuous_virtual_recent_plans",
     "build_rotation_target_to_source_grid",
     "build_warp_reencode_plans",
     "feather_coverage",

@@ -23,6 +23,7 @@ from mapkv.retrieval import GeometryChunkRetriever
 from mapkv.slot_evaluation import _select_best_slot
 from mapkv.warp_reencode import (
     WarpReencodePlan,
+    build_continuous_virtual_recent_plans,
     build_rotation_target_to_source_grid,
     warp_latent,
 )
@@ -895,6 +896,111 @@ def test_virtual_recent_reencode_uses_native_t3_t5_writer_layout():
     assert torch.count_nonzero(payloads[1][1] != 112) == 0
     assert audit["rope_layout"] == "recent_slot_t3_t5"
     assert audit["runtime_cache_mutated"] is False
+
+
+def test_continuous_virtual_recent_reprojects_short_term_fallback():
+    recent = torch.arange(1 * 3 * 1 * 2 * 2, dtype=torch.float32).reshape(
+        1, 3, 1, 2, 2
+    )
+    center_grid = torch.zeros(3, 2, 2, 2)
+    plan = WarpReencodePlan(
+        target_block=4,
+        source_chunk=1,
+        historical_latent=torch.zeros_like(recent),
+        target_to_source_grid=center_grid,
+        coverage=torch.zeros(1, 3, 2, 2),
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        recent_target_to_source_grid=center_grid,
+        recent_coverage=torch.ones(1, 3, 2, 2),
+        mode="continuous_geometry_reprojected_virtual_recent",
+    )
+    virtual = plan.compose(recent)
+    expected = warp_latent(recent, center_grid)
+    torch.testing.assert_close(virtual, expected)
+    assert not torch.equal(virtual, recent)
+    assert plan.audit["short_term_recent_reprojected"] is True
+    assert plan.audit["recent_warp_coverage_fraction"] == pytest.approx(1.0)
+
+
+def test_continuous_plan_is_visibility_driven_and_causal(tmp_path):
+    latents = torch.randn(1, 12, 16, 4, 4)
+    latent_path = tmp_path / "latents.pt"
+    torch.save(latents, latent_path)
+    poses = np.repeat(np.eye(4, dtype=np.float64)[None], 16, axis=0)
+    pose_path = tmp_path / "poses.npy"
+    np.save(pose_path, poses)
+    intrinsics = np.array(
+        [[2.0, 0.0, 2.0], [0.0, 2.0, 2.0], [0.0, 0.0, 1.0]]
+    )
+    intrinsic_path = tmp_path / "intrinsics.txt"
+    intrinsic_path.write_text(repr(intrinsics.tolist()))
+    cell = SurfelCell(
+        voxel_key=(0, 0, -2),
+        xyz=np.array([0.0, 0.0, -2.0], dtype=np.float32),
+        confidence=3.0,
+        normal=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        radius=0.5,
+        rgb_preview=None,
+        first_seen_chunk=0,
+        last_seen_chunk=0,
+        observing_chunks=[0],
+        chunk_weights={0: 1.0},
+        view_dirs={},
+        observation_weight=1.0,
+    )
+    index_path = tmp_path / "surfel.npz"
+    VoxelSurfelIndex(0.1, [cell]).save(index_path)
+    sequence_path = tmp_path / "sequence.json"
+    sequence_path.write_text(
+        json.dumps(
+            {
+                "cut3r_predicted_pose_used_for_map": False,
+                "coordinate_frame": "known_control_world",
+                "frames": [
+                    {
+                        "chunk_id": 0,
+                        "shape": [4, 4],
+                        "intrinsics": intrinsics.tolist(),
+                    }
+                ],
+            }
+        )
+    )
+    plans, selections = build_continuous_virtual_recent_plans(
+        source_latents_path=latent_path,
+        source_chunk=0,
+        target_pose_path=pose_path,
+        intrinsics_path=intrinsic_path,
+        surfel_index_path=index_path,
+        surfel_sequence_path=sequence_path,
+        latent_length=12,
+        rgb_length=16,
+        frames_per_block=3,
+        latent_hw=(4, 4),
+        image_hw=(4, 4),
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        alpha=1.0,
+        feather_kernel=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        min_history_gap_chunks=2,
+    )
+    assert tuple(plans) == (2, 3)
+    assert [item["target_chunk"] for item in selections] == [2, 3]
+    assert all(
+        item["status"] == "scheduled_visible_support"
+        for item in selections
+    )
+    assert all(
+        plan.recent_target_to_source_grid is not None
+        for plan in plans.values()
+    )
+    assert all(
+        item["geometry_frames"][0]["future_geometry_used"] is False
+        for item in selections
+    )
 
 
 def test_reference_kv_bank_records_rope_layout_and_roundtrips(tmp_path):
