@@ -9,6 +9,7 @@ VALID_MODES = {"off", "oracle", "wrong", "random", "zero", "pose", "geometry"}
 VALID_GATES = {"global", "ref_blind", "surfel", "surfel_ref_blind"}
 VALID_INJECTION_MODES = {
     "replace_recent_delta",
+    "canonical_recent_delta",
     "selected_recent_delta",
     "replace_ref_delta",
     "replace_both_delta",

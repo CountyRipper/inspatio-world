@@ -38,6 +38,10 @@ from mapkv_proto.retrieval import RetrievalPlan
 from mapkv_proto.revisit_pair import build_block_mapping
 from mapkv_proto.visualization import save_gate_overlay
 from mapkv.latent_control import LatentBlockIntervention
+from mapkv.canonical_kv import (
+    build_canonical_readdress_contexts,
+    save_canonical_audit,
+)
 from mapkv.kv_bank import resolve_memory_layers
 from mapkv.warp_reencode import (
     build_continuous_virtual_recent_plans,
@@ -104,6 +108,7 @@ def parse_args() -> argparse.Namespace:
         "--injection_mode",
         choices=(
             "replace_recent_delta",
+            "canonical_recent_delta",
             "selected_recent_delta",
             "replace_ref_delta",
             "replace_both_delta",
@@ -117,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval_plan")
     parser.add_argument("--warp_reencode_recent", action="store_true")
     parser.add_argument("--continuous_virtual_recent", action="store_true")
+    parser.add_argument("--canonical_kv_readdress", action="store_true")
     parser.add_argument(
         "--continuous_recent_fallback",
         choices=("raw", "warped"),
@@ -125,9 +131,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--continuous_query_gate",
-        choices=("global", "surfel"),
+        choices=("global", "surfel", "support_preserving"),
         default="surfel",
         help="Apply Virtual Recent delta globally or only at M_history query tokens.",
+    )
+    parser.add_argument(
+        "--continuous_mask_policy",
+        choices=("legacy_soft", "strong_core"),
+        default="legacy_soft",
+        help="Use the legacy feathered composition mask or a binary strong core.",
+    )
+    parser.add_argument(
+        "--warp_history_representation",
+        choices=("latent_warp", "rgb_warp_vae"),
+        default="latent_warp",
+        help="Warp historical latent directly or warp lossless RGB then re-encode.",
     )
     parser.add_argument("--warp_source_latents")
     parser.add_argument("--warp_intrinsics_path")
@@ -135,6 +153,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warp_surfel_sequence")
     parser.add_argument("--warp_min_history_gap", type=int, default=2)
     parser.add_argument("--warp_feather_kernel", type=int, default=3)
+    parser.add_argument("--warp_memory_dilation_kernel", type=int, default=3)
+    parser.add_argument("--warp_query_feather_kernel", type=int, default=3)
     parser.add_argument("--compare_latents_to")
     parser.add_argument("--verify_memory_off_replay", action="store_true")
     parser.add_argument("--replay_tolerance", type=float, default=0.0)
@@ -241,6 +261,7 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
         mapkv.enabled
         and not mapkv.target_chunks
         and not args.continuous_virtual_recent
+        and not args.canonical_kv_readdress
     ):
         raise ValueError("MapKV is enabled but target_chunks is empty")
     return config, experiment, mapkv
@@ -531,11 +552,22 @@ def main() -> None:
         == len(args.latent_strengths)
     ):
         raise ValueError("Latent source/target/strength lists must have equal length")
-    if args.warp_reencode_recent and args.continuous_virtual_recent:
-        raise ValueError(
-            "Block-on Warp-Reencode and Continuous CAVR are mutually exclusive"
+    if sum(
+        bool(value)
+        for value in (
+            args.warp_reencode_recent,
+            args.continuous_virtual_recent,
+            args.canonical_kv_readdress,
         )
-    if args.warp_reencode_recent or args.continuous_virtual_recent:
+    ) > 1:
+        raise ValueError(
+            "Block-on WRE, Continuous WRE, and Canonical-K are mutually exclusive"
+        )
+    if (
+        args.warp_reencode_recent
+        or args.continuous_virtual_recent
+        or args.canonical_kv_readdress
+    ):
         if not args.warp_source_latents or not args.warp_intrinsics_path:
             raise ValueError(
                 "Virtual Recent requires --warp_source_latents and "
@@ -549,7 +581,7 @@ def main() -> None:
             )
         if args.latent_memory_path:
             raise ValueError("Warp-reencode and direct latent control are separate runs")
-    if args.continuous_virtual_recent and (
+    if (args.continuous_virtual_recent or args.canonical_kv_readdress) and (
         not args.warp_surfel_index or not args.warp_surfel_sequence
     ):
         raise ValueError(
@@ -690,7 +722,63 @@ def main() -> None:
             capture_chunk_ids=args.capture_chunks,
         )
     virtual_recent_contexts = {}
-    if args.warp_reencode_recent or args.continuous_virtual_recent:
+    canonical_audit = None
+    inference_conditioning = None
+    if args.canonical_kv_readdress:
+        if not mapkv_config.enabled or mapkv_config.mode != "oracle":
+            raise ValueError("Canonical-K requires enabled manual oracle mode")
+        if mapkv_config.source_chunk is None:
+            raise ValueError("Canonical-K requires --source_chunk")
+        if mapkv_config.injection_mode != "canonical_recent_delta":
+            raise ValueError(
+                "Canonical-K requires --injection_mode canonical_recent_delta"
+            )
+        if mapkv_config.gate.mode != "global":
+            raise ValueError("Canonical-K owns its geometry query gate")
+        selected_canonical_layers = resolve_indices(
+            mapkv_config.selected_layers,
+            pipeline.num_transformer_blocks,
+            name="canonical-K layer",
+        )
+        inference_conditioning = pipeline.text_encoder(
+            text_prompts=batch["text"]
+        )
+        memory_contexts, memory_selections, canonical_audit = (
+            build_canonical_readdress_contexts(
+                pipeline=pipeline,
+                conditional_dict=inference_conditioning,
+                ref_latent=ref_latent,
+                render_latent=render_latent,
+                mask_latent=mask_latent,
+                source_latents_path=args.warp_source_latents,
+                source_chunk=mapkv_config.source_chunk,
+                target_pose_path=args.target_pose_path,
+                intrinsics_path=args.warp_intrinsics_path,
+                surfel_index_path=args.warp_surfel_index,
+                surfel_sequence_path=args.warp_surfel_sequence,
+                latent_length=output_length,
+                rgb_length=int(batch["source_video"].shape[1]),
+                frames_per_block=frames_per_block,
+                latent_hw=(
+                    int(target_latent.shape[-2]),
+                    int(target_latent.shape[-1]),
+                ),
+                image_hw=(
+                    int(source_video_bcthw.shape[-2]),
+                    int(source_video_bcthw.shape[-1]),
+                ),
+                selected_layers=selected_canonical_layers,
+                selected_step_indices=mapkv_config.selected_step_indices,
+                alpha=mapkv_config.alpha,
+                device=device,
+                dtype=dtype,
+                min_history_gap_chunks=args.warp_min_history_gap,
+                memory_dilation_kernel=args.warp_memory_dilation_kernel,
+                query_feather_kernel=args.warp_query_feather_kernel,
+            )
+        )
+        save_canonical_audit(canonical_audit, output_root)
+    elif args.warp_reencode_recent or args.continuous_virtual_recent:
         if not mapkv_config.enabled or mapkv_config.mode != "oracle":
             raise ValueError(
                 "Warp-reencode requires enabled manual oracle mode with a fixed source"
@@ -744,7 +832,20 @@ def main() -> None:
                     query_gate_mode=(
                         "surfel_exact"
                         if args.continuous_query_gate == "surfel"
-                        else "global"
+                        else (
+                            "surfel_support_preserving"
+                            if args.continuous_query_gate == "support_preserving"
+                            else "global"
+                        )
+                    ),
+                    mask_policy=args.continuous_mask_policy,
+                    memory_dilation_kernel=args.warp_memory_dilation_kernel,
+                    query_feather_kernel=args.warp_query_feather_kernel,
+                    historical_representation=args.warp_history_representation,
+                    vae=(
+                        pipeline.vae
+                        if args.warp_history_representation == "rgb_warp_vae"
+                        else None
                     ),
                 )
             )
@@ -821,6 +922,7 @@ def main() -> None:
             memory_contexts=memory_contexts or None,
             virtual_recent_contexts=virtual_recent_contexts or None,
             latent_block_interventions=latent_block_interventions or None,
+            conditional_dict=inference_conditioning,
         )
     torch.cuda.synchronize(device)
     inference_seconds = time.perf_counter() - inference_started
@@ -1133,6 +1235,10 @@ def main() -> None:
                 "surfel_sequence": args.warp_surfel_sequence,
                 "min_history_gap_chunks": args.warp_min_history_gap,
                 "feather_kernel": args.warp_feather_kernel,
+                "memory_mask_policy": args.continuous_mask_policy,
+                "memory_dilation_kernel": args.warp_memory_dilation_kernel,
+                "query_feather_kernel": args.warp_query_feather_kernel,
+                "historical_representation": args.warp_history_representation,
                 "short_term_recent": (
                     args.continuous_recent_fallback
                     if args.continuous_virtual_recent
@@ -1149,6 +1255,10 @@ def main() -> None:
                     str(target): audit
                     for target, audit in pipeline.last_virtual_recent_audits.items()
                 },
+            },
+            "canonical_kv": {
+                "enabled": args.canonical_kv_readdress,
+                "audit": canonical_audit,
             },
         },
         "latent_control": {

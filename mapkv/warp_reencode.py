@@ -150,6 +150,36 @@ def feather_coverage(
     return smooth.reshape(batch, frames, height, width).clamp(0, 1)
 
 
+def strong_memory_coverage(
+    hard_coverage: torch.Tensor,
+    dilation_kernel: int = 3,
+) -> torch.Tensor:
+    """Build a binary, support-preserving memory-composition mask.
+
+    The old WRE path averaged the projected surfel mask before both latent
+    composition and attention gating.  This path keeps the historical core at
+    one and only expands it by a small, explicit morphology operation.
+    """
+    if dilation_kernel < 1 or dilation_kernel % 2 == 0:
+        raise ValueError("memory dilation kernel must be a positive odd integer")
+    if hard_coverage.ndim != 4:
+        raise ValueError(
+            "hard_coverage must be [B,F,H,W], got "
+            f"{tuple(hard_coverage.shape)}"
+        )
+    binary = (hard_coverage.float() > 0).to(dtype=torch.float32)
+    if dilation_kernel == 1:
+        return binary
+    batch, frames, height, width = binary.shape
+    dilated = F.max_pool2d(
+        binary.reshape(batch * frames, 1, height, width),
+        dilation_kernel,
+        stride=1,
+        padding=dilation_kernel // 2,
+    )
+    return dilated.reshape(batch, frames, height, width)
+
+
 def warp_latent(
     historical_latent: torch.Tensor, grid: torch.Tensor
 ) -> torch.Tensor:
@@ -209,6 +239,14 @@ class WarpReencodePlan:
     source_target_translation: tuple[float, ...] = ()
     recent_target_to_source_grid: torch.Tensor | None = None
     recent_coverage: torch.Tensor | None = None
+    hard_coverage: torch.Tensor | None = None
+    query_coverage: torch.Tensor | None = None
+    query_feather_kernel: int = 1
+    historical_representation: str = "latent_warp"
+    historical_is_target_aligned: bool = False
+    rgb_preview_source: torch.Tensor | None = None
+    rgb_preview_target: torch.Tensor | None = None
+    rgb_warp_coverage_preview: torch.Tensor | None = None
     query_gate_mode: str = "global"
     mode: str = "block_on_warp_reencode"
     geometry_audit: dict = field(default_factory=dict)
@@ -225,7 +263,11 @@ class WarpReencodePlan:
         historical = self.historical_latent.to(
             device=current_recent.device, dtype=current_recent.dtype
         )
-        warped = warp_latent(historical, self.target_to_source_grid)
+        warped = (
+            historical
+            if self.historical_is_target_aligned
+            else warp_latent(historical, self.target_to_source_grid)
+        )
         if self.recent_target_to_source_grid is None:
             warped_recent = current_recent
         else:
@@ -251,8 +293,27 @@ class WarpReencodePlan:
             "warped_recent": warped_recent.detach().cpu(),
             "virtual_recent": virtual.detach().cpu(),
             "coverage": coverage.detach().cpu(),
+            "memory_coverage": coverage.detach().cpu(),
             "target_to_source_grid": self.target_to_source_grid.detach().cpu(),
         }
+        if self.rgb_preview_source is not None:
+            self.artifacts["rgb_preview_source"] = (
+                self.rgb_preview_source.detach().cpu()
+            )
+        if self.rgb_preview_target is not None:
+            self.artifacts["rgb_preview_target"] = (
+                self.rgb_preview_target.detach().cpu()
+            )
+        if self.rgb_warp_coverage_preview is not None:
+            self.artifacts["rgb_warp_coverage_preview"] = (
+                self.rgb_warp_coverage_preview.detach().cpu()
+            )
+        if self.hard_coverage is not None:
+            self.artifacts["hard_coverage"] = self.hard_coverage.detach().cpu()
+        if self.query_coverage is not None:
+            self.artifacts["query_coverage_source"] = (
+                self.query_coverage.detach().cpu()
+            )
         if self.recent_target_to_source_grid is not None:
             self.artifacts["recent_target_to_source_grid"] = (
                 self.recent_target_to_source_grid.detach().cpu()
@@ -272,9 +333,17 @@ class WarpReencodePlan:
         self.audit.update(
             {
                 "mode": self.mode,
+                "historical_representation": self.historical_representation,
+                "historical_is_target_aligned": self.historical_is_target_aligned,
                 "target_block": int(self.target_block),
                 "source_chunk": int(self.source_chunk),
                 "coverage_fraction": float(coverage.mean().item()),
+                "memory_coverage_fraction": float(coverage.mean().item()),
+                "hard_coverage_fraction": (
+                    None
+                    if self.hard_coverage is None
+                    else float(self.hard_coverage.float().mean().item())
+                ),
                 "historical_vs_current_recent_overlap_l1": historical_delta,
                 "virtual_vs_current_recent_l1": float(
                     (virtual.float() - current_recent.float()).abs().mean().item()
@@ -315,10 +384,19 @@ class WarpReencodePlan:
         writer_audit: dict,
     ) -> MemoryContext:
         self.audit["writer"] = writer_audit
-        if self.query_gate_mode not in {"global", "surfel_exact"}:
+        if self.query_gate_mode not in {
+            "global",
+            "surfel_exact",
+            "surfel_support_preserving",
+        }:
             raise ValueError(
                 f"Unsupported Virtual Recent query gate: {self.query_gate_mode}"
             )
+        query_coverage = (
+            self.coverage
+            if self.query_coverage is None
+            else self.query_coverage
+        )
         context = make_memory_context(
             target_block=self.target_block,
             source_chunk=self.source_chunk,
@@ -328,10 +406,10 @@ class WarpReencodePlan:
             alpha=self.alpha,
             injection_mode="replace_recent_delta",
             gate_mode=self.query_gate_mode,
-            smooth_kernel=1,
+            smooth_kernel=self.query_feather_kernel,
             coverage=(
-                self.coverage
-                if self.query_gate_mode == "surfel_exact"
+                query_coverage
+                if self.query_gate_mode != "global"
                 else None
             ),
         )
@@ -342,7 +420,12 @@ class WarpReencodePlan:
                 "attention_query_gate_mode": self.query_gate_mode,
                 "query_gate_uses_latent_composition_mask": (
                     self.query_gate_mode == "surfel_exact"
+                    and query_coverage is self.coverage
                 ),
+                "memory_and_query_masks_split": (
+                    self.query_gate_mode == "surfel_support_preserving"
+                ),
+                "query_feather_kernel": int(self.query_feather_kernel),
             }
         )
         self.memory_context = context
@@ -557,6 +640,11 @@ def build_continuous_virtual_recent_plans(
     min_history_gap_chunks: int = 2,
     warp_short_term_recent: bool = True,
     query_gate_mode: str = "global",
+    mask_policy: str = "legacy_soft",
+    memory_dilation_kernel: int = 3,
+    query_feather_kernel: int = 3,
+    historical_representation: str = "latent_warp",
+    vae=None,
 ) -> tuple[dict[int, WarpReencodePlan], list[dict]]:
     """Build visibility-driven Virtual Recent plans for every causal block.
 
@@ -570,10 +658,26 @@ def build_continuous_virtual_recent_plans(
         raise ValueError(
             "Long-term memory must exclude the immediate recent chunk"
         )
-    if query_gate_mode not in {"global", "surfel_exact"}:
+    if query_gate_mode not in {
+        "global",
+        "surfel_exact",
+        "surfel_support_preserving",
+    }:
         raise ValueError(
             f"Unsupported continuous query gate mode: {query_gate_mode}"
         )
+    if mask_policy not in {"legacy_soft", "strong_core"}:
+        raise ValueError(f"Unsupported continuous mask policy: {mask_policy}")
+    if mask_policy == "strong_core" and query_gate_mode != "surfel_support_preserving":
+        raise ValueError(
+            "strong_core mask policy requires surfel_support_preserving query gate"
+        )
+    if historical_representation not in {"latent_warp", "rgb_warp_vae"}:
+        raise ValueError(
+            f"Unsupported historical representation: {historical_representation}"
+        )
+    if historical_representation == "rgb_warp_vae" and vae is None:
+        raise ValueError("rgb_warp_vae requires the native Wan VAE")
     source_path = Path(source_latents_path).resolve()
     payload = torch.load(source_path, map_location="cpu", weights_only=True)
     if isinstance(payload, dict):
@@ -593,6 +697,17 @@ def build_continuous_virtual_recent_plans(
     historical = payload[:, source_start:source_stop].to(
         device=device, dtype=dtype
     )
+    historical_rgb = None
+    if historical_representation == "rgb_warp_vae":
+        with torch.no_grad():
+            historical_rgb = (
+                vae.decode_to_pixel(historical, use_cache=False) * 0.5 + 0.5
+            ).clamp(0, 1)
+        if historical_rgb.ndim != 5 or historical_rgb.shape[2] != 3:
+            raise RuntimeError(
+                "Native VAE decode must return [B,T,3,H,W], got "
+                f"{tuple(historical_rgb.shape)}"
+            )
     poses = np.load(Path(target_pose_path).resolve()).astype(np.float64)
     if poses.shape != (rgb_length, 4, 4):
         raise ValueError(
@@ -722,16 +837,70 @@ def build_continuous_virtual_recent_plans(
                 )
             )
             per_frame_geometry.append(geometry)
+        plan_historical = historical
+        rgb_preview_source = None
+        rgb_preview_target = None
+        rgb_warp_coverage_preview = None
+        if historical_representation == "rgb_warp_vae":
+            rgb_frames = int(historical_rgb.shape[1])
+            source_dense_rgb = np.rint(
+                np.linspace(source_rgb[0], source_rgb[-1], rgb_frames)
+            ).astype(np.int64)
+            target_dense_rgb = np.rint(
+                np.linspace(target_rgb[0], target_rgb[-1], rgb_frames)
+            ).astype(np.int64)
+            rgb_grids = []
+            rgb_valid = []
+            for source_index, target_index in zip(
+                source_dense_rgb, target_dense_rgb
+            ):
+                rgb_grid, rgb_mask, _ = build_rotation_target_to_source_grid(
+                    poses[int(source_index)],
+                    poses[int(target_index)],
+                    image_intrinsics,
+                    image_intrinsics,
+                    image_hw,
+                )
+                rgb_grids.append(rgb_grid)
+                rgb_valid.append(rgb_mask)
+            rgb_grid_tensor = torch.stack(rgb_grids).to(device=device)
+            warped_rgb = warp_latent(historical_rgb, rgb_grid_tensor)
+            with torch.no_grad():
+                plan_historical = vae.encode_to_latent(
+                    (warped_rgb * 2.0 - 1.0)
+                    .to(dtype=dtype)
+                    .permute(0, 2, 1, 3, 4)
+                ).to(device=device, dtype=dtype)
+            if plan_historical.shape != historical.shape:
+                raise RuntimeError(
+                    "RGB-warp VAE encode changed historical block shape: "
+                    f"{tuple(plan_historical.shape)} != {tuple(historical.shape)}"
+                )
+            preview_index = rgb_frames // 2
+            rgb_preview_source = historical_rgb[:, preview_index]
+            rgb_preview_target = warped_rgb[:, preview_index]
+            rgb_warp_coverage_preview = torch.stack(rgb_valid)[
+                preview_index
+            ]
         hard_memory_coverage = torch.stack(surfel_masks).unsqueeze(0)
-        coverage = feather_coverage(
-            hard_memory_coverage, feather_kernel
-        ).to(device=device)
+        if mask_policy == "strong_core":
+            coverage = strong_memory_coverage(
+                hard_memory_coverage, memory_dilation_kernel
+            ).to(device=device)
+        else:
+            coverage = feather_coverage(
+                hard_memory_coverage, feather_kernel
+            ).to(device=device)
         if warp_short_term_recent:
             mode = "continuous_geometry_reprojected_virtual_recent"
         elif query_gate_mode == "global":
             mode = "continuous_raw_recent_warp_reencode"
+        elif mask_policy == "strong_core":
+            mode = "strong_core_masked_continuous_wre"
         else:
             mode = "masked_continuous_warp_reencode"
+        if historical_representation == "rgb_warp_vae":
+            mode = "strong_core_rgb_warp_vae_wre"
         selection = {
             "target_chunk": target_chunk,
             "source_chunk": int(source_chunk),
@@ -741,6 +910,9 @@ def build_continuous_virtual_recent_plans(
             "hard_coverage_fraction": float(
                 hard_memory_coverage.mean().item()
             ),
+            "memory_mask_policy": mask_policy,
+            "memory_dilation_kernel": int(memory_dilation_kernel),
+            "query_feather_kernel": int(query_feather_kernel),
             "source_rgb_indices": list(source_rgb),
             "recent_rgb_indices": list(recent_rgb),
             "target_rgb_indices": list(target_rgb),
@@ -754,6 +926,11 @@ def build_continuous_virtual_recent_plans(
             "same_mask_controls_latent_and_attention": (
                 query_gate_mode == "surfel_exact"
             ),
+            "memory_and_query_masks_split": (
+                query_gate_mode == "surfel_support_preserving"
+            ),
+            "historical_representation": historical_representation,
+            "rgb_warp_before_vae": historical_representation == "rgb_warp_vae",
             "geometry_frames": per_frame_geometry,
         }
         if not bool(hard_memory_coverage.any()):
@@ -770,7 +947,7 @@ def build_continuous_virtual_recent_plans(
         plan = WarpReencodePlan(
             target_block=target_chunk,
             source_chunk=int(source_chunk),
-            historical_latent=historical,
+            historical_latent=plan_historical,
             target_to_source_grid=torch.stack(historical_grids).to(
                 device=device
             ),
@@ -785,14 +962,29 @@ def build_continuous_virtual_recent_plans(
             source_target_translation=tuple(translations),
             recent_target_to_source_grid=recent_grid_tensor,
             recent_coverage=recent_coverage,
+            hard_coverage=hard_memory_coverage.to(device=device),
+            query_coverage=coverage,
+            query_feather_kernel=(
+                int(query_feather_kernel)
+                if query_gate_mode == "surfel_support_preserving"
+                else 1
+            ),
             query_gate_mode=query_gate_mode,
             mode=mode,
+            historical_representation=historical_representation,
+            historical_is_target_aligned=(
+                historical_representation == "rgb_warp_vae"
+            ),
+            rgb_preview_source=rgb_preview_source,
+            rgb_preview_target=rgb_preview_target,
+            rgb_warp_coverage_preview=rgb_warp_coverage_preview,
             geometry_audit={
                 "coordinate_frame": sequence.get("coordinate_frame"),
                 "pose_source": "known_control_c2w_to_cut3r_c2w",
                 "surfel_index": str(Path(surfel_index_path).resolve()),
                 "surfel_sequence": str(sequence_path),
                 "source_candidate_only": True,
+                "memory_mask_policy": mask_policy,
                 "per_frame": per_frame_geometry,
             },
         )
@@ -855,14 +1047,42 @@ def save_warp_reencode_artifacts(
         center = decoded.shape[1] // 2
         for index, name in enumerate(names):
             _save_rgb_tensor(decoded[index, center], target_root / f"{name}.png")
-        coverage = plan.artifacts["coverage"].float().mean(dim=(0, 1, 2))
-        coverage_image = Image.fromarray(
-            (coverage.numpy().clip(0, 1) * 255).round().astype(np.uint8)
-        ).resize(
-            (int(decoded.shape[-1]), int(decoded.shape[-2])),
-            Image.Resampling.BILINEAR,
-        )
-        coverage_image.save(target_root / "coverage.png")
+        if "rgb_preview_source" in plan.artifacts:
+            _save_rgb_tensor(
+                plan.artifacts["rgb_preview_source"][0],
+                target_root / "rgb_history_source.png",
+            )
+        if "rgb_preview_target" in plan.artifacts:
+            _save_rgb_tensor(
+                plan.artifacts["rgb_preview_target"][0],
+                target_root / "rgb_history_warped_to_target.png",
+            )
+        if "rgb_warp_coverage_preview" in plan.artifacts:
+            rgb_mask = plan.artifacts["rgb_warp_coverage_preview"].float()
+            while rgb_mask.ndim > 2:
+                rgb_mask = rgb_mask.mean(dim=0)
+            Image.fromarray(
+                (rgb_mask.numpy().clip(0, 1) * 255).round().astype(np.uint8)
+            ).save(target_root / "rgb_warp_coverage.png")
+        mask_artifacts = {
+            "coverage": "coverage.png",
+            "hard_coverage": "M_hard.png",
+            "memory_coverage": "M_memory.png",
+            "query_coverage_source": "M_query_source.png",
+            "query_gate_tokens": "M_query.png",
+        }
+        for key, filename in mask_artifacts.items():
+            if key not in plan.artifacts:
+                continue
+            mask = plan.artifacts[key].float()
+            while mask.ndim > 2:
+                mask = mask.mean(dim=0)
+            Image.fromarray(
+                (mask.numpy().clip(0, 1) * 255).round().astype(np.uint8)
+            ).resize(
+                (int(decoded.shape[-1]), int(decoded.shape[-2])),
+                Image.Resampling.NEAREST if key == "hard_coverage" else Image.Resampling.BILINEAR,
+            ).save(target_root / filename)
         if "recent_coverage" in plan.artifacts:
             recent_coverage = plan.artifacts["recent_coverage"].float().mean(
                 dim=(0, 1)
@@ -913,6 +1133,7 @@ __all__ = [
     "build_rotation_target_to_source_grid",
     "build_warp_reencode_plans",
     "feather_coverage",
+    "strong_memory_coverage",
     "infer_intrinsic_image_hw",
     "latent_to_rgb_index",
     "load_intrinsics",

@@ -14,6 +14,30 @@ These rules apply to every MapKV experiment and report in this repository.
 3. Report videos stay as relative external files; never base64-embed video.
    Provide synchronized Play/Pause/Reset controls.
 
+## Pipeline and architecture reporting
+
+1. Every report must maintain a complete, readable end-to-end pipeline view,
+   from experiment inputs through generation, geometry/addressing, memory
+   payload, context injection, output, and evaluation. Do not show only the
+   newest module in isolation.
+2. Prefer a rendered graph or flow diagram. The report must still include a
+   concise text/table representation so architecture remains reviewable when
+   images are unavailable.
+3. Label the current experimental focus in Chinese. Keep unchanged modules in
+   the graph with lower emphasis so the user can understand the whole system.
+4. Every added, modified, removed, or replaced architecture component must be
+   visually marked in the graph and listed with:
+   - previous behavior;
+   - current behavior;
+   - affected files/modules; and
+   - why the change was made.
+5. If a run has no architecture change, explicitly state `本次无架构变化`.
+6. Use `mapkv.report_framework` for MapKV reports and always emit:
+   - `architecture_state.json`;
+   - `architecture_changes.json`;
+   - `architecture.md`; and
+   - `assets/architecture_graph.svg`.
+
 ## Surfel visualization defaults
 
 1. Do not use chunk-ID center/disk plots as the primary surfel visualization.

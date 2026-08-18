@@ -6,6 +6,30 @@ report:
   short_reentry_clip_is_supplemental: true
   embed_videos_as_base64: false
 
+architecture:
+  framework: mapkv.report_framework
+  complete_pipeline_required: true
+  graph_required: true
+  graph_language: zh-CN
+  retain_unchanged_modules: true
+  highlight_current_focus: true
+  mark_change_types:
+    - added
+    - modified
+    - removed
+    - unchanged
+  require_change_annotation_fields:
+    - before
+    - after
+    - affected_files
+    - rationale
+  no_change_text: 本次无架构变化
+  required_artifacts:
+    - architecture_state.json
+    - architecture_changes.json
+    - architecture.md
+    - assets/architecture_graph.svg
+
 surfel:
   primary_color_source: generated_historical_rgb_observations
   primary_views:

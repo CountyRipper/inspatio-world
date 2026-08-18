@@ -22,6 +22,7 @@ class ActiveLayerMemory:
     injection_mode: str = "replace_recent_delta"
     ref_k: torch.Tensor | None = None
     ref_v: torch.Tensor | None = None
+    memory_slot_gate: torch.Tensor | None = None
 
 
 def _smooth_gate(gate: torch.Tensor, kernel_size: int) -> torch.Tensor:
@@ -95,6 +96,57 @@ def normalize_coverage(
     return coverage.clamp(0, 1)
 
 
+def support_preserving_query_gate(
+    coverage: torch.Tensor,
+    *,
+    batch: int,
+    frames: int,
+    token_hw: tuple[int, int],
+    device: torch.device,
+    feather_kernel: int = 3,
+) -> torch.Tensor:
+    """Tokenize geometry support without averaging small objects away.
+
+    ``adaptive_max_pool2d`` preserves every supported latent cell when the
+    query grid is coarser.  A soft boundary is then added outside that hard
+    token core, while ``maximum`` keeps the supported interior at one.
+    """
+    if feather_kernel < 1 or feather_kernel % 2 == 0:
+        raise ValueError("query feather kernel must be a positive odd integer")
+    coverage = torch.as_tensor(coverage, dtype=torch.float32, device=device)
+    if coverage.ndim == 2:
+        coverage = coverage[None, None]
+    elif coverage.ndim == 3:
+        coverage = coverage[None]
+    if coverage.ndim != 4:
+        raise ValueError(
+            f"coverage must have 2, 3, or 4 dimensions, got {coverage.ndim}"
+        )
+    if coverage.shape[0] == 1 and batch > 1:
+        coverage = coverage.expand(batch, -1, -1, -1)
+    if coverage.shape[1] == 1 and frames > 1:
+        coverage = coverage.expand(-1, frames, -1, -1)
+    if coverage.shape[:2] != (batch, frames):
+        raise ValueError(
+            f"coverage batch/frame shape {tuple(coverage.shape[:2])} != "
+            f"{(batch, frames)}"
+        )
+    source_hw = tuple(int(value) for value in coverage.shape[-2:])
+    flat = coverage.reshape(batch * frames, 1, *source_hw).clamp(0, 1)
+    if source_hw != tuple(token_hw):
+        if source_hw[0] >= token_hw[0] and source_hw[1] >= token_hw[1]:
+            flat = F.adaptive_max_pool2d(flat, token_hw)
+        else:
+            flat = F.interpolate(flat, size=token_hw, mode="nearest")
+    hard = (flat > 0).to(dtype=torch.float32)
+    hard = hard.reshape(batch, frames, *token_hw)
+    if feather_kernel == 1:
+        return hard
+    expanded = _dilate_gate(hard, feather_kernel)
+    feathered = _smooth_gate(expanded, feather_kernel)
+    return torch.maximum(hard, feathered).clamp(0, 1)
+
+
 @dataclass(frozen=True)
 class MemoryContext:
     """Immutable activation plan for one target latent block."""
@@ -111,6 +163,7 @@ class MemoryContext:
     smooth_kernel: int = 3
     coverage: torch.Tensor | None = None
     query_gate: torch.Tensor | None = None
+    memory_slot_gate: torch.Tensor | None = None
     active_step: int | None = None
     num_steps: int | None = None
     audit_log: list[dict] = field(default_factory=list, compare=False)
@@ -148,6 +201,19 @@ class MemoryContext:
                 frames=frames,
                 token_hw=token_hw,
                 device=mask_block.device,
+            )
+        elif self.gate_mode == "surfel_support_preserving":
+            if self.coverage is None:
+                raise ValueError(
+                    "surfel_support_preserving gate requires a coverage mask"
+                )
+            gate = support_preserving_query_gate(
+                self.coverage,
+                batch=batch,
+                frames=frames,
+                token_hw=token_hw,
+                device=mask_block.device,
+                feather_kernel=self.smooth_kernel,
             )
         elif self.gate_mode in {"surfel", "surfel_ref_blind"}:
             if self.coverage is None:
@@ -206,6 +272,7 @@ class MemoryContext:
             injection_mode=self.injection_mode,
             ref_k=ref_k,
             ref_v=ref_v,
+            memory_slot_gate=self.memory_slot_gate,
         )
 
     @property
@@ -226,9 +293,15 @@ def make_memory_context(
     reference_layer_payloads: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     smooth_kernel: int,
     coverage: torch.Tensor | None = None,
+    memory_slot_gate: torch.Tensor | None = None,
 ) -> MemoryContext | None:
     if (
-        gate_mode in {"surfel", "surfel_ref_blind", "surfel_exact"}
+        gate_mode in {
+            "surfel",
+            "surfel_ref_blind",
+            "surfel_exact",
+            "surfel_support_preserving",
+        }
         and coverage is not None
         and not bool(coverage.any())
     ):
@@ -245,4 +318,5 @@ def make_memory_context(
         reference_layer_payloads=reference_layer_payloads,
         smooth_kernel=smooth_kernel,
         coverage=coverage,
+        memory_slot_gate=memory_slot_gate,
     )

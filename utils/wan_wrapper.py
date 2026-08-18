@@ -376,6 +376,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         render_latent_input: Optional[torch.Tensor] = None,
         freqs_offset: int = 0,
         memory_context=None,
+        canonical_capture=None,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -405,6 +406,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             )
             if memory_context is not None:
                 model_kwargs["memory_context"] = memory_context
+            if canonical_capture is not None:
+                model_kwargs["canonical_capture"] = canonical_capture
             flow_pred = self.model(**model_kwargs).permute(0, 2, 1, 3, 4)
             if kv_size[1]<0:
                 return flow_pred

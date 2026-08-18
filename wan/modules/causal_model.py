@@ -58,6 +58,7 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache=None,  
         kv_size=(0,0),
         layer_memory=None,
+        canonical_capture=None,
     ):
         r"""
         Args:
@@ -68,13 +69,15 @@ class CausalWanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        def qkv_fn(x): 
-            q = self.norm_q(self.q(x)).view(b, s, n, d)
-            k = self.norm_k(self.k(x)).view(b, s, n, d)
+        def qkv_fn(x):
+            q_projected = self.q(x)
+            k_projected = self.k(x)
+            q = self.norm_q(q_projected).view(b, s, n, d)
+            k = self.norm_k(k_projected).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
-            return q, k, v
+            return q, k, v, k_projected
 
-        q, k, v = qkv_fn(x)
+        q, k, v, k_projected = qkv_fn(x)
 
         roped_query = rope_apply_given_freqs(q, freqs).type_as(v)
         roped_key = rope_apply_given_freqs(k, freqs).type_as(v)
@@ -84,6 +87,11 @@ class CausalWanSelfAttention(nn.Module):
         assert kv_cache is not None, "kv_cache must be provided when kv_size > 0" 
         if kv_size[1] < 0:
             assert layer_memory is None, "Memory injection is forbidden during the context writer pass"
+            if canonical_capture is not None:
+                canonical_capture["k_projected_pre_norm"] = (
+                    k_projected.detach().clone()
+                )
+                canonical_capture["v"] = v.detach().clone()
             len_x = roped_query.shape[1]
             kv_cache["k"][:, kv_size[0]:kv_size[0]+len_x] = roped_key
             kv_cache["v"][:, kv_size[0]:kv_size[0]+len_x] = v
@@ -169,6 +177,36 @@ class CausalWanSelfAttention(nn.Module):
                         aux_v = torch.cat([ref_v, layer_memory.v, v], dim=1)
                         a_mem = attention(roped_query, aux_k, aux_v)
                         memory_signal = a_mem - a_base
+                    elif layer_memory.injection_mode == "canonical_recent_delta":
+                        if layer_memory.memory_slot_gate is None:
+                            raise ValueError(
+                                "canonical_recent_delta requires a memory-slot gate"
+                            )
+                        slot_gate = layer_memory.memory_slot_gate
+                        if slot_gate.shape != recent_shape[:2]:
+                            raise ValueError(
+                                "Canonical memory-slot gate shape "
+                                f"{tuple(slot_gate.shape)} != {tuple(recent_shape[:2])}"
+                            )
+                        slot_gate = slot_gate[:, :, None, None].to(
+                            device=cached_k.device, dtype=cached_k.dtype
+                        )
+                        recent_k = cached_k[:, slot_len:2 * slot_len]
+                        recent_v = cached_v[:, slot_len:2 * slot_len]
+                        virtual_k = (
+                            slot_gate * layer_memory.k
+                            + (1.0 - slot_gate) * recent_k
+                        )
+                        virtual_v = (
+                            slot_gate * layer_memory.v
+                            + (1.0 - slot_gate) * recent_v
+                        )
+                        ref_k = cached_k[:, :slot_len]
+                        ref_v = cached_v[:, :slot_len]
+                        aux_k = torch.cat([ref_k, virtual_k, roped_key], dim=1)
+                        aux_v = torch.cat([ref_v, virtual_v, v], dim=1)
+                        a_mem = attention(roped_query, aux_k, aux_v)
+                        memory_signal = a_mem - a_base
                     elif layer_memory.injection_mode == "selected_recent_delta":
                         ref_k = cached_k[:, :slot_len]
                         ref_v = cached_v[:, :slot_len]
@@ -223,6 +261,13 @@ class CausalWanSelfAttention(nn.Module):
                         layer_memory.audit_record.update(
                             {
                                 "injection_mode": layer_memory.injection_mode,
+                                "memory_slot_gate_fraction": (
+                                    None
+                                    if layer_memory.memory_slot_gate is None
+                                    else float(
+                                        layer_memory.memory_slot_gate.float().mean().item()
+                                    )
+                                ),
                                 "attention_base_abs_mean": float(
                                     a_base.float().abs().mean().item()
                                 ),
@@ -299,6 +344,7 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         kv_size=(0,0),
         layer_memory=None,
+        canonical_capture=None,
     ):
         r"""
         Args:
@@ -318,6 +364,7 @@ class CausalWanAttentionBlock(nn.Module):
             kv_cache=kv_cache,
             kv_size=kv_size,
             layer_memory=layer_memory,
+            canonical_capture=canonical_capture,
         )
 
         x = x + y * e[2]
@@ -498,6 +545,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         render_latent_input: torch.Tensor = None,
         freqs_offset: int = 0,
         memory_context=None,
+        canonical_capture=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -591,6 +639,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 layer_memory = memory_context.for_layer(block_index, len(self.blocks))
                 if layer_memory is not None:
                     kwargs['layer_memory'] = layer_memory
+            kwargs.pop('canonical_capture', None)
+            if canonical_capture is not None and block_index in canonical_capture:
+                if kv_size[1] >= 0:
+                    raise ValueError(
+                        "Canonical K/V capture is only valid during a context writer pass"
+                    )
+                kwargs['canonical_capture'] = canonical_capture[block_index]
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x= torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),

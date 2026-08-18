@@ -124,3 +124,46 @@ default output is
 The previous warped-short-term/global-delta failure remains reproducible by
 passing `--continuous_recent_fallback warped --continuous_query_gate global`
 to `inference_mapkv_proto.py`; its existing result directory is not replaced.
+
+## Report architecture framework
+
+All new MapKV reports use `mapkv.report_framework`. A report must describe the
+complete path from controlled inputs through generation, geometry/addressing,
+memory payload, context/attention, output, and evaluation. The current focus is
+marked in Chinese; unchanged modules remain visible; added/modified/removed
+modules are color-coded and paired with a before/after change table.
+
+Every report emits:
+
+    architecture_state.json
+    architecture_changes.json
+    architecture.md
+    assets/architecture_graph.svg
+
+The validator rejects incomplete role coverage, unknown graph edges, changed
+nodes without annotations, and change records without affected files or a
+rationale. Project-wide defaults live in `AGENTS.md` and
+`mapkv/report_preferences.yaml`.
+
+## Identity recovery stage
+
+Run the three controlled representation ablations with:
+
+    bash scripts/run_mapkv_identity_recovery.sh --stage full --gpu 0
+
+The runner freezes B1 chunk 8, known-pose CUT3R geometry, continuous
+visibility, all transformer layers, all four denoising steps, and `alpha=1`.
+It changes one variable at a time:
+
+1. `strong_core_latent_wre` separates a binary/dilated `M_memory` from the
+   support-preserving, soft-boundary `M_query`;
+2. `rgb_warp_vae_wre` applies the exact camera warp to lossless generated RGB
+   before the native WanVAE encode;
+3. `canonical_kv` captures writer-only projected pre-normalization K plus V,
+   warps them into the target token grid, applies `norm_k` and target Recent
+   T/H/W RoPE, then retains runtime Recent outside the memory-slot mask.
+
+Canonical capture is forbidden during denoising and must reconstruct source
+post-RoPE K/V exactly before generation. The report contains complete B1-to-B2
+videos, Chinese method labels, real-RGB surfel views, object identity crops,
+and the full architecture/change graph.

@@ -205,6 +205,7 @@ class CausalInferencePipeline(torch.nn.Module):
         memory_contexts: Optional[Mapping[int, object]] = None,
         virtual_recent_contexts: Optional[Mapping[int, object]] = None,
         latent_block_interventions: Optional[Mapping[int, object]] = None,
+        conditional_dict: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -235,9 +236,8 @@ class CausalInferencePipeline(torch.nn.Module):
             )
 
         num_output_frames = num_frames   # add the initial latent frames
-        conditional_dict = self.text_encoder(
-            text_prompts=text_prompts
-        )
+        if conditional_dict is None:
+            conditional_dict = self.text_encoder(text_prompts=text_prompts)
  
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],
@@ -341,6 +341,15 @@ class CausalInferencePipeline(torch.nn.Module):
                 self.last_query_gates[block_id] = block_memory.query_gate.detach().cpu()
                 if virtual_plan is not None:
                     gate = block_memory.query_gate.float()
+                    virtual_plan.artifacts["query_gate_tokens"] = (
+                        gate.reshape(
+                            gate.shape[0],
+                            self.num_frame_per_block,
+                            *layout["token_hw"],
+                        )
+                        .detach()
+                        .cpu()
+                    )
                     virtual_plan.audit.update(
                         {
                             "query_gate_token_fraction": float(
@@ -404,6 +413,7 @@ class CausalInferencePipeline(torch.nn.Module):
         conditional_dict,
         selected_layers,
         render_block: torch.Tensor,
+        canonical_capture: dict[int, dict[str, torch.Tensor]] | None = None,
     ) -> tuple[dict[int, tuple[torch.Tensor, torch.Tensor]], dict]:
         """Run the native [Ref, Recent] t=0 writer in an isolated cache.
 
@@ -469,6 +479,7 @@ class CausalInferencePipeline(torch.nn.Module):
             render_latent_input=render_block,
             kv_size=(0, -1),
             freqs_offset=0,
+            canonical_capture=canonical_capture,
         )
         result = {}
         layer_stats = {}

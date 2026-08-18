@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -19,14 +20,24 @@ from mapkv_proto.memory_context import (
     ActiveLayerMemory,
     MemoryContext,
     reference_blind_gate,
+    support_preserving_query_gate,
 )
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
+from mapkv.canonical_kv import _memory_token_gate, _warp_token_payload
 from mapkv.retrieval import GeometryChunkRetriever
+from mapkv.report_framework import (
+    ArchitectureChange,
+    ArchitectureEdge,
+    ArchitectureSnapshot,
+    node,
+    write_architecture_bundle,
+)
 from mapkv.slot_evaluation import _select_best_slot
 from mapkv.warp_reencode import (
     WarpReencodePlan,
     build_continuous_virtual_recent_plans,
     build_rotation_target_to_source_grid,
+    strong_memory_coverage,
     warp_latent,
 )
 from mapkv_proto.reference_kv_bank import ReferenceKVBankWriter
@@ -118,6 +129,32 @@ def test_surfel_exact_gate_tokenizes_same_mask_without_dilation():
     assert int(torch.count_nonzero(gate)) == 3
 
 
+def test_support_preserving_query_gate_keeps_small_historical_object():
+    coverage = torch.zeros(1, 3, 8, 8)
+    coverage[:, :, 3, 3] = 1.0
+    gate = support_preserving_query_gate(
+        coverage,
+        batch=1,
+        frames=3,
+        token_hw=(4, 4),
+        device=torch.device("cpu"),
+        feather_kernel=3,
+    )
+    assert gate.shape == (1, 3, 4, 4)
+    assert float(gate.max()) == 1.0
+    assert torch.all(gate[:, :, 1, 1] == 1.0)
+    assert float(gate.min()) >= 0.0 and float(gate.max()) <= 1.0
+
+
+def test_strong_memory_coverage_preserves_binary_core_and_dilates():
+    hard = torch.zeros(1, 3, 7, 7)
+    hard[:, :, 3, 3] = 1.0
+    memory = strong_memory_coverage(hard, dilation_kernel=3)
+    assert set(memory.unique().tolist()) == {0.0, 1.0}
+    assert int(torch.count_nonzero(memory[0, 0])) == 9
+    assert torch.all(memory[:, :, 3, 3] == 1.0)
+
+
 def test_surfel_rgb_is_sampled_from_real_first_seen_observation(tmp_path):
     image_path = tmp_path / "generated.png"
     Image.new("RGB", (16, 16), (17, 83, 201)).save(image_path)
@@ -163,6 +200,97 @@ def test_surfel_rgb_is_sampled_from_real_first_seen_observation(tmp_path):
     assert chunks.tolist() == [0]
     assert colors.tolist() == [[17, 83, 201]]
     assert stats["invented_colors"] is False
+
+
+def _complete_test_architecture() -> ArchitectureSnapshot:
+    roles = (
+        "input",
+        "generation",
+        "geometry",
+        "address",
+        "payload",
+        "context",
+        "attention",
+        "output",
+        "evaluation",
+    )
+    nodes = tuple(
+        node(
+            id=f"node_{role}",
+            label_zh=f"模块 {role}",
+            label_en=f"{role} module",
+            role=role,
+            column=index,
+            row=0,
+            summary=f"complete {role} stage",
+            change_type="modified" if role == "attention" else "unchanged",
+            focus=role == "attention",
+            files=("mapkv/example.py",),
+        )
+        for index, role in enumerate(roles)
+    )
+    return ArchitectureSnapshot(
+        name="完整测试 Pipeline",
+        focus_zh="测试 attention 模块",
+        focus_en="test attention focus",
+        nodes=nodes,
+        edges=tuple(
+            ArchitectureEdge(nodes[index].id, nodes[index + 1].id)
+            for index in range(len(nodes) - 1)
+        ),
+        changes=(
+            ArchitectureChange(
+                component_id="node_attention",
+                change_type="modified",
+                before="全局作用",
+                after="局部作用",
+                affected_files=("mapkv/example.py",),
+                rationale="验证空间局部性",
+            ),
+        ),
+    )
+
+
+def test_report_framework_rejects_incomplete_pipeline():
+    snapshot = ArchitectureSnapshot(
+        name="incomplete",
+        focus_zh="缺失模块",
+        focus_en="missing modules",
+        nodes=(
+            node(
+                id="only_input",
+                label_zh="输入",
+                label_en="input",
+                role="input",
+                column=0,
+                row=0,
+                summary="input only",
+                focus=True,
+            ),
+        ),
+        edges=(),
+    )
+    with pytest.raises(ValueError, match="missing roles"):
+        snapshot.validate()
+
+
+def test_report_framework_writes_graph_state_and_change_artifacts(tmp_path):
+    snapshot = _complete_test_architecture()
+    paths = write_architecture_bundle(tmp_path, snapshot)
+    assert all(Path(path).is_file() for path in paths.values())
+    svg = (tmp_path / "assets" / "architecture_graph.svg").read_text()
+    assert "本次关注：测试 attention 模块" in svg
+    assert "已修改 · 本次 Focus" in svg
+    state = json.loads((tmp_path / "architecture_state.json").read_text())
+    assert len(state["nodes"]) == 9
+    changes = json.loads(
+        (tmp_path / "architecture_changes.json").read_text()
+    )
+    assert changes[0]["before"] == "全局作用"
+    assert changes[0]["after"] == "局部作用"
+    markdown = (tmp_path / "architecture.md").read_text()
+    assert "完整 Pipeline" in markdown
+    assert "mapkv/example.py" in markdown
 
 
 def test_exact_control_trajectory_is_block_aligned_and_revisits_same_pose():
@@ -470,6 +598,90 @@ def test_auxiliary_attention_is_strictly_opt_in_and_cache_safe(monkeypatch):
     )
     assert [item[0].shape[1] for item in calls] == [6, 5]
     assert not torch.equal(selected_out, baseline)
+
+
+def test_canonical_writer_capture_and_recent_fallback_are_cache_safe(monkeypatch):
+    import wan.modules.causal_model as causal_model
+
+    calls = []
+
+    def fake_attention(q, k, v):
+        calls.append((k.clone(), v.clone()))
+        return q + v.mean(dim=1, keepdim=True)
+
+    monkeypatch.setattr(causal_model, "attention", fake_attention)
+    module = causal_model.CausalWanSelfAttention(
+        dim=4, num_heads=2, qk_norm=False
+    )
+    with torch.no_grad():
+        for projection in (module.q, module.k, module.v, module.o):
+            projection.weight.copy_(torch.eye(4))
+            projection.bias.zero_()
+    x = torch.tensor([[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]])
+    freqs = torch.ones(2, 1, 1, dtype=torch.complex128)
+    writer_cache = {
+        "k": torch.zeros(1, 2, 2, 2),
+        "v": torch.zeros(1, 2, 2, 2),
+    }
+    capture = {}
+    module(
+        x,
+        None,
+        freqs,
+        kv_cache=writer_cache,
+        kv_size=(0, -1),
+        canonical_capture=capture,
+    )
+    torch.testing.assert_close(capture["k_projected_pre_norm"], x)
+    torch.testing.assert_close(capture["v"].flatten(2), x)
+
+    cache = {
+        "k": torch.arange(16, dtype=torch.float32).view(1, 4, 2, 2),
+        "v": torch.arange(16, dtype=torch.float32).view(1, 4, 2, 2) + 20,
+    }
+    before = {key: value.clone() for key, value in cache.items()}
+    calls.clear()
+    memory_k = torch.full((1, 2, 2, 2), -7.0)
+    memory_v = torch.full((1, 2, 2, 2), 77.0)
+    memory = ActiveLayerMemory(
+        k=memory_k,
+        v=memory_v,
+        alpha=1.0,
+        query_gate=torch.ones(1, 2),
+        source_chunk=0,
+        injection_mode="canonical_recent_delta",
+        memory_slot_gate=torch.tensor([[True, False]]),
+    )
+    module(x, None, freqs, kv_cache=cache, kv_size=(0, 4), layer_memory=memory)
+    assert len(calls) == 2
+    auxiliary_k, auxiliary_v = calls[1]
+    torch.testing.assert_close(auxiliary_k[:, 2], memory_k[:, 0])
+    torch.testing.assert_close(auxiliary_v[:, 2], memory_v[:, 0])
+    torch.testing.assert_close(auxiliary_k[:, 3], cache["k"][:, 3])
+    torch.testing.assert_close(auxiliary_v[:, 3], cache["v"][:, 3])
+    for key in cache:
+        torch.testing.assert_close(cache[key], before[key])
+
+
+def test_canonical_token_warp_and_memory_gate_preserve_layout():
+    payload = torch.arange(1 * 2 * 2 * 3 * 4, dtype=torch.float32).reshape(
+        1, 12, 4
+    )
+    yy, xx = torch.meshgrid(
+        torch.arange(2, dtype=torch.float32),
+        torch.arange(3, dtype=torch.float32),
+        indexing="ij",
+    )
+    grid = torch.stack(
+        [2 * (xx + 0.5) / 3 - 1, 2 * (yy + 0.5) / 2 - 1], dim=-1
+    ).repeat(2, 1, 1, 1)
+    warped = _warp_token_payload(payload, grid, frames=2, token_hw=(2, 3))
+    torch.testing.assert_close(warped, payload, rtol=0, atol=1e-5)
+    coverage = torch.zeros(1, 2, 4, 6)
+    coverage[:, :, 1, 1] = 1.0
+    gate = _memory_token_gate(coverage, (2, 3))
+    assert gate.shape == (1, 12)
+    assert int(torch.count_nonzero(gate)) == 2
 
 
 def test_retrieval_plan_loads_selected_token_indices(tmp_path):
