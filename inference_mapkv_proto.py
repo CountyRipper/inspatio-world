@@ -99,13 +99,15 @@ def parse_args() -> argparse.Namespace:
         "--injection_mode",
         choices=(
             "replace_recent_delta",
+            "selected_recent_delta",
             "replace_ref_delta",
             "replace_both_delta",
             "residual_memory_attention",
         ),
     )
     parser.add_argument(
-        "--gate_mode", choices=("global", "ref_blind", "surfel_ref_blind")
+        "--gate_mode",
+        choices=("global", "ref_blind", "surfel", "surfel_ref_blind"),
     )
     parser.add_argument("--retrieval_plan")
     parser.add_argument("--compare_latents_to")
@@ -287,10 +289,12 @@ def _build_memory_contexts(
     reference_payload_cache = {}
     for target_chunk in config.target_chunks:
         coverage = None
+        selected_token_indices = None
         plan_source = None
         if plan is not None:
             plan_source = plan.selected_chunk(target_chunk)
             coverage = plan.load_coverage(target_chunk)
+            selected_token_indices = plan.load_token_indices(target_chunk)
         if config.mode == "oracle":
             source_chunk = config.source_chunk
             if source_chunk is None:
@@ -329,7 +333,7 @@ def _build_memory_contexts(
             raise ValueError(
                 f"Source chunk {source_chunk} is not causally valid for target {target_chunk}"
             )
-        if config.gate.mode == "surfel_ref_blind" and (
+        if config.gate.mode in {"surfel", "surfel_ref_blind"} and (
             coverage is None or not bool(coverage.any())
         ):
             selection["status"] = "memory_off_empty_coverage"
@@ -345,6 +349,31 @@ def _build_memory_contexts(
                 pin_memory=config.pin_memory,
             )
         layer_payloads = payload_cache[source_chunk]
+        if config.injection_mode == "selected_recent_delta":
+            if selected_token_indices is None or not len(selected_token_indices):
+                raise ValueError(
+                    "selected_recent_delta requires selected_token_indices_path "
+                    f"for target {target_chunk}"
+                )
+            first_k = next(iter(layer_payloads.values()))[0]
+            indices = selected_token_indices.to(
+                device=first_k.device, dtype=torch.long
+            )
+            if int(indices.min()) < 0 or int(indices.max()) >= first_k.shape[1]:
+                raise IndexError(
+                    f"Selected token index outside [0,{first_k.shape[1]})"
+                )
+            layer_payloads = {
+                layer: (
+                    k.index_select(1, indices),
+                    v.index_select(1, indices),
+                )
+                for layer, (k, v) in layer_payloads.items()
+            }
+            selection["selected_token_count"] = int(indices.numel())
+            selection["selected_token_fraction"] = float(
+                indices.numel() / first_k.shape[1]
+            )
         reference_layer_payloads = None
         if reference_bank is not None:
             if source_chunk not in reference_payload_cache:

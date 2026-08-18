@@ -80,10 +80,18 @@ def build_control_phases(
     frames_per_block: int = 3,
     requested_speed_degrees_per_frame: float = 0.5,
     distractor: bool = False,
+    revisit_theta_degrees: float | None = None,
 ) -> tuple[list[Phase], int]:
     """Build a block-aligned exact-yaw schedule from measured VAE timing."""
     if theta_degrees <= 0:
         raise ValueError("theta_degrees must be positive")
+    revisit_theta = (
+        float(theta_degrees)
+        if revisit_theta_degrees is None
+        else float(revisit_theta_degrees)
+    )
+    if revisit_theta <= 0:
+        raise ValueError("revisit_theta_degrees must be positive")
     if temporal_stride <= 0 or requested_speed_degrees_per_frame <= 0:
         raise ValueError("temporal stride and requested speed must be positive")
     rgb_per_block = temporal_stride * frames_per_block
@@ -92,6 +100,15 @@ def build_control_phases(
         int(
             math.ceil(
                 theta_degrees
+                / (requested_speed_degrees_per_frame * rgb_per_block)
+            )
+        ),
+    )
+    revisit_ramp_blocks = max(
+        1,
+        int(
+            math.ceil(
+                revisit_theta
                 / (requested_speed_degrees_per_frame * rgb_per_block)
             )
         ),
@@ -109,8 +126,10 @@ def build_control_phases(
         _append_phase(phases, "A2_distractor", 3, 0.0, 0.0)
     else:
         _append_phase(phases, "A1_distractor", 3, 0.0, 0.0)
-    _append_phase(phases, "A_to_B2", ramp_blocks, 0.0, theta_degrees)
-    _append_phase(phases, "B2_hold", 2, theta_degrees, theta_degrees)
+    _append_phase(
+        phases, "A_to_B2", revisit_ramp_blocks, 0.0, revisit_theta
+    )
+    _append_phase(phases, "B2_hold", 2, revisit_theta, revisit_theta)
     return phases, ramp_blocks
 
 
@@ -195,6 +214,7 @@ def validate_exact_case(
     source_rgb_index: int,
     target_rgb_index: int,
     phase_labels: list[dict],
+    expected_rotation_degrees: float = 0.0,
 ) -> dict:
     base_center = target_c2w[0, :3, 3]
     translation_norm = np.linalg.norm(target_c2w[:, :3, 3] - base_center, axis=1)
@@ -212,11 +232,14 @@ def validate_exact_case(
         for item in phase_labels
         if item["kind"] == "ramp"
     ]
+    rotation_matches_expected = (
+        abs(rotation_error - float(expected_rotation_degrees)) < 1e-6
+    )
     checks = {
         "pitch_zero": float(np.max(np.abs(pitch_degrees))) < 1e-6,
         "roll_zero": float(np.max(np.abs(roll_degrees))) < 1e-6,
         "translation_static": float(translation_norm.max()) < 1e-6,
-        "same_view_rotation": rotation_error < 1e-6,
+        "expected_view_rotation": rotation_matches_expected,
         "same_view_translation": translation_error < 1e-8,
         "source_target_gap": target_chunk - source_chunk >= 4,
         "source_outside_recent": source_chunk < target_chunk - 1,
@@ -227,6 +250,8 @@ def validate_exact_case(
             for item in phase_labels
         ),
     }
+    if abs(float(expected_rotation_degrees)) < 1e-12:
+        checks["same_view_rotation"] = rotation_error < 1e-6
     return {
         "valid": all(checks.values()),
         "checks": checks,
@@ -234,6 +259,9 @@ def validate_exact_case(
         "max_abs_roll_degrees": float(np.max(np.abs(roll_degrees))),
         "max_relative_translation_norm": float(translation_norm.max()),
         "B1_B2_rotation_distance_degrees": rotation_error,
+        "expected_B1_B2_rotation_distance_degrees": float(
+            expected_rotation_degrees
+        ),
         "B1_B2_translation_distance": translation_error,
         "ramp_speeds_degrees_per_rgb_frame": ramp_speeds,
         "source_chunk": source_chunk,

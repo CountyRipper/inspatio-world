@@ -35,6 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_path_root", default=".")
     parser.add_argument("--source_frame_index", type=int, required=True)
     parser.add_argument("--theta", type=float, required=True)
+    parser.add_argument(
+        "--revisit_theta",
+        type=float,
+        help="Optional B2 yaw. Defaults to theta for an exact same-pose revisit.",
+    )
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--speed_deg_per_rgb_frame", type=float, default=0.5)
     parser.add_argument("--frames_per_block", type=int, default=3)
@@ -144,6 +149,7 @@ def main() -> None:
         frames_per_block=args.frames_per_block,
         requested_speed_degrees_per_frame=args.speed_deg_per_rgb_frame,
         distractor=args.distractor,
+        revisit_theta_degrees=args.revisit_theta,
     )
     num_blocks = phases[-1].stop_block
     latent_length = num_blocks * args.frames_per_block
@@ -196,6 +202,14 @@ def main() -> None:
         source_rgb_index=source_rgb_index,
         target_rgb_index=target_rgb_index,
         phase_labels=phase_labels,
+        expected_rotation_degrees=abs(
+            args.theta
+            - (
+                args.theta
+                if args.revisit_theta is None
+                else args.revisit_theta
+            )
+        ),
     )
     if not pose_validation["valid"]:
         raise RuntimeError(f"Generated pose validation failed: {pose_validation}")
@@ -273,9 +287,14 @@ def main() -> None:
         "case_id": args.case_id,
         "decision_eligible": True,
         "trajectory_type": (
-            "pure_yaw_same_view_revisit_with_distractor"
-            if args.distractor
-            else "pure_yaw_same_view_revisit"
+            "pure_yaw_partial_overlap"
+            if args.revisit_theta is not None
+            and abs(args.revisit_theta - args.theta) > 1e-9
+            else (
+                "pure_yaw_same_view_revisit_with_distractor"
+                if args.distractor
+                else "pure_yaw_same_view_revisit"
+            )
         ),
         "pose_convention": (
             "absolute c2w; each pose is selected_source_c2w @ local_yaw_rotation"
@@ -285,11 +304,16 @@ def main() -> None:
         "interpolation": "exact_per_rgb_frame",
         "adaptive_frame": False,
         "theta_degrees": args.theta,
+        "b1_theta_degrees": args.theta,
+        "b2_theta_degrees": (
+            args.theta if args.revisit_theta is None else args.revisit_theta
+        ),
         "pitch_degrees": 0.0,
         "roll_degrees": 0.0,
         "relative_translation": False,
         "requested_speed_degrees_per_rgb_frame": args.speed_deg_per_rgb_frame,
         "ramp_blocks": ramp_blocks,
+        "revisit_ramp_blocks": phase_by_name(phases, "A_to_B2").blocks,
         "frames_per_block": args.frames_per_block,
         "latent_length": latent_length,
         "rgb_length": rgb_length,

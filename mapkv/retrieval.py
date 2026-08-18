@@ -78,6 +78,8 @@ class GeometryChunkRetriever:
         top_k: int,
         positive_chunks: list[int] | tuple[int, ...] = (),
         chunk_clusters: list[list[int]] | None = None,
+        query_pose_mode: str = "controlled_same_pose_known",
+        candidate_chunks: list[int] | tuple[int, ...] | None = None,
     ) -> tuple[dict, dict]:
         """Vote from target-visible, causally eligible surfels.
 
@@ -87,12 +89,18 @@ class GeometryChunkRetriever:
         """
         started = time.perf_counter()
         eligible_max = int(current_chunk) - self.min_history_gap_chunks
+        candidate_set = (
+            None
+            if candidate_chunks is None
+            else {int(chunk) for chunk in candidate_chunks}
+        )
         visible = surfel_index.visible_cells(
             query_pose,
             intrinsics,
             image_size,
             source_image_size=source_image_size,
             eligible_max_chunk=eligible_max,
+            eligible_chunks=candidate_set,
             use_occlusion=self.use_occlusion,
         )
         scores: dict[int, float] = {}
@@ -123,6 +131,10 @@ class GeometryChunkRetriever:
                     int(chunk)
                     for chunk in cell.observing_chunks
                     if 0 <= int(chunk) <= eligible_max
+                    and (
+                        candidate_set is None
+                        or int(chunk) in candidate_set
+                    )
                 }
             )
             if not eligible_observations:
@@ -256,7 +268,17 @@ class GeometryChunkRetriever:
         positive = sorted({int(chunk) for chunk in positive_chunks})
         result = {
             "target_chunk": int(current_chunk),
-            "query_pose_mode": "controlled_same_pose_known",
+            "query_pose_mode": query_pose_mode,
+            "retrieval_scope": (
+                "all_causal_history"
+                if candidate_set is None
+                else "explicit_candidate_control"
+            ),
+            "candidate_chunks": (
+                None
+                if candidate_set is None
+                else sorted(candidate_set)
+            ),
             "voting_mode": "simple_observing_chunk_vote",
             "eligibility_before_zbuffer": True,
             "eligible_max_chunk": eligible_max,
@@ -354,6 +376,7 @@ def pose_retrieve(
     top_k: int,
     min_history_gap_chunks: int,
     positive_chunks: list[int] | tuple[int, ...] = (),
+    query_pose_mode: str = "controlled_same_pose_known",
 ) -> dict:
     candidates = [
         item
@@ -379,7 +402,7 @@ def pose_retrieve(
     positive = sorted({int(chunk) for chunk in positive_chunks})
     return {
         "target_chunk": int(current_chunk),
-        "query_pose_mode": "controlled_same_pose_known",
+        "query_pose_mode": query_pose_mode,
         "eligible_chunks": sorted(distances),
         "rotation_distance_radians": {
             str(chunk): float(distance)
@@ -428,6 +451,7 @@ def build_retrieval(
     use_view_alignment: bool = True,
     use_occlusion: bool = True,
     positive_chunks: list[int] | tuple[int, ...] = (),
+    candidate_chunks: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     sequence_path = Path(sequence_path).resolve()
     sequence = json.loads(sequence_path.read_text(encoding="utf-8"))
@@ -444,6 +468,9 @@ def build_retrieval(
     query_pose = np.asarray(sequence["query_pose"], dtype=np.float32)
     query_intrinsics = np.asarray(
         sequence["query_intrinsics"], dtype=np.float32
+    )
+    query_pose_mode = str(
+        sequence.get("query_pose_mode", "controlled_same_pose_known")
     )
     query_frame = next(
         item
@@ -475,6 +502,8 @@ def build_retrieval(
             top_k=top_k,
             positive_chunks=positive_chunks,
             chunk_clusters=chunk_clusters,
+            query_pose_mode=query_pose_mode,
+            candidate_chunks=candidate_chunks,
         )
         pose = pose_retrieve(
             sequence,
@@ -483,6 +512,7 @@ def build_retrieval(
             top_k=top_k,
             min_history_gap_chunks=min_history_gap_chunks,
             positive_chunks=positive_chunks,
+            query_pose_mode=query_pose_mode,
         )
         coverage_name = (
             f"selected_coverage_target_{target_chunk:04d}.npz"
@@ -512,6 +542,17 @@ def build_retrieval(
             {int(chunk) for chunk in positive_chunks}
         ),
         "geometry_pose_source": "known_control_c2w",
+        "query_pose_mode": query_pose_mode,
+        "retrieval_scope": (
+            "all_causal_history"
+            if candidate_chunks is None
+            else "explicit_candidate_control"
+        ),
+        "candidate_chunks": (
+            None
+            if candidate_chunks is None
+            else sorted({int(chunk) for chunk in candidate_chunks})
+        ),
         "pose_cluster_rule": {
             "contiguous_only": True,
             "rotation_tolerance_degrees": 0.25,
@@ -587,6 +628,7 @@ def main() -> None:
     parser.add_argument("--target_chunk", type=int)
     parser.add_argument("--target_chunks", nargs="+", type=int)
     parser.add_argument("--positive_chunks", nargs="*", type=int, default=[])
+    parser.add_argument("--candidate_chunks", nargs="*", type=int)
     parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument(
         "--min_history_gap_chunks", type=int, default=2
@@ -611,6 +653,7 @@ def main() -> None:
         use_view_alignment=not args.no_view_alignment,
         use_occlusion=not args.no_occlusion,
         positive_chunks=args.positive_chunks,
+        candidate_chunks=args.candidate_chunks,
     )
 
 

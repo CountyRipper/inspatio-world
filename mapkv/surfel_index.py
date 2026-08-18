@@ -361,15 +361,20 @@ class SurfelIndex:
             **merged,
         }
 
-    def eligible_cell_indices(self, eligible_max_chunk: int | None) -> np.ndarray:
-        if eligible_max_chunk is None:
+    def eligible_cell_indices(
+        self,
+        eligible_max_chunk: int | None,
+        eligible_chunks: set[int] | None = None,
+    ) -> np.ndarray:
+        if eligible_max_chunk is None and eligible_chunks is None:
             return np.arange(len(self.cells), dtype=np.int32)
         return np.asarray(
             [
                 index
                 for index, cell in enumerate(self.cells)
                 if any(
-                    0 <= int(chunk) <= int(eligible_max_chunk)
+                    (eligible_max_chunk is None or 0 <= int(chunk) <= int(eligible_max_chunk))
+                    and (eligible_chunks is None or int(chunk) in eligible_chunks)
                     for chunk in cell.observing_chunks
                 )
             ],
@@ -384,12 +389,15 @@ class SurfelIndex:
         *,
         source_image_size: tuple[int, int] | None = None,
         eligible_max_chunk: int | None = None,
+        eligible_chunks: set[int] | None = None,
         use_occlusion: bool = True,
         front_facing: bool = False,
         maximum_radius_pixels: float = 12.0,
     ) -> dict[str, np.ndarray | int]:
         """Project only causally eligible surfaces, then apply the z-buffer."""
-        candidates = self.eligible_cell_indices(eligible_max_chunk)
+        candidates = self.eligible_cell_indices(
+            eligible_max_chunk, eligible_chunks
+        )
         empty = {
             "indices": np.empty(0, dtype=np.int32),
             "pixels": np.empty((0, 2), dtype=np.int32),

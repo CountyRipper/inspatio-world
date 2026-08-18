@@ -112,7 +112,24 @@ class CausalWanSelfAttention(nn.Module):
                         )
                     slot_len = cached_k.shape[1] // 2
                     recent_shape = cached_k[:, slot_len:2 * slot_len].shape
-                    if layer_memory.k.shape != recent_shape or layer_memory.v.shape != recent_shape:
+                    if layer_memory.injection_mode == "selected_recent_delta":
+                        if (
+                            layer_memory.k.shape != layer_memory.v.shape
+                            or layer_memory.k.ndim != 4
+                            or layer_memory.k.shape[0] != recent_shape[0]
+                            or layer_memory.k.shape[2:] != recent_shape[2:]
+                            or not 0 < layer_memory.k.shape[1] <= recent_shape[1]
+                        ):
+                            raise ValueError(
+                                "Selected historical KV shape mismatch: "
+                                f"K={tuple(layer_memory.k.shape)} "
+                                f"V={tuple(layer_memory.v.shape)} "
+                                f"recent={tuple(recent_shape)}"
+                            )
+                    elif (
+                        layer_memory.k.shape != recent_shape
+                        or layer_memory.v.shape != recent_shape
+                    ):
                         raise ValueError(
                             "Historical KV shape mismatch: "
                             f"K={tuple(layer_memory.k.shape)} V={tuple(layer_memory.v.shape)} "
@@ -150,6 +167,17 @@ class CausalWanSelfAttention(nn.Module):
                         ref_v = cached_v[:, :slot_len]
                         aux_k = torch.cat([ref_k, layer_memory.k, roped_key], dim=1)
                         aux_v = torch.cat([ref_v, layer_memory.v, v], dim=1)
+                        a_mem = attention(roped_query, aux_k, aux_v)
+                        memory_signal = a_mem - a_base
+                    elif layer_memory.injection_mode == "selected_recent_delta":
+                        ref_k = cached_k[:, :slot_len]
+                        ref_v = cached_v[:, :slot_len]
+                        aux_k = torch.cat(
+                            [ref_k, layer_memory.k, roped_key], dim=1
+                        )
+                        aux_v = torch.cat(
+                            [ref_v, layer_memory.v, v], dim=1
+                        )
                         a_mem = attention(roped_query, aux_k, aux_v)
                         memory_signal = a_mem - a_base
                     elif layer_memory.injection_mode == "replace_ref_delta":

@@ -114,6 +114,24 @@ class RetrievalPlan:
                 raise KeyError(f"Coverage file has no 'coverage' array: {path}")
             return torch.from_numpy(payload["coverage"].astype(np.float32))
 
+    def load_token_indices(self, target_chunk: int) -> torch.Tensor | None:
+        relative = self.entry(target_chunk).get(
+            "selected_token_indices_path"
+        )
+        if not relative:
+            return None
+        path = Path(relative)
+        if not path.is_absolute():
+            path = self.path.parent / path
+        with np.load(path) as payload:
+            if "token_indices" not in payload:
+                raise KeyError(
+                    f"Token selection file has no token_indices array: {path}"
+                )
+            return torch.from_numpy(
+                payload["token_indices"].astype(np.int64)
+            )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build pose-only top-1 KV retrieval plan")

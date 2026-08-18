@@ -9,14 +9,20 @@ import torch
 
 from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv.latent_control import LatentBlockIntervention
+from mapkv.locality_evaluation import _rotation_warp
 from mapkv.surfel_index import write_oriented_disk_preview
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
-from mapkv_proto.memory_context import ActiveLayerMemory, reference_blind_gate
+from mapkv_proto.memory_context import (
+    ActiveLayerMemory,
+    MemoryContext,
+    reference_blind_gate,
+)
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.retrieval import GeometryChunkRetriever
 from mapkv.slot_evaluation import _select_best_slot
 from mapkv_proto.reference_kv_bank import ReferenceKVBankWriter
+from mapkv_proto.retrieval import RetrievalPlan
 from mapkv.surfel_index import (
     SurfelCell,
     SurfelIndex as VoxelSurfelIndex,
@@ -60,6 +66,28 @@ def test_reference_blind_gate_follows_upstream_mask_semantics():
     torch.testing.assert_close(gate, torch.ones_like(gate))
 
 
+def test_surfel_gate_uses_geometry_without_reference_mask():
+    coverage = torch.zeros(2, 3)
+    coverage[0, 0] = 1.0
+    context = MemoryContext(
+        target_block=4,
+        source_chunk=1,
+        layer_payloads={},
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        alpha=1.0,
+        gate_mode="surfel",
+        smooth_kernel=1,
+        coverage=coverage,
+    )
+    # A fully reference-valid upstream mask must not suppress a pure surfel gate.
+    gated = context.with_query_gate(torch.ones(1, 3, 1, 4, 6), (2, 3))
+    gate = gated.query_gate.reshape(1, 3, 2, 3)
+    assert torch.count_nonzero(gate) > 0
+    torch.testing.assert_close(gate[:, 0], gate[:, 1])
+    torch.testing.assert_close(gate[:, 1], gate[:, 2])
+
+
 def test_exact_control_trajectory_is_block_aligned_and_revisits_same_pose():
     phases, ramp_blocks = build_control_phases(30.0, temporal_stride=4.0)
     assert ramp_blocks == 5
@@ -90,6 +118,52 @@ def test_exact_control_trajectory_is_block_aligned_and_revisits_same_pose():
     assert validation["B1_B2_rotation_distance_degrees"] < 1e-6
     assert validation["B1_B2_translation_distance"] == 0.0
     assert all(0.4 <= speed <= 0.6 for speed in validation["ramp_speeds_degrees_per_rgb_frame"])
+
+
+def test_partial_overlap_trajectory_uses_distinct_b2_pose():
+    phases, ramp_blocks = build_control_phases(
+        30.0,
+        temporal_stride=4.0,
+        revisit_theta_degrees=20.0,
+    )
+    assert ramp_blocks == 5
+    assert phase_by_name(phases, "A_to_B2").blocks == 4
+    num_blocks = phases[-1].stop_block
+    latent_length = num_blocks * 3
+    rgb_length = rgb_length_for_latents(latent_length, 4.0)
+    yaw, labels = build_yaw_samples(phases, rgb_length)
+    source_chunk = plateau_middle_chunk(phase_by_name(phases, "B1_hold"))
+    target_chunk = plateau_middle_chunk(phase_by_name(phases, "B2_hold"))
+    source_rgb = monotonic_index(source_chunk * 3 + 1, latent_length, rgb_length)
+    target_rgb = monotonic_index(target_chunk * 3 + 1, latent_length, rgb_length)
+    validation = validate_exact_case(
+        target_c2w=build_exact_c2w(np.eye(4), yaw),
+        yaw_degrees=yaw,
+        pitch_degrees=np.zeros_like(yaw),
+        roll_degrees=np.zeros_like(yaw),
+        source_chunk=source_chunk,
+        target_chunk=target_chunk,
+        source_rgb_index=source_rgb,
+        target_rgb_index=target_rgb,
+        phase_labels=labels,
+        expected_rotation_degrees=10.0,
+    )
+    assert validation["valid"] is True
+    assert validation["B1_B2_rotation_distance_degrees"] == pytest.approx(10.0)
+    assert "same_view_rotation" not in validation["checks"]
+
+
+def test_rotation_only_metric_warp_is_identity_for_equal_poses():
+    image = np.linspace(0, 1, 6 * 8 * 3, dtype=np.float32).reshape(6, 8, 3)
+    intrinsics = np.array(
+        [[10.0, 0.0, 4.0], [0.0, 10.0, 3.0], [0.0, 0.0, 1.0]]
+    )
+    warped, valid, homography = _rotation_warp(
+        image, np.eye(4), np.eye(4), intrinsics
+    )
+    np.testing.assert_allclose(homography, np.eye(3), atol=1e-8)
+    np.testing.assert_allclose(warped, image, atol=1e-7)
+    np.testing.assert_array_equal(valid, np.ones((6, 8), dtype=np.float32))
 
 
 def test_noise_bundle_roundtrip_and_provider_does_not_use_global_rng(tmp_path):
@@ -236,6 +310,50 @@ def test_auxiliary_attention_is_strictly_opt_in_and_cache_safe(monkeypatch):
 
     with pytest.raises(AssertionError, match="writer"):
         module(x, None, freqs, kv_cache=cache, kv_size=(0, -1), layer_memory=active)
+
+    calls.clear()
+    selected = ActiveLayerMemory(
+        k=torch.full((1, 1, 2, 2), -5.0),
+        v=torch.full((1, 1, 2, 2), 200.0),
+        alpha=1.0,
+        query_gate=torch.ones(1, 2),
+        source_chunk=0,
+        injection_mode="selected_recent_delta",
+    )
+    selected_out = module(
+        x,
+        None,
+        freqs,
+        kv_cache=cache,
+        kv_size=(0, 4),
+        layer_memory=selected,
+    )
+    assert [item[0].shape[1] for item in calls] == [6, 5]
+    assert not torch.equal(selected_out, baseline)
+
+
+def test_retrieval_plan_loads_selected_token_indices(tmp_path):
+    np.savez_compressed(
+        tmp_path / "tokens.npz",
+        token_indices=np.array([0, 7, 12], dtype=np.int64),
+    )
+    (tmp_path / "plan.json").write_text(
+        json.dumps(
+            {
+                "targets": [
+                    {
+                        "target_chunk": 5,
+                        "selected_chunks": [1],
+                        "selected_token_indices_path": "tokens.npz",
+                    }
+                ]
+            }
+        )
+    )
+    plan = RetrievalPlan(tmp_path / "plan.json")
+    torch.testing.assert_close(
+        plan.load_token_indices(5), torch.tensor([0, 7, 12])
+    )
 
 
 def test_residual_memory_attention_is_separate_and_cache_safe(monkeypatch):
@@ -404,6 +522,47 @@ def test_current_surfel_filters_recent_geometry_before_zbuffer():
     assert result["eligibility_before_zbuffer"] is True
     assert result["selected_chunks"] == [1]
     assert 4 not in result["eligible_chunks"]
+    assert np.all(diagnostics["visible"]["indices"] == 0)
+
+
+def test_candidate_control_filters_noncandidate_before_zbuffer():
+    def cell(z, chunk):
+        return SurfelCell(
+            voxel_key=(0, 0, int(z * 10)),
+            xyz=np.array([0.0, 0.0, z], dtype=np.float32),
+            confidence=3.0,
+            normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            radius=0.4,
+            rgb_preview=None,
+            first_seen_chunk=chunk,
+            last_seen_chunk=chunk,
+            observing_chunks=[chunk],
+            chunk_weights={chunk: 1.0},
+            view_dirs={chunk: np.array([0.0, 0.0, -1.0], dtype=np.float32)},
+            observation_weight=1.0,
+        )
+
+    index = VoxelSurfelIndex(0.1, [cell(2.0, 7), cell(1.0, 14)])
+    retriever = GeometryChunkRetriever(
+        min_history_gap_chunks=2,
+        use_view_alignment=False,
+        use_occlusion=True,
+    )
+    intrinsic = np.array(
+        [[10.0, 0.0, 5.0], [0.0, 10.0, 5.0], [0.0, 0.0, 1.0]]
+    )
+    result, diagnostics = retriever.retrieve(
+        index,
+        np.eye(4),
+        intrinsic,
+        source_image_size=(11, 11),
+        image_size=(11, 11),
+        current_chunk=20,
+        top_k=1,
+        candidate_chunks=[7],
+    )
+    assert result["selected_chunks"] == [7]
+    assert result["retrieval_scope"] == "explicit_candidate_control"
     assert np.all(diagnostics["visible"]["indices"] == 0)
 
 

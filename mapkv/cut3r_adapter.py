@@ -207,6 +207,8 @@ class Cut3RAdapter:
         output_dir: str | Path,
         target_chunk: int,
         query_source_chunk: int,
+        query_pose_mode: str = "controlled_same_pose_known",
+        query_target_chunk: int | None = None,
         confidence_threshold: float = 1.5,
     ) -> Cut3RSequence:
         baseline_root = Path(baseline_root).resolve()
@@ -226,6 +228,28 @@ class Cut3RAdapter:
             raise AssertionError("Future leakage in CUT3R prefix")
         if int(query_source_chunk) not in {int(item["chunk_id"]) for item in history}:
             raise ValueError("controlled_same_pose source is absent from the causal prefix")
+        if query_pose_mode not in {
+            "controlled_same_pose_known",
+            "known_target_pose",
+        }:
+            raise ValueError(f"Unsupported query pose mode: {query_pose_mode}")
+        query_target_chunk = (
+            int(target_chunk)
+            if query_target_chunk is None
+            else int(query_target_chunk)
+        )
+        query_target_mapping = next(
+            (
+                item
+                for item in mapping
+                if int(item["chunk_id"]) == query_target_chunk
+            ),
+            None,
+        )
+        if query_pose_mode == "known_target_pose" and query_target_mapping is None:
+            raise ValueError(
+                f"Known target query chunk {query_target_chunk} is absent from block mapping"
+            )
         image_paths = [(baseline_root / item["png_path"]).resolve() for item in history]
         for path in image_paths:
             if not path.is_file():
@@ -351,10 +375,18 @@ class Cut3RAdapter:
                 }
             )
 
-        query = next(
+        query_source = next(
             item for item in frame_entries
             if item["chunk_id"] == int(query_source_chunk)
         )
+        if query_pose_mode == "known_target_pose":
+            query_pose = to_cut3r_c2w(
+                np.asarray(query_target_mapping["c2w"], dtype=np.float64)
+            ).astype(np.float32)
+        else:
+            query_pose = np.asarray(
+                query_source["camera_pose"], dtype=np.float32
+            )
         cut3r_commit = _git(self.root, "rev-parse", "HEAD")
         cut3r_dirty = bool(_git(self.root, "status", "--short"))
         checkpoint_sha256 = _sha256(self.checkpoint)
@@ -377,10 +409,11 @@ class Cut3RAdapter:
             "prefix_last_chunk": max(item["chunk_id"] for item in frame_entries),
             "target_chunk": int(target_chunk),
             "future_leakage": False,
-            "query_pose_mode": "controlled_same_pose_known",
+            "query_pose_mode": query_pose_mode,
             "query_source_chunk": int(query_source_chunk),
-            "query_pose": query["camera_pose"],
-            "query_intrinsics": query["intrinsics"],
+            "query_target_chunk": query_target_chunk,
+            "query_pose": query_pose.tolist(),
+            "query_intrinsics": query_source["intrinsics"],
             "frames": frame_entries,
         }
         (output_dir / "sequence.json").write_text(
@@ -402,7 +435,7 @@ class Cut3RAdapter:
             "prefix_last_chunk": sequence_payload["prefix_last_chunk"],
             "target_chunk": int(target_chunk),
             "future_leakage": False,
-            "query_pose_mode": "controlled_same_pose_known",
+            "query_pose_mode": query_pose_mode,
             "map_pose_source": "known_control_c2w",
             "cut3r_predicted_pose_used_for_map": False,
             "maximum_predicted_translation_drift": float(
@@ -425,7 +458,9 @@ class Cut3RAdapter:
             "Y/Z camera-basis conversion.\n"
             "- Scale: arbitrary learned scene scale; voxel size is therefore relative.\n"
             "- CUT3R predicted poses are diagnostics only and never place geometry.\n"
-            "- Query: B2 reuses the known B1 pose in controlled_same_pose_known mode.\n"
+            f"- Query: {query_pose_mode}; source chunk {query_source_chunk} provides "
+            f"intrinsics and target chunk {query_target_chunk} provides the known "
+            "pose when known_target_pose is selected.\n"
             "- Causality: only generated chunks strictly before B2 were provided.\n",
             encoding="utf-8",
         )
@@ -470,6 +505,12 @@ def main() -> None:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--target_chunk", type=int, required=True)
     parser.add_argument("--query_source_chunk", type=int, required=True)
+    parser.add_argument(
+        "--query_pose_mode",
+        choices=("controlled_same_pose_known", "known_target_pose"),
+        default="controlled_same_pose_known",
+    )
+    parser.add_argument("--query_target_chunk", type=int)
     parser.add_argument("--confidence_threshold", type=float, default=1.5)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--device", default="cuda")
@@ -486,6 +527,8 @@ def main() -> None:
         output_dir=args.output_dir,
         target_chunk=args.target_chunk,
         query_source_chunk=args.query_source_chunk,
+        query_pose_mode=args.query_pose_mode,
+        query_target_chunk=args.query_target_chunk,
         confidence_threshold=args.confidence_threshold,
     )
 

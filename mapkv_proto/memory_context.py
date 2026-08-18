@@ -90,7 +90,9 @@ def normalize_coverage(
             mode="bilinear",
             align_corners=False,
         ).reshape(batch, frames, *token_hw)
-    return coverage.clamp_(0, 1)
+    # expand() produces a shared-stride view when one center-frame mask is
+    # repeated across latent frames; an in-place clamp is invalid for it.
+    return coverage.clamp(0, 1)
 
 
 @dataclass(frozen=True)
@@ -130,24 +132,30 @@ class MemoryContext:
             gate = torch.ones(
                 (batch, frames, *token_hw), device=mask_block.device, dtype=torch.float32
             )
-        else:
+        elif self.gate_mode == "ref_blind":
             gate = reference_blind_gate(
                 mask_block, token_hw, smooth_kernel=self.smooth_kernel
             )
-            if self.gate_mode == "surfel_ref_blind":
-                if self.coverage is None:
-                    raise ValueError("surfel_ref_blind gate requires a coverage mask")
-                coverage = normalize_coverage(
-                    self.coverage,
-                    batch=batch,
-                    frames=frames,
-                    token_hw=token_hw,
-                    device=mask_block.device,
+        elif self.gate_mode in {"surfel", "surfel_ref_blind"}:
+            if self.coverage is None:
+                raise ValueError(f"{self.gate_mode} gate requires a coverage mask")
+            coverage = normalize_coverage(
+                self.coverage,
+                batch=batch,
+                frames=frames,
+                token_hw=token_hw,
+                device=mask_block.device,
+            )
+            coverage = _smooth_gate(_dilate_gate(coverage), self.smooth_kernel)
+            if self.gate_mode == "surfel":
+                gate = coverage
+            else:
+                gate = reference_blind_gate(
+                    mask_block, token_hw, smooth_kernel=self.smooth_kernel
                 )
-                coverage = _smooth_gate(_dilate_gate(coverage), self.smooth_kernel)
                 gate = gate * coverage
-            elif self.gate_mode != "ref_blind":
-                raise ValueError(f"Unsupported gate mode: {self.gate_mode}")
+        else:
+            raise ValueError(f"Unsupported gate mode: {self.gate_mode}")
         return replace(self, query_gate=gate.flatten(1).to(dtype=mask_block.dtype))
 
     def for_layer(self, block_index: int, num_layers: int) -> ActiveLayerMemory | None:
@@ -206,7 +214,11 @@ def make_memory_context(
     smooth_kernel: int,
     coverage: torch.Tensor | None = None,
 ) -> MemoryContext | None:
-    if gate_mode == "surfel_ref_blind" and coverage is not None and not bool(coverage.any()):
+    if (
+        gate_mode in {"surfel", "surfel_ref_blind"}
+        and coverage is not None
+        and not bool(coverage.any())
+    ):
         return None
     return MemoryContext(
         target_block=target_block,
