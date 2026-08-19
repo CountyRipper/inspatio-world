@@ -8,9 +8,10 @@ from itertools import product
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 
 
 @dataclass
@@ -28,6 +29,7 @@ class SurfelCell:
     observing_chunks: list[int] = field(default_factory=list)
     chunk_weights: dict[int, float] = field(default_factory=dict)
     view_dirs: dict[int, np.ndarray] = field(default_factory=dict)
+    reference_blind_at_write: dict[int, float] = field(default_factory=dict)
     observation_weight: float = 0.0
 
 
@@ -214,6 +216,14 @@ class SurfelIndex:
                     match.view_dirs[chunk] = (
                         value / norm if norm > 1e-8 else previous
                     )
+                incoming_blind = observation.reference_blind_at_write.get(
+                    chunk
+                )
+                if incoming_blind is not None:
+                    match.reference_blind_at_write[chunk] = max(
+                        float(incoming_blind),
+                        float(match.reference_blind_at_write.get(chunk, 0.0)),
+                    )
             match.observing_chunks.sort()
             merged += 1
 
@@ -233,6 +243,7 @@ class SurfelIndex:
         camera_pose: np.ndarray,
         chunk_id: int,
         rgb: np.ndarray | None = None,
+        reference_validity: np.ndarray | None = None,
         *,
         intrinsics: np.ndarray | None = None,
         confidence_threshold: float = 1.5,
@@ -245,6 +256,22 @@ class SurfelIndex:
         points = _sample_grid(np.asarray(pts3d, dtype=np.float32), grid_hw)
         conf = _sample_grid(np.asarray(confidence, dtype=np.float32), grid_hw)
         colors = None if rgb is None else _sample_grid(np.asarray(rgb), grid_hw)
+        reference_valid = None
+        if reference_validity is not None:
+            reference_array = np.asarray(reference_validity, dtype=np.float32)
+            if reference_array.ndim != 2:
+                raise ValueError(
+                    "reference_validity must be a 2D image-space mask"
+                )
+            if tuple(reference_array.shape) != source_hw:
+                reference_array = np.asarray(
+                    Image.fromarray(reference_array, mode="F").resize(
+                        (source_hw[1], source_hw[0]),
+                        Image.Resampling.BILINEAR,
+                    ),
+                    dtype=np.float32,
+                )
+            reference_valid = _sample_grid(reference_array, grid_hw).clip(0, 1)
         normals = _normal_grid(points)
         pose = np.asarray(camera_pose, dtype=np.float32)
         camera = pose[:3, 3]
@@ -280,6 +307,9 @@ class SurfelIndex:
         depth_flat = depth[valid]
         normals_flat = normals[valid]
         colors_flat = None if colors is None else colors[valid]
+        reference_valid_flat = (
+            None if reference_valid is None else reference_valid[valid]
+        )
         toward_camera = camera[None] - points_flat
         view_norm = np.linalg.norm(toward_camera, axis=-1, keepdims=True)
         view_dirs = np.divide(
@@ -342,6 +372,15 @@ class SurfelIndex:
                     observing_chunks=[int(chunk_id)],
                     chunk_weights={int(chunk_id): float(weight)},
                     view_dirs={int(chunk_id): view_dir.copy()},
+                    reference_blind_at_write=(
+                        {}
+                        if reference_valid_flat is None
+                        else {
+                            int(chunk_id): float(
+                                1.0 - reference_valid_flat[index]
+                            )
+                        }
+                    ),
                     observation_weight=float(weight),
                 )
             )
@@ -365,14 +404,25 @@ class SurfelIndex:
         self,
         eligible_max_chunk: int | None,
         eligible_chunks: set[int] | None = None,
+        eligible_indices: np.ndarray | None = None,
     ) -> np.ndarray:
-        if eligible_max_chunk is None and eligible_chunks is None:
+        allowed = (
+            None
+            if eligible_indices is None
+            else {int(index) for index in np.asarray(eligible_indices).reshape(-1)}
+        )
+        if (
+            eligible_max_chunk is None
+            and eligible_chunks is None
+            and allowed is None
+        ):
             return np.arange(len(self.cells), dtype=np.int32)
         return np.asarray(
             [
                 index
                 for index, cell in enumerate(self.cells)
-                if any(
+                if (allowed is None or index in allowed)
+                and any(
                     (eligible_max_chunk is None or 0 <= int(chunk) <= int(eligible_max_chunk))
                     and (eligible_chunks is None or int(chunk) in eligible_chunks)
                     for chunk in cell.observing_chunks
@@ -380,6 +430,25 @@ class SurfelIndex:
             ],
             dtype=np.int32,
         )
+
+    def generated_only_cell_indices(
+        self,
+        chunk_id: int,
+        *,
+        reference_blind_threshold: float = 0.5,
+    ) -> np.ndarray:
+        """Return cells whose selected observation was source-blind at write."""
+        chunk_id = int(chunk_id)
+        selected = [
+            index
+            for index, cell in enumerate(self.cells)
+            if chunk_id in cell.observing_chunks
+            and float(
+                cell.reference_blind_at_write.get(chunk_id, -1.0)
+            )
+            >= float(reference_blind_threshold)
+        ]
+        return np.asarray(selected, dtype=np.int32)
 
     def visible_cells(
         self,
@@ -390,13 +459,14 @@ class SurfelIndex:
         source_image_size: tuple[int, int] | None = None,
         eligible_max_chunk: int | None = None,
         eligible_chunks: set[int] | None = None,
+        eligible_indices: np.ndarray | None = None,
         use_occlusion: bool = True,
         front_facing: bool = False,
         maximum_radius_pixels: float = 12.0,
     ) -> dict[str, np.ndarray | int]:
         """Project only causally eligible surfaces, then apply the z-buffer."""
         candidates = self.eligible_cell_indices(
-            eligible_max_chunk, eligible_chunks
+            eligible_max_chunk, eligible_chunks, eligible_indices
         )
         empty = {
             "indices": np.empty(0, dtype=np.int32),
@@ -571,12 +641,16 @@ class SurfelIndex:
         chunk_ids: list[int] = []
         chunk_weights: list[float] = []
         view_dirs: list[np.ndarray] = []
+        reference_blind_at_write: list[float] = []
         offsets = [0]
         for cell in self.cells:
             for chunk_id in sorted(set(cell.observing_chunks)):
                 chunk_ids.append(chunk_id)
                 chunk_weights.append(cell.chunk_weights.get(chunk_id, 0.0))
                 view_dirs.append(cell.view_dirs.get(chunk_id, np.zeros(3)))
+                reference_blind_at_write.append(
+                    float(cell.reference_blind_at_write.get(chunk_id, np.nan))
+                )
             offsets.append(len(chunk_ids))
         np.savez_compressed(
             path,
@@ -616,6 +690,9 @@ class SurfelIndex:
             chunk_ids=np.asarray(chunk_ids, dtype=np.int32),
             chunk_weights=np.asarray(chunk_weights, dtype=np.float32),
             view_dirs=np.asarray(view_dirs, dtype=np.float32).reshape(-1, 3),
+            reference_blind_at_write=np.asarray(
+                reference_blind_at_write, dtype=np.float32
+            ),
             offsets=np.asarray(offsets, dtype=np.int64),
         )
 
@@ -658,7 +735,7 @@ class SurfelIndex:
     def load(cls, path: str | Path) -> "SurfelIndex":
         payload = np.load(path)
         version = int(payload["version"][0])
-        if version not in (1, INDEX_VERSION):
+        if version not in (1, 2, INDEX_VERSION):
             raise ValueError(f"Unsupported surfel index version: {version}")
         offsets = payload["offsets"]
         voxel_size = float(payload["voxel_size"][0])
@@ -668,6 +745,11 @@ class SurfelIndex:
             chunks = payload["chunk_ids"][start:stop]
             weights = payload["chunk_weights"][start:stop]
             directions = payload["view_dirs"][start:stop]
+            blind_values = (
+                payload["reference_blind_at_write"][start:stop]
+                if version >= 3
+                else np.full(len(chunks), np.nan, dtype=np.float32)
+            )
             chunk_weights = {
                 int(chunk): float(weight)
                 for chunk, weight in zip(chunks, weights)
@@ -693,6 +775,11 @@ class SurfelIndex:
                     view_dirs={
                         int(chunk): direction.copy()
                         for chunk, direction in zip(chunks, directions)
+                    },
+                    reference_blind_at_write={
+                        int(chunk): float(value)
+                        for chunk, value in zip(chunks, blind_values)
+                        if np.isfinite(value)
                     },
                     observation_weight=float(
                         payload["observation_weight"][index]
@@ -842,6 +929,7 @@ def build_from_sequence(
     grid_hw: tuple[int, int] = (30, 52),
     radius_scale: float = 0.5,
     merge_normal_cosine: float = 0.6,
+    reference_mask_root: str | Path | None = None,
 ) -> SurfelIndex:
     started = time.perf_counter()
     sequence_path = Path(sequence_path).resolve()
@@ -866,22 +954,45 @@ def build_from_sequence(
     index = SurfelIndex(resolved_voxel_size)
     insertions = []
     raw_points = 0
+    reference_mask_root = (
+        None
+        if reference_mask_root is None
+        else Path(reference_mask_root).resolve()
+    )
+    tagged_observations = 0
     for item in sequence["frames"]:
         payload = np.load(sequence_path.parent / item["data_path"])
-        raw_points += int(payload["confidence"].size)
-        insertions.append(
-            index.insert_frame(
-                payload["pts3d"],
-                payload["confidence"],
-                payload["c2w"],
-                int(item["chunk_id"]),
-                intrinsics=payload["intrinsics"],
-                confidence_threshold=confidence_threshold,
-                grid_hw=grid_hw,
-                radius_scale=radius_scale,
-                normal_cosine=merge_normal_cosine,
+        chunk_id = int(item["chunk_id"])
+        reference_validity = None
+        if reference_mask_root is not None:
+            mask_path = (
+                reference_mask_root
+                / f"chunk_{chunk_id:04d}_reference_valid.png"
             )
+            if not mask_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing reference-valid write mask: {mask_path}"
+                )
+            reference_validity = (
+                np.asarray(Image.open(mask_path).convert("L"), dtype=np.float32)
+                / 255.0
+            )
+        raw_points += int(payload["confidence"].size)
+        insertion = index.insert_frame(
+            payload["pts3d"],
+            payload["confidence"],
+            payload["c2w"],
+            chunk_id,
+            reference_validity=reference_validity,
+            intrinsics=payload["intrinsics"],
+            confidence_threshold=confidence_threshold,
+            grid_hw=grid_hw,
+            radius_scale=radius_scale,
+            normal_cosine=merge_normal_cosine,
         )
+        insertions.append(insertion)
+        if reference_validity is not None:
+            tagged_observations += int(insertion["accepted"])
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     index_path = output_dir / "surfel_index.npz"
@@ -910,6 +1021,16 @@ def build_from_sequence(
         "index_bytes": index_path.stat().st_size,
         "build_ms": (time.perf_counter() - started) * 1000.0,
         "insertions": insertions,
+        "reference_blind_at_write": {
+            "enabled": reference_mask_root is not None,
+            "mask_root": (
+                None
+                if reference_mask_root is None
+                else str(reference_mask_root)
+            ),
+            "tagged_observations": tagged_observations,
+            "semantics": "1 - upstream reference_valid at observation pixel",
+        },
     }
     (output_dir / "stats.json").write_text(
         json.dumps(stats, indent=2), encoding="utf-8"
@@ -999,6 +1120,13 @@ def main() -> None:
     parser.add_argument("--grid_width", type=int, default=52)
     parser.add_argument("--radius_scale", type=float, default=0.5)
     parser.add_argument("--merge_normal_cosine", type=float, default=0.6)
+    parser.add_argument(
+        "--reference_mask_root",
+        help=(
+            "Optional baseline masks directory. When set, every observation "
+            "stores reference_blind_at_write for its chunk."
+        ),
+    )
     args = parser.parse_args()
     build_from_sequence(
         sequence_path=args.sequence,
@@ -1010,6 +1138,7 @@ def main() -> None:
         grid_hw=(args.grid_height, args.grid_width),
         radius_scale=args.radius_scale,
         merge_normal_cosine=args.merge_normal_cosine,
+        reference_mask_root=args.reference_mask_root,
     )
 
 

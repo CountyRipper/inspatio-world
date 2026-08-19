@@ -227,6 +227,7 @@ def render_target_rgb(
     *,
     eligible_chunks: set[int] | None = None,
     eligible_max_chunk: int | None = None,
+    eligible_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     visible = index.visible_cells(
         query_pose,
@@ -235,6 +236,7 @@ def render_target_rgb(
         source_image_size=image_hw,
         eligible_max_chunk=eligible_max_chunk,
         eligible_chunks=eligible_chunks,
+        eligible_indices=eligible_indices,
         use_occlusion=True,
         front_facing=False,
         maximum_radius_pixels=12.0,
@@ -259,6 +261,11 @@ def render_target_rgb(
 
 
 def _option_page(output_dir: Path, manifest: dict) -> None:
+    source_label = (
+        f"B1 chunk {manifest['source_chunk']} generated-only"
+        if manifest.get("b1_visualization_generated_only")
+        else f"B1 chunk {manifest['source_chunk']}"
+    )
     cards = [
         (
             "A — RGB 世界坐标 splat",
@@ -276,9 +283,9 @@ def _option_page(output_dir: Path, manifest: dict) -> None:
             "直接看历史 surfel 从目标相机能渲染出什么，最容易判断几何是否有意义。",
         ),
         (
-            "D — B1-only RGB z-buffer（推荐 memory 主视图）",
+            f"D — {source_label} RGB z-buffer（推荐 memory 主视图）",
             "D_rgb_b1_target_zbuffer.png",
-            "纯 B1 chunk 8 surfel，不混入 B2 图像；直接看长期 memory 覆盖与外观。",
+            f"纯 {source_label} surfel，不混入 B2 图像；直接看长期 memory 覆盖与外观。",
         ),
         (
             "E — B1 RGB 与 B2 overlay（推荐对齐审计）",
@@ -319,6 +326,7 @@ def generate_options(
     target_chunk: int,
     source_chunk: int,
     output_dir: str | Path,
+    generated_only_source: bool = False,
 ) -> dict:
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -354,6 +362,15 @@ def generate_options(
         eligible_max_chunk=int(sequence["prefix_last_chunk"]),
     )
     Image.fromarray(all_rgb).save(output_dir / "C_rgb_target_zbuffer.png")
+    generated_only_indices = (
+        index.generated_only_cell_indices(source_chunk)
+        if generated_only_source
+        else None
+    )
+    if generated_only_source and not len(generated_only_indices):
+        raise RuntimeError(
+            f"No generated-only observations for source chunk {source_chunk}"
+        )
     b1_rgb, b1_mask, b1_stats = render_target_rgb(
         index,
         colors,
@@ -363,6 +380,7 @@ def generate_options(
         image_hw,
         eligible_chunks={int(source_chunk)},
         eligible_max_chunk=int(target_chunk) - 2,
+        eligible_indices=generated_only_indices,
     )
     target_rgb = _prepare_cut3r_rgb(
         mapping_path.parent / target["png_path"], image_hw
@@ -390,6 +408,12 @@ def generate_options(
         "source_chunk": int(source_chunk),
         "target_camera_all_history": all_stats,
         "target_camera_b1_only": b1_stats,
+        "b1_visualization_generated_only": bool(generated_only_source),
+        "generated_only_source_cells": (
+            None
+            if generated_only_indices is None
+            else int(len(generated_only_indices))
+        ),
         "color_chunk_min": int(color_chunks[valid].min()) if valid.any() else None,
         "color_chunk_max": int(color_chunks[valid].max()) if valid.any() else None,
     }
@@ -429,6 +453,7 @@ def main() -> None:
     parser.add_argument("--block_mapping", required=True)
     parser.add_argument("--target_chunk", type=int, required=True)
     parser.add_argument("--source_chunk", type=int, required=True)
+    parser.add_argument("--generated_only_source", action="store_true")
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
     print(
@@ -440,6 +465,7 @@ def main() -> None:
                 target_chunk=args.target_chunk,
                 source_chunk=args.source_chunk,
                 output_dir=args.output_dir,
+                generated_only_source=args.generated_only_source,
             ),
             indent=2,
         )

@@ -16,6 +16,7 @@ import numpy as np
 from mapkv_proto.trajectory_builder import (
     build_control_phases,
     build_exact_c2w,
+    build_source_protected_revisit_phases,
     build_yaw_samples,
     monotonic_index,
     phase_by_name,
@@ -39,6 +40,14 @@ def parse_args() -> argparse.Namespace:
         "--revisit_theta",
         type=float,
         help="Optional B2 yaw. Defaults to theta for an exact same-pose revisit.",
+    )
+    parser.add_argument(
+        "--leave_theta",
+        type=float,
+        help=(
+            "Build the memory-required 0→theta→leave_theta→revisit_theta path. "
+            "Requires a negative value and --revisit_theta."
+        ),
     )
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--speed_deg_per_rgb_frame", type=float, default=0.5)
@@ -143,14 +152,33 @@ def main() -> None:
     }
     save_json(vae_time_map, vae_time_map_path)
 
-    phases, ramp_blocks = build_control_phases(
-        args.theta,
-        temporal_stride=temporal_stride,
-        frames_per_block=args.frames_per_block,
-        requested_speed_degrees_per_frame=args.speed_deg_per_rgb_frame,
-        distractor=args.distractor,
-        revisit_theta_degrees=args.revisit_theta,
-    )
+    if args.leave_theta is not None:
+        if args.distractor:
+            raise ValueError("--leave_theta and --distractor are mutually exclusive")
+        if args.revisit_theta is None:
+            raise ValueError("--leave_theta requires --revisit_theta")
+        phases, ramp_block_map = build_source_protected_revisit_phases(
+            b1_theta_degrees=args.theta,
+            leave_theta_degrees=args.leave_theta,
+            b2_theta_degrees=args.revisit_theta,
+            temporal_stride=temporal_stride,
+            frames_per_block=args.frames_per_block,
+            requested_speed_degrees_per_frame=args.speed_deg_per_rgb_frame,
+        )
+        ramp_blocks = ramp_block_map["A_to_B1"]
+    else:
+        phases, ramp_blocks = build_control_phases(
+            args.theta,
+            temporal_stride=temporal_stride,
+            frames_per_block=args.frames_per_block,
+            requested_speed_degrees_per_frame=args.speed_deg_per_rgb_frame,
+            distractor=args.distractor,
+            revisit_theta_degrees=args.revisit_theta,
+        )
+        ramp_block_map = {
+            "A_to_B1": ramp_blocks,
+            "A_to_B2": phase_by_name(phases, "A_to_B2").blocks,
+        }
     num_blocks = phases[-1].stop_block
     latent_length = num_blocks * args.frames_per_block
     rgb_length = rgb_length_for_latents(latent_length, temporal_stride)
@@ -166,7 +194,12 @@ def main() -> None:
     b1 = phase_by_name(phases, "B1_hold")
     b2 = phase_by_name(phases, "B2_hold")
     wrong_phase = phase_by_name(
-        phases, "wrong_hold" if args.distractor else "A1_distractor"
+        phases,
+        (
+            "Leave_hold"
+            if args.leave_theta is not None
+            else ("wrong_hold" if args.distractor else "A1_distractor")
+        ),
     )
     source_chunk = plateau_middle_chunk(b1)
     target_chunk = plateau_middle_chunk(b2)
@@ -287,7 +320,9 @@ def main() -> None:
         "case_id": args.case_id,
         "decision_eligible": True,
         "trajectory_type": (
-            "pure_yaw_partial_overlap"
+            "pure_yaw_source_protected_revisit"
+            if args.leave_theta is not None
+            else "pure_yaw_partial_overlap"
             if args.revisit_theta is not None
             and abs(args.revisit_theta - args.theta) > 1e-9
             else (
@@ -308,12 +343,18 @@ def main() -> None:
         "b2_theta_degrees": (
             args.theta if args.revisit_theta is None else args.revisit_theta
         ),
+        "leave_theta_degrees": args.leave_theta,
         "pitch_degrees": 0.0,
         "roll_degrees": 0.0,
         "relative_translation": False,
         "requested_speed_degrees_per_rgb_frame": args.speed_deg_per_rgb_frame,
         "ramp_blocks": ramp_blocks,
-        "revisit_ramp_blocks": phase_by_name(phases, "A_to_B2").blocks,
+        "ramp_blocks_by_phase": ramp_block_map,
+        "revisit_ramp_blocks": (
+            phase_by_name(phases, "Leave_to_B2").blocks
+            if args.leave_theta is not None
+            else phase_by_name(phases, "A_to_B2").blocks
+        ),
         "frames_per_block": args.frames_per_block,
         "latent_length": latent_length,
         "rgb_length": rgb_length,

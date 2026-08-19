@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--continuous_query_gate",
-        choices=("global", "surfel", "support_preserving"),
+        choices=("global", "surfel", "support_preserving", "source_protected"),
         default="surfel",
         help="Apply Virtual Recent delta globally or only at M_history query tokens.",
     )
@@ -155,6 +155,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warp_feather_kernel", type=int, default=3)
     parser.add_argument("--warp_memory_dilation_kernel", type=int, default=3)
     parser.add_argument("--warp_query_feather_kernel", type=int, default=3)
+    parser.add_argument(
+        "--source_protected_memory",
+        action="store_true",
+        help=(
+            "Use only source-blind historical observations and forbid memory "
+            "inside the current protected reference region."
+        ),
+    )
+    parser.add_argument(
+        "--warp_reference_protection_kernel", type=int, default=3
+    )
+    parser.add_argument(
+        "--warp_generated_only_threshold", type=float, default=0.5
+    )
     parser.add_argument("--compare_latents_to")
     parser.add_argument("--verify_memory_off_replay", action="store_true")
     parser.add_argument("--replay_tolerance", type=float, default=0.0)
@@ -835,7 +849,12 @@ def main() -> None:
                         else (
                             "surfel_support_preserving"
                             if args.continuous_query_gate == "support_preserving"
-                            else "global"
+                            else (
+                                "surfel_source_protected"
+                                if args.continuous_query_gate
+                                == "source_protected"
+                                else "global"
+                            )
                         )
                     ),
                     mask_policy=args.continuous_mask_policy,
@@ -846,6 +865,14 @@ def main() -> None:
                         pipeline.vae
                         if args.warp_history_representation == "rgb_warp_vae"
                         else None
+                    ),
+                    reference_mask_latent=mask_latent,
+                    source_protection=args.source_protected_memory,
+                    reference_protection_dilation_kernel=(
+                        args.warp_reference_protection_kernel
+                    ),
+                    generated_only_threshold=(
+                        args.warp_generated_only_threshold
                     ),
                 )
             )
@@ -1239,6 +1266,13 @@ def main() -> None:
                 "memory_dilation_kernel": args.warp_memory_dilation_kernel,
                 "query_feather_kernel": args.warp_query_feather_kernel,
                 "historical_representation": args.warp_history_representation,
+                "source_protected_memory": args.source_protected_memory,
+                "reference_protection_kernel": (
+                    args.warp_reference_protection_kernel
+                ),
+                "generated_only_threshold": (
+                    args.warp_generated_only_threshold
+                ),
                 "short_term_recent": (
                     args.continuous_recent_fallback
                     if args.continuous_virtual_recent

@@ -37,6 +37,7 @@ from mapkv.warp_reencode import (
     WarpReencodePlan,
     build_continuous_virtual_recent_plans,
     build_rotation_target_to_source_grid,
+    reference_protected_coverage,
     strong_memory_coverage,
     warp_latent,
 )
@@ -49,6 +50,7 @@ from mapkv.surfel_index import (
 from mapkv_proto.trajectory_builder import (
     build_control_phases,
     build_exact_c2w,
+    build_source_protected_revisit_phases,
     build_yaw_samples,
     monotonic_index,
     phase_by_name,
@@ -1462,3 +1464,89 @@ def test_slot_selection_does_not_call_both_required_for_a_near_tie():
         (0.020, 0.066, "reference"),
     ]
     assert _select_best_slot(groups, ranking) == "recent"
+
+
+def test_source_protected_trajectory_is_exact_and_block_aligned():
+    phases, ramps = build_source_protected_revisit_phases(
+        b1_theta_degrees=45.0,
+        leave_theta_degrees=-20.0,
+        b2_theta_degrees=35.0,
+        temporal_stride=4.0,
+        frames_per_block=3,
+        requested_speed_degrees_per_frame=0.5,
+    )
+    assert ramps == {
+        "A_to_B1": 8,
+        "B1_to_Leave": 11,
+        "Leave_to_B2": 10,
+    }
+    assert [phase.name for phase in phases] == [
+        "A0_hold",
+        "A_to_B1",
+        "B1_hold",
+        "B1_to_Leave",
+        "Leave_hold",
+        "Leave_to_B2",
+        "B2_hold",
+    ]
+    assert phase_by_name(phases, "B1_hold").start_yaw == 45.0
+    assert phase_by_name(phases, "Leave_hold").start_yaw == -20.0
+    assert phase_by_name(phases, "B2_hold").start_yaw == 35.0
+    assert plateau_middle_chunk(phase_by_name(phases, "B1_hold")) == 11
+    assert plateau_middle_chunk(phase_by_name(phases, "B2_hold")) == 37
+
+
+def test_surfel_reference_blind_observation_roundtrips(tmp_path):
+    cells = [
+        SurfelCell(
+            voxel_key=(0, 0, 1),
+            xyz=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+            confidence=2.0,
+            normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            radius=0.1,
+            rgb_preview=None,
+            first_seen_chunk=3,
+            last_seen_chunk=8,
+            observing_chunks=[3, 8],
+            chunk_weights={3: 1.0, 8: 1.0},
+            view_dirs={},
+            reference_blind_at_write={3: 0.1, 8: 0.9},
+            observation_weight=2.0,
+        )
+    ]
+    path = tmp_path / "surfel_index.npz"
+    VoxelSurfelIndex(0.1, cells).save(path)
+    loaded = VoxelSurfelIndex.load(path)
+    assert loaded.cells[0].reference_blind_at_write == pytest.approx(
+        {3: 0.1, 8: 0.9}
+    )
+    np.testing.assert_array_equal(
+        loaded.generated_only_cell_indices(8), np.array([0], dtype=np.int32)
+    )
+    assert loaded.generated_only_cell_indices(3).size == 0
+
+
+def test_source_protected_gate_is_zero_for_reference_valid_tokens():
+    coverage = torch.ones(1, 3, 4, 4)
+    mask = -torch.ones(1, 3, 1, 4, 4)
+    mask[:, :, :, :, :2] = 1.0
+    context = MemoryContext(
+        target_block=9,
+        source_chunk=2,
+        layer_payloads={},
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        alpha=1.0,
+        gate_mode="surfel_source_protected",
+        smooth_kernel=3,
+        coverage=coverage,
+        reference_protection_kernel=1,
+    )
+    gate = context.with_query_gate(mask, (4, 4)).query_gate.reshape(
+        1, 3, 4, 4
+    )
+    assert torch.count_nonzero(gate[:, :, :, :2]) == 0
+    assert torch.count_nonzero(gate[:, :, :, 2:]) > 0
+    protected = reference_protected_coverage(mask, dilation_kernel=1)
+    assert torch.all(protected[:, :, :, :2] == 1)
+    assert torch.all(protected[:, :, :, 2:] == 0)

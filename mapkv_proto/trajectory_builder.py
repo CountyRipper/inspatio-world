@@ -133,6 +133,83 @@ def build_control_phases(
     return phases, ramp_blocks
 
 
+def build_source_protected_revisit_phases(
+    *,
+    b1_theta_degrees: float,
+    leave_theta_degrees: float,
+    b2_theta_degrees: float,
+    temporal_stride: float,
+    frames_per_block: int = 3,
+    requested_speed_degrees_per_frame: float = 0.5,
+) -> tuple[list[Phase], dict[str, int]]:
+    """Build the exact 0→B1→Leave→B2 memory-required yaw schedule.
+
+    Every phase boundary is expressed in latent blocks.  Ramp lengths are
+    independently rounded up so each segment stays within the requested
+    constant-speed envelope after the measured VAE temporal mapping.
+    """
+    if temporal_stride <= 0 or requested_speed_degrees_per_frame <= 0:
+        raise ValueError("temporal stride and requested speed must be positive")
+    if frames_per_block <= 0:
+        raise ValueError("frames_per_block must be positive")
+    if b1_theta_degrees <= 0 or b2_theta_degrees <= 0:
+        raise ValueError("B1 and B2 yaw must be positive")
+    if leave_theta_degrees >= 0:
+        raise ValueError("The source-protected benchmark requires a negative leave yaw")
+
+    rgb_per_block = temporal_stride * frames_per_block
+
+    def ramp_blocks(start: float, stop: float) -> int:
+        return max(
+            1,
+            int(
+                math.ceil(
+                    abs(float(stop) - float(start))
+                    / (requested_speed_degrees_per_frame * rgb_per_block)
+                )
+            ),
+        )
+
+    segment_blocks = {
+        "A_to_B1": ramp_blocks(0.0, b1_theta_degrees),
+        "B1_to_Leave": ramp_blocks(b1_theta_degrees, leave_theta_degrees),
+        "Leave_to_B2": ramp_blocks(leave_theta_degrees, b2_theta_degrees),
+    }
+    phases: list[Phase] = []
+    _append_phase(phases, "A0_hold", 2, 0.0, 0.0)
+    _append_phase(
+        phases,
+        "A_to_B1",
+        segment_blocks["A_to_B1"],
+        0.0,
+        b1_theta_degrees,
+    )
+    _append_phase(
+        phases, "B1_hold", 2, b1_theta_degrees, b1_theta_degrees
+    )
+    _append_phase(
+        phases,
+        "B1_to_Leave",
+        segment_blocks["B1_to_Leave"],
+        b1_theta_degrees,
+        leave_theta_degrees,
+    )
+    _append_phase(
+        phases, "Leave_hold", 3, leave_theta_degrees, leave_theta_degrees
+    )
+    _append_phase(
+        phases,
+        "Leave_to_B2",
+        segment_blocks["Leave_to_B2"],
+        leave_theta_degrees,
+        b2_theta_degrees,
+    )
+    _append_phase(
+        phases, "B2_hold", 2, b2_theta_degrees, b2_theta_degrees
+    )
+    return phases, segment_blocks
+
+
 def rgb_length_for_latents(latent_length: int, temporal_stride: float) -> int:
     if latent_length <= 0:
         raise ValueError("latent_length must be positive")

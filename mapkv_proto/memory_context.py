@@ -147,6 +147,38 @@ def support_preserving_query_gate(
     return torch.maximum(hard, feathered).clamp(0, 1)
 
 
+def reference_protected_token_mask(
+    mask_block: torch.Tensor,
+    token_hw: tuple[int, int],
+    *,
+    dilation_kernel: int = 3,
+) -> torch.Tensor:
+    """Conservatively protect every query token touched by valid source."""
+    if dilation_kernel < 1 or dilation_kernel % 2 == 0:
+        raise ValueError(
+            "reference protection kernel must be a positive odd integer"
+        )
+    if mask_block.ndim != 5:
+        raise ValueError(
+            f"mask_block must be [B,F,C,H,W], got {tuple(mask_block.shape)}"
+        )
+    batch, frames = mask_block.shape[:2]
+    valid = ((mask_block.float() + 1.0) * 0.5).clamp(0, 1).mean(dim=2)
+    flat = valid.reshape(batch * frames, 1, *valid.shape[-2:])
+    if dilation_kernel > 1:
+        flat = F.max_pool2d(
+            flat,
+            dilation_kernel,
+            stride=1,
+            padding=dilation_kernel // 2,
+        )
+    if tuple(flat.shape[-2:]) != tuple(token_hw):
+        flat = F.adaptive_max_pool2d(flat, token_hw)
+    return (flat > 0).to(dtype=torch.float32).reshape(
+        batch, frames, *token_hw
+    )
+
+
 @dataclass(frozen=True)
 class MemoryContext:
     """Immutable activation plan for one target latent block."""
@@ -164,6 +196,7 @@ class MemoryContext:
     coverage: torch.Tensor | None = None
     query_gate: torch.Tensor | None = None
     memory_slot_gate: torch.Tensor | None = None
+    reference_protection_kernel: int = 3
     active_step: int | None = None
     num_steps: int | None = None
     audit_log: list[dict] = field(default_factory=list, compare=False)
@@ -215,6 +248,25 @@ class MemoryContext:
                 device=mask_block.device,
                 feather_kernel=self.smooth_kernel,
             )
+        elif self.gate_mode == "surfel_source_protected":
+            if self.coverage is None:
+                raise ValueError(
+                    "surfel_source_protected gate requires a coverage mask"
+                )
+            gate = support_preserving_query_gate(
+                self.coverage,
+                batch=batch,
+                frames=frames,
+                token_hw=token_hw,
+                device=mask_block.device,
+                feather_kernel=self.smooth_kernel,
+            )
+            protected = reference_protected_token_mask(
+                mask_block,
+                token_hw,
+                dilation_kernel=self.reference_protection_kernel,
+            )
+            gate = gate * (1.0 - protected)
         elif self.gate_mode in {"surfel", "surfel_ref_blind"}:
             if self.coverage is None:
                 raise ValueError(f"{self.gate_mode} gate requires a coverage mask")
@@ -294,6 +346,7 @@ def make_memory_context(
     smooth_kernel: int,
     coverage: torch.Tensor | None = None,
     memory_slot_gate: torch.Tensor | None = None,
+    reference_protection_kernel: int = 3,
 ) -> MemoryContext | None:
     if (
         gate_mode in {
@@ -301,6 +354,7 @@ def make_memory_context(
             "surfel_ref_blind",
             "surfel_exact",
             "surfel_support_preserving",
+            "surfel_source_protected",
         }
         and coverage is not None
         and not bool(coverage.any())
@@ -319,4 +373,5 @@ def make_memory_context(
         smooth_kernel=smooth_kernel,
         coverage=coverage,
         memory_slot_gate=memory_slot_gate,
+        reference_protection_kernel=int(reference_protection_kernel),
     )

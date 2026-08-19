@@ -180,6 +180,33 @@ def strong_memory_coverage(
     return dilated.reshape(batch, frames, height, width)
 
 
+def reference_protected_coverage(
+    mask_block: torch.Tensor,
+    *,
+    dilation_kernel: int = 3,
+) -> torch.Tensor:
+    """Return [B,F,H,W] source-valid support protected from MapKV."""
+    if dilation_kernel < 1 or dilation_kernel % 2 == 0:
+        raise ValueError(
+            "reference protection kernel must be a positive odd integer"
+        )
+    if mask_block.ndim != 5:
+        raise ValueError(
+            f"mask_block must be [B,F,C,H,W], got {tuple(mask_block.shape)}"
+        )
+    valid = ((mask_block.float() + 1.0) * 0.5).clamp(0, 1).mean(dim=2)
+    if dilation_kernel == 1:
+        return valid
+    batch, frames, height, width = valid.shape
+    protected = F.max_pool2d(
+        valid.reshape(batch * frames, 1, height, width),
+        dilation_kernel,
+        stride=1,
+        padding=dilation_kernel // 2,
+    )
+    return protected.reshape(batch, frames, height, width).clamp(0, 1)
+
+
 def warp_latent(
     historical_latent: torch.Tensor, grid: torch.Tensor
 ) -> torch.Tensor:
@@ -240,8 +267,13 @@ class WarpReencodePlan:
     recent_target_to_source_grid: torch.Tensor | None = None
     recent_coverage: torch.Tensor | None = None
     hard_coverage: torch.Tensor | None = None
+    history_coverage: torch.Tensor | None = None
+    reference_valid_coverage: torch.Tensor | None = None
+    reference_protected_coverage: torch.Tensor | None = None
+    need_coverage: torch.Tensor | None = None
     query_coverage: torch.Tensor | None = None
     query_feather_kernel: int = 1
+    reference_protection_kernel: int = 3
     historical_representation: str = "latent_warp"
     historical_is_target_aligned: bool = False
     rgb_preview_source: torch.Tensor | None = None
@@ -310,6 +342,22 @@ class WarpReencodePlan:
             )
         if self.hard_coverage is not None:
             self.artifacts["hard_coverage"] = self.hard_coverage.detach().cpu()
+        if self.history_coverage is not None:
+            self.artifacts["history_coverage"] = (
+                self.history_coverage.detach().cpu()
+            )
+        if self.reference_valid_coverage is not None:
+            self.artifacts["reference_valid_coverage"] = (
+                self.reference_valid_coverage.detach().cpu()
+            )
+        if self.reference_protected_coverage is not None:
+            self.artifacts["reference_protected_coverage"] = (
+                self.reference_protected_coverage.detach().cpu()
+            )
+        if self.need_coverage is not None:
+            self.artifacts["need_coverage"] = (
+                self.need_coverage.detach().cpu()
+            )
         if self.query_coverage is not None:
             self.artifacts["query_coverage_source"] = (
                 self.query_coverage.detach().cpu()
@@ -388,6 +436,7 @@ class WarpReencodePlan:
             "global",
             "surfel_exact",
             "surfel_support_preserving",
+            "surfel_source_protected",
         }:
             raise ValueError(
                 f"Unsupported Virtual Recent query gate: {self.query_gate_mode}"
@@ -412,6 +461,7 @@ class WarpReencodePlan:
                 if self.query_gate_mode != "global"
                 else None
             ),
+            reference_protection_kernel=self.reference_protection_kernel,
         )
         if context is None:
             raise RuntimeError("Virtual recent context unexpectedly disabled")
@@ -423,9 +473,16 @@ class WarpReencodePlan:
                     and query_coverage is self.coverage
                 ),
                 "memory_and_query_masks_split": (
-                    self.query_gate_mode == "surfel_support_preserving"
+                    self.query_gate_mode
+                    in {
+                        "surfel_support_preserving",
+                        "surfel_source_protected",
+                    }
                 ),
                 "query_feather_kernel": int(self.query_feather_kernel),
+                "reference_protection_kernel": int(
+                    self.reference_protection_kernel
+                ),
             }
         )
         self.memory_context = context
@@ -581,6 +638,8 @@ def _surfel_coverage_for_pose(
     intrinsics: np.ndarray,
     source_image_hw: tuple[int, int],
     target_hw: tuple[int, int],
+    generated_only: bool = False,
+    reference_blind_threshold: float = 0.5,
 ) -> tuple[torch.Tensor, dict]:
     """Project source-chunk surfels after eligibility filtering."""
     eligible = [
@@ -592,6 +651,22 @@ def _surfel_coverage_for_pose(
         raise RuntimeError(
             "A source-observed surfel was created after the source chunk"
         )
+    generated_only_indices = None
+    if generated_only:
+        tagged = [
+            cell
+            for cell in eligible
+            if int(source_chunk) in cell.reference_blind_at_write
+        ]
+        if not tagged:
+            raise RuntimeError(
+                "Source-protected WRE requires reference_blind_at_write "
+                f"metadata for source chunk {source_chunk}"
+            )
+        generated_only_indices = surfel_index.generated_only_cell_indices(
+            source_chunk,
+            reference_blind_threshold=reference_blind_threshold,
+        )
     visible = surfel_index.visible_cells(
         query_pose,
         intrinsics,
@@ -599,6 +674,7 @@ def _surfel_coverage_for_pose(
         source_image_size=source_image_hw,
         eligible_max_chunk=int(target_chunk) - 2,
         eligible_chunks={int(source_chunk)},
+        eligible_indices=generated_only_indices,
         use_occlusion=True,
     )
     coverage = np.zeros(target_hw, dtype=np.float32)
@@ -610,6 +686,15 @@ def _surfel_coverage_for_pose(
         "target_chunk": int(target_chunk),
         "eligibility_before_zbuffer": True,
         "eligible_source_observed_surfels": len(eligible),
+        "generated_only_filter": bool(generated_only),
+        "reference_blind_threshold": (
+            float(reference_blind_threshold) if generated_only else None
+        ),
+        "generated_only_source_surfels": (
+            None
+            if generated_only_indices is None
+            else int(len(generated_only_indices))
+        ),
         "num_eligible_surfels": int(visible["num_eligible_cells"]),
         "num_visible_surfels": int(visible["num_visible_cells"]),
         "num_visible_pixels": int(len(pixels)),
@@ -645,6 +730,10 @@ def build_continuous_virtual_recent_plans(
     query_feather_kernel: int = 3,
     historical_representation: str = "latent_warp",
     vae=None,
+    reference_mask_latent: torch.Tensor | None = None,
+    source_protection: bool = False,
+    reference_protection_dilation_kernel: int = 3,
+    generated_only_threshold: float = 0.5,
 ) -> tuple[dict[int, WarpReencodePlan], list[dict]]:
     """Build visibility-driven Virtual Recent plans for every causal block.
 
@@ -662,13 +751,17 @@ def build_continuous_virtual_recent_plans(
         "global",
         "surfel_exact",
         "surfel_support_preserving",
+        "surfel_source_protected",
     }:
         raise ValueError(
             f"Unsupported continuous query gate mode: {query_gate_mode}"
         )
     if mask_policy not in {"legacy_soft", "strong_core"}:
         raise ValueError(f"Unsupported continuous mask policy: {mask_policy}")
-    if mask_policy == "strong_core" and query_gate_mode != "surfel_support_preserving":
+    if mask_policy == "strong_core" and query_gate_mode not in {
+        "surfel_support_preserving",
+        "surfel_source_protected",
+    }:
         raise ValueError(
             "strong_core mask policy requires surfel_support_preserving query gate"
         )
@@ -678,6 +771,19 @@ def build_continuous_virtual_recent_plans(
         )
     if historical_representation == "rgb_warp_vae" and vae is None:
         raise ValueError("rgb_warp_vae requires the native Wan VAE")
+    if source_protection:
+        if reference_mask_latent is None:
+            raise ValueError(
+                "source-protected WRE requires the current reference mask"
+            )
+        if reference_mask_latent.ndim != 5:
+            raise ValueError(
+                "reference_mask_latent must be [B,F,C,H,W]"
+            )
+        if int(reference_mask_latent.shape[1]) != int(latent_length):
+            raise ValueError(
+                "reference mask latent length does not match generation"
+            )
     source_path = Path(source_latents_path).resolve()
     payload = torch.load(source_path, map_location="cpu", weights_only=True)
     if isinstance(payload, dict):
@@ -816,6 +922,8 @@ def build_continuous_virtual_recent_plans(
                 intrinsics=surfel_intrinsics,
                 source_image_hw=surfel_source_hw,
                 target_hw=latent_hw,
+                generated_only=source_protection,
+                reference_blind_threshold=generated_only_threshold,
             )
             historical_grids.append(history_grid)
             surfel_masks.append(surfel_mask * history_mask)
@@ -882,7 +990,28 @@ def build_continuous_virtual_recent_plans(
             rgb_warp_coverage_preview = torch.stack(rgb_valid)[
                 preview_index
             ]
-        hard_memory_coverage = torch.stack(surfel_masks).unsqueeze(0)
+        history_coverage = torch.stack(surfel_masks).unsqueeze(0)
+        reference_valid = None
+        reference_protected = None
+        if source_protection:
+            target_reference_mask = reference_mask_latent[
+                :, target_start:target_stop
+            ].to(device=device)
+            reference_valid = (
+                ((target_reference_mask.float() + 1.0) * 0.5)
+                .clamp(0, 1)
+                .mean(dim=2)
+            )
+            reference_protected = reference_protected_coverage(
+                target_reference_mask,
+                dilation_kernel=reference_protection_dilation_kernel,
+            ).to(device=device)
+            hard_memory_coverage = (
+                history_coverage.to(device=device)
+                * (1.0 - reference_protected)
+            )
+        else:
+            hard_memory_coverage = history_coverage.to(device=device)
         if mask_policy == "strong_core":
             coverage = strong_memory_coverage(
                 hard_memory_coverage, memory_dilation_kernel
@@ -891,6 +1020,9 @@ def build_continuous_virtual_recent_plans(
             coverage = feather_coverage(
                 hard_memory_coverage, feather_kernel
             ).to(device=device)
+        if reference_protected is not None:
+            # Dilation/feather must never leak back into protected source.
+            coverage = coverage * (1.0 - reference_protected)
         if warp_short_term_recent:
             mode = "continuous_geometry_reprojected_virtual_recent"
         elif query_gate_mode == "global":
@@ -901,6 +1033,8 @@ def build_continuous_virtual_recent_plans(
             mode = "masked_continuous_warp_reencode"
         if historical_representation == "rgb_warp_vae":
             mode = "strong_core_rgb_warp_vae_wre"
+        if source_protection:
+            mode = "source_protected_rgb_warp_vae_wre"
         selection = {
             "target_chunk": target_chunk,
             "source_chunk": int(source_chunk),
@@ -919,6 +1053,32 @@ def build_continuous_virtual_recent_plans(
             "source_target_rotation_degrees": rotations,
             "source_latents_path": str(source_path),
             "activation_policy": "visible_source_surfel_support",
+            "source_protection": bool(source_protection),
+            "generated_only_history": bool(source_protection),
+            "generated_only_threshold": (
+                float(generated_only_threshold) if source_protection else None
+            ),
+            "reference_protection_dilation_kernel": (
+                int(reference_protection_dilation_kernel)
+                if source_protection
+                else None
+            ),
+            "history_coverage_fraction": float(
+                history_coverage.float().mean().item()
+            ),
+            "reference_valid_fraction": (
+                None
+                if reference_valid is None
+                else float(reference_valid.mean().item())
+            ),
+            "reference_protected_fraction": (
+                None
+                if reference_protected is None
+                else float(reference_protected.mean().item())
+            ),
+            "memory_need_fraction": float(
+                hard_memory_coverage.float().mean().item()
+            ),
             "short_term_recent": (
                 "camera_warped" if warp_short_term_recent else "raw_last_pred"
             ),
@@ -963,6 +1123,10 @@ def build_continuous_virtual_recent_plans(
             recent_target_to_source_grid=recent_grid_tensor,
             recent_coverage=recent_coverage,
             hard_coverage=hard_memory_coverage.to(device=device),
+            history_coverage=history_coverage.to(device=device),
+            reference_valid_coverage=reference_valid,
+            reference_protected_coverage=reference_protected,
+            need_coverage=hard_memory_coverage.to(device=device),
             query_coverage=coverage,
             query_feather_kernel=(
                 int(query_feather_kernel)
@@ -970,6 +1134,9 @@ def build_continuous_virtual_recent_plans(
                 else 1
             ),
             query_gate_mode=query_gate_mode,
+            reference_protection_kernel=int(
+                reference_protection_dilation_kernel
+            ),
             mode=mode,
             historical_representation=historical_representation,
             historical_is_target_aligned=(
@@ -984,6 +1151,8 @@ def build_continuous_virtual_recent_plans(
                 "surfel_index": str(Path(surfel_index_path).resolve()),
                 "surfel_sequence": str(sequence_path),
                 "source_candidate_only": True,
+                "source_protection": bool(source_protection),
+                "generated_only_observations": bool(source_protection),
                 "memory_mask_policy": mask_policy,
                 "per_frame": per_frame_geometry,
             },
@@ -1067,6 +1236,10 @@ def save_warp_reencode_artifacts(
         mask_artifacts = {
             "coverage": "coverage.png",
             "hard_coverage": "M_hard.png",
+            "history_coverage": "M_history.png",
+            "reference_valid_coverage": "M_ref_valid.png",
+            "reference_protected_coverage": "M_ref_protected.png",
+            "need_coverage": "M_need.png",
             "memory_coverage": "M_memory.png",
             "query_coverage_source": "M_query_source.png",
             "query_gate_tokens": "M_query.png",

@@ -68,6 +68,41 @@ The stage performs:
 - All/Early10/Middle10/Late10 layer budget;
 - a compact synchronized HTML report.
 
+## Source-protected generated-history revisit
+
+Build the stronger exact-yaw benchmark from the same static scene:
+
+~~~bash
+PYTHONPATH=. /mnt/16T2/daixiangting/conda_envs/inspatio/bin/python \
+  scripts/build_mapkv_control_case.py \
+  --case_id yaw45m20to35_scene01 \
+  --source_json test/example/new.json \
+  --data_path_root /mnt/16T2/daixiangting/inspatio-world \
+  --source_frame_index 240 \
+  --theta 45 --leave_theta -20 --revisit_theta 35 \
+  --vae_calibration_metadata \
+    artifacts/control/yaw30_scene01/baseline/seed_0/run_metadata.json \
+  --vae_time_map artifacts/control/vae_time_map.json \
+  --render --render_device 0
+~~~
+
+Then run the cached baseline → causal CUT3R → tagged surfel → RGB-Warp WRE
+pipeline:
+
+~~~bash
+bash scripts/run_mapkv_source_protected.sh \
+  --stage full --gpu 0 \
+  --output_root \
+    results/mapkv_fast/yaw45m20to35_scene01_seed0_source_protected
+~~~
+
+The source-protected path records `reference_blind_at_write` per surfel
+observation and uses
+`M_need = M_history × (1 - M_ref_protected)` for both Virtual Recent
+composition and a source-clamped query gate. The report separates source
+stability from true generated-history revisit recovery and always includes the
+complete B1 → leave → return → B2 videos.
+
 For the current partial-overlap control, unconstrained retrieval and the
 declared B1-locality ablation are stored separately. The latter restricts
 candidates to the manifest B1 plateau only to isolate *where* memory acts; it
