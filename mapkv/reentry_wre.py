@@ -13,7 +13,12 @@ from mapkv_proto.pose_utils import (
     to_cut3r_c2w,
 )
 
-from .reentry_memory import ReentryMemoryLifecycle, erode_binary_coverage
+from .reentry_memory import (
+    PerSurfaceRefreshLifecycle,
+    ReentryEpisodeLifecycle,
+    ReentryMemoryLifecycle,
+    erode_binary_coverage,
+)
 from .surfel_index import SurfelIndex
 from .warp_reencode import (
     WarpReencodePlan,
@@ -49,16 +54,17 @@ def _candidate_chunks(
     start_chunk: int,
     stop_chunk_exclusive: int,
     reference_blind_threshold: float,
+    same_surface_only: bool = False,
 ) -> list[int]:
-    # Lifecycle is anchored to ``anchor_indices``, but source selection must
-    # not depend on successful cross-view fusion into those exact cells.  A
-    # good first-pass observation can contain the same surface in a nearby,
-    # not-yet-merged cell.  Keep the parameter to make this distinction
-    # explicit and verify that the anchor group itself is non-empty.
     if not len(np.asarray(anchor_indices).reshape(-1)):
         return []
     candidates: set[int] = set()
-    for cell in index.cells:
+    cells = (
+        (index.cells[int(cell_index)] for cell_index in anchor_indices)
+        if same_surface_only
+        else index.cells
+    )
+    for cell in cells:
         for chunk in cell.observing_chunks:
             chunk = int(chunk)
             if not start_chunk <= chunk < stop_chunk_exclusive:
@@ -86,6 +92,7 @@ def score_view_adaptive_observations(
     rgb_length: int,
     frames_per_block: int,
     reference_blind_threshold: float,
+    same_surface_only: bool = False,
 ) -> list[dict]:
     """Score first-episode observations and return a deterministic ranking."""
     query_pose = np.asarray(query_pose, dtype=np.float64)
@@ -96,12 +103,14 @@ def score_view_adaptive_observations(
             chunk,
             reference_blind_threshold=reference_blind_threshold,
         )
-        eligible = generated.astype(np.int32)
         shared = np.intersect1d(
             np.asarray(surface_group_indices, dtype=np.int32),
             generated,
             assume_unique=False,
         ).astype(np.int32)
+        eligible = shared if same_surface_only else generated.astype(np.int32)
+        if not len(eligible):
+            continue
         visible = surfel_index.visible_cells(
             query_pose,
             intrinsics,
@@ -194,6 +203,7 @@ def score_view_adaptive_observations(
                 "rotation_distance_degrees": rotation_degrees,
                 "eligible_generated_only_surfels": int(len(eligible)),
                 "shared_anchor_surfels": int(len(shared)),
+                "same_surface_only": bool(same_surface_only),
             }
         )
     ranking.sort(
@@ -229,7 +239,10 @@ def build_reentry_virtual_recent_plans(
     vae,
     reference_mask_latent: torch.Tensor,
     absent_blocks: int = 2,
+    refresh_policy: str = "one_shot",
+    refresh_ttl_blocks: int = 2,
     view_adaptive_source: bool = False,
+    same_surface_source: bool = False,
     edge_safe: bool = False,
     reference_protection_dilation_kernel: int = 3,
     generated_only_threshold: float = 0.5,
@@ -237,7 +250,7 @@ def build_reentry_virtual_recent_plans(
     query_feather_kernel: int = 3,
     warp_valid_erosion_kernel: int = 3,
 ) -> tuple[dict[int, WarpReencodePlan], list[dict]]:
-    """Build one-shot, lifecycle-aware RGB-Warp→VAE Recent corrections."""
+    """Build lifecycle-aware RGB-Warp→VAE Recent corrections."""
     if vae is None:
         raise ValueError("Re-entry WRE requires the native Wan VAE")
     if feather_kernel < 1 or feather_kernel % 2 == 0:
@@ -248,6 +261,14 @@ def build_reentry_virtual_recent_plans(
         raise ValueError("reference mask latent length does not match generation")
     if observation_start_chunk > int(source_chunk):
         raise ValueError("observation_start_chunk must include the anchor source")
+    if refresh_policy not in {
+        "one_shot",
+        "episode_continuous",
+        "per_surface_ttl",
+    }:
+        raise ValueError(f"Unsupported re-entry refresh policy: {refresh_policy}")
+    if same_surface_source and not view_adaptive_source:
+        raise ValueError("same_surface_source requires view_adaptive_source")
 
     source_path = Path(source_latents_path).resolve()
     all_latents = torch.load(source_path, map_location="cpu", weights_only=True)
@@ -312,6 +333,7 @@ def build_reentry_virtual_recent_plans(
         target_poses = poses[np.asarray(target_rgb, dtype=np.int64)]
         raw_surfel_masks = []
         anchor_valid = []
+        anchor_visible_results = []
         for anchor_pose, target_pose in zip(anchor_poses, target_poses):
             _, valid, _ = build_rotation_target_to_source_grid(
                 anchor_pose,
@@ -333,6 +355,18 @@ def build_reentry_virtual_recent_plans(
             )
             anchor_valid.append(valid)
             raw_surfel_masks.append(surfel_mask)
+            anchor_visible_results.append(
+                surfel_index.visible_cells(
+                    to_cut3r_c2w(target_pose),
+                    surfel_intrinsics,
+                    latent_hw,
+                    source_image_size=surfel_source_hw,
+                    eligible_max_chunk=int(target_chunk) - 2,
+                    eligible_chunks={int(source_chunk)},
+                    eligible_indices=anchor_indices,
+                    use_occlusion=True,
+                )
+            )
         raw_history = torch.stack(raw_surfel_masks).unsqueeze(0).to(device)
         warp_valid = torch.stack(anchor_valid).unsqueeze(0).to(device)
         target_reference_mask = reference_mask_latent[
@@ -350,6 +384,29 @@ def build_reentry_virtual_recent_plans(
         anchor_need = (
             raw_history * warp_valid * (1.0 - ref_protected)
         )
+        visible_anchor_indices: set[int] = set()
+        readable_anchor_indices: set[int] = set()
+        accepted_pixels = (
+            (warp_valid * (1.0 - ref_protected))[0]
+            .detach()
+            .float()
+            .cpu()
+            .numpy()
+        )
+        for frame_index, visible_result in enumerate(anchor_visible_results):
+            pixels = np.asarray(visible_result["pixels"], dtype=np.int32)
+            indices = np.asarray(visible_result["indices"], dtype=np.int32)
+            visible_anchor_indices.update(int(value) for value in indices)
+            if len(pixels):
+                accepted = (
+                    accepted_pixels[
+                        frame_index, pixels[:, 0], pixels[:, 1]
+                    ]
+                    > 0
+                )
+                readable_anchor_indices.update(
+                    int(value) for value in indices[accepted]
+                )
         target_info[target_chunk] = {
             "target_start": target_start,
             "target_stop": target_stop,
@@ -360,6 +417,12 @@ def build_reentry_virtual_recent_plans(
             "reference_valid": ref_valid,
             "reference_protected": ref_protected,
             "anchor_need": anchor_need,
+            "visible_anchor_indices": np.asarray(
+                sorted(visible_anchor_indices), dtype=np.int32
+            ),
+            "readable_anchor_indices": np.asarray(
+                sorted(readable_anchor_indices), dtype=np.int32
+            ),
         }
 
     absent_run = 0
@@ -380,37 +443,112 @@ def build_reentry_virtual_recent_plans(
         start_chunk=int(observation_start_chunk),
         stop_chunk_exclusive=int(first_absence_start),
         reference_blind_threshold=generated_only_threshold,
+        same_surface_only=same_surface_source,
     )
     if int(source_chunk) not in candidates:
         raise RuntimeError("Anchor source is missing from first-episode candidates")
 
-    lifecycle = ReentryMemoryLifecycle(absent_blocks=absent_blocks)
     decisions: dict[int, dict] = {}
-    for target_chunk, info in target_info.items():
-        visible = bool(info["raw_history"].any())
-        read_support = bool(info["anchor_need"].any())
-        decision = lifecycle.step(
-            visible=visible,
-            read_support=read_support,
+    active_indices_by_chunk: dict[int, np.ndarray] = {}
+    if refresh_policy == "per_surface_ttl":
+        surface_lifecycle = PerSurfaceRefreshLifecycle(
+            anchor_indices,
+            absent_blocks=absent_blocks,
+            refresh_ttl_blocks=refresh_ttl_blocks,
         )
-        decisions[target_chunk] = {
-            "target_chunk": int(target_chunk),
-            "state_before": decision.state_before.value,
-            "state_after": decision.state_after.value,
-            "historical_visible": visible,
-            "historical_visibility_fraction": float(
-                info["raw_history"].float().mean().item()
-            ),
-            "absence_count": decision.absence_count,
-            "episode_id": decision.episode_id,
-            "read_support": read_support,
-            "read_long_term": decision.read_long_term,
-            "anchor_need_fraction": float(
-                info["anchor_need"].float().mean().item()
-            ),
-            "first_absence_start_chunk": int(first_absence_start),
-            "first_episode_candidate_chunks": candidates,
-        }
+        for target_chunk, info in target_info.items():
+            surface_decision = surface_lifecycle.step(
+                visible_surface_ids=info["visible_anchor_indices"],
+                readable_surface_ids=info["readable_anchor_indices"],
+            )
+            active_indices = np.asarray(
+                surface_decision.active_surface_ids, dtype=np.int32
+            )
+            active_indices_by_chunk[target_chunk] = active_indices
+            read_long_term = bool(len(active_indices))
+            decisions[target_chunk] = {
+                "target_chunk": int(target_chunk),
+                "state_before": "PER_SURFACE",
+                "state_after": (
+                    "PER_SURFACE_REFRESH_ACTIVE"
+                    if read_long_term
+                    else "PER_SURFACE_WAIT"
+                ),
+                "historical_visible": bool(info["raw_history"].any()),
+                "historical_visibility_fraction": float(
+                    info["raw_history"].float().mean().item()
+                ),
+                "absence_count": 0,
+                "episode_id": 1,
+                "read_support": bool(len(info["readable_anchor_indices"])),
+                "read_long_term": read_long_term,
+                "anchor_need_fraction": float(
+                    info["anchor_need"].float().mean().item()
+                ),
+                "visible_surface_count": len(
+                    surface_decision.visible_surface_ids
+                ),
+                "readable_surface_count": len(
+                    surface_decision.readable_surface_ids
+                ),
+                "newly_reentered_surface_count": len(
+                    surface_decision.newly_reentered_surface_ids
+                ),
+                "active_refresh_surface_count": len(
+                    surface_decision.active_surface_ids
+                ),
+                "armed_surface_count": surface_decision.armed_surface_count,
+                "refresh_ttl_histogram": (
+                    surface_decision.ttl_histogram_before_decrement
+                ),
+                "first_absence_start_chunk": int(first_absence_start),
+                "first_episode_candidate_chunks": candidates,
+            }
+    else:
+        lifecycle = (
+            ReentryEpisodeLifecycle(absent_blocks=absent_blocks)
+            if refresh_policy == "episode_continuous"
+            else ReentryMemoryLifecycle(absent_blocks=absent_blocks)
+        )
+        for target_chunk, info in target_info.items():
+            visible = bool(info["raw_history"].any())
+            read_support = bool(info["anchor_need"].any())
+            decision = lifecycle.step(
+                visible=visible,
+                read_support=read_support,
+            )
+            decisions[target_chunk] = {
+                "target_chunk": int(target_chunk),
+                "state_before": decision.state_before.value,
+                "state_after": decision.state_after.value,
+                "historical_visible": visible,
+                "historical_visibility_fraction": float(
+                    info["raw_history"].float().mean().item()
+                ),
+                "absence_count": decision.absence_count,
+                "episode_id": decision.episode_id,
+                "read_support": read_support,
+                "read_long_term": decision.read_long_term,
+                "anchor_need_fraction": float(
+                    info["anchor_need"].float().mean().item()
+                ),
+                "visible_surface_count": int(
+                    len(info["visible_anchor_indices"])
+                ),
+                "readable_surface_count": int(
+                    len(info["readable_anchor_indices"])
+                ),
+                "newly_reentered_surface_count": 0,
+                "active_refresh_surface_count": (
+                    int(len(info["readable_anchor_indices"]))
+                    if decision.read_long_term
+                    else 0
+                ),
+                "armed_surface_count": 0,
+                "refresh_ttl_histogram": {},
+                "first_absence_start_chunk": int(first_absence_start),
+                "first_episode_candidate_chunks": candidates,
+            }
 
     source_cache: dict[int, dict] = {}
 
@@ -439,15 +577,22 @@ def build_reentry_virtual_recent_plans(
     plans: dict[int, WarpReencodePlan] = {}
     selections: list[dict] = []
     selected_for_episode: dict[int, int] = {}
+    ranking_for_episode: dict[int, list[dict]] = {}
     selected_layers = tuple(int(layer) for layer in selected_layers)
     selected_steps = tuple(int(step) for step in selected_step_indices)
     for target_chunk, info in target_info.items():
         timeline = dict(decisions[target_chunk])
         timeline.update(
             {
-                "activation_policy": "reentry_once_then_native_recent_handoff",
+                "activation_policy": refresh_policy,
                 "absent_blocks_required": int(absent_blocks),
+                "refresh_ttl_blocks": (
+                    int(refresh_ttl_blocks)
+                    if refresh_policy == "per_surface_ttl"
+                    else None
+                ),
                 "view_adaptive_source": bool(view_adaptive_source),
+                "same_surface_source": bool(same_surface_source),
                 "edge_safe_support": bool(edge_safe),
                 "generated_only_threshold": float(
                     generated_only_threshold
@@ -461,8 +606,10 @@ def build_reentry_virtual_recent_plans(
             selections.append(timeline)
             continue
         episode_id = int(timeline["episode_id"])
-        ranking = []
-        if view_adaptive_source:
+        ranking = ranking_for_episode.get(episode_id, [])
+        if episode_id in selected_for_episode:
+            selected_source = selected_for_episode[episode_id]
+        elif view_adaptive_source:
             target_pose = to_cut3r_c2w(
                 info["target_poses"][len(info["target_poses"]) // 2]
             )
@@ -480,6 +627,7 @@ def build_reentry_virtual_recent_plans(
                 rgb_length=rgb_length,
                 frames_per_block=frames_per_block,
                 reference_blind_threshold=generated_only_threshold,
+                same_surface_only=same_surface_source,
             )
             if not ranking or float(ranking[0]["score"]) <= 0:
                 raise RuntimeError("No valid first-episode observation for re-entry")
@@ -487,16 +635,31 @@ def build_reentry_virtual_recent_plans(
         else:
             selected_source = int(source_chunk)
         selected_for_episode.setdefault(episode_id, selected_source)
-        if selected_for_episode[episode_id] != selected_source:
-            raise RuntimeError("Historical source switched within a re-entry episode")
+        ranking_for_episode.setdefault(episode_id, ranking)
         source = load_source(selected_source)
         selected_generated = surfel_index.generated_only_cell_indices(
             selected_source,
             reference_blind_threshold=generated_only_threshold,
         )
-        selected_group = selected_generated.astype(np.int32)
+        selected_group = (
+            np.intersect1d(
+                selected_generated,
+                anchor_indices,
+                assume_unique=False,
+            ).astype(np.int32)
+            if same_surface_source
+            else selected_generated.astype(np.int32)
+        )
+        if refresh_policy == "per_surface_ttl":
+            selected_group = np.intersect1d(
+                selected_group,
+                active_indices_by_chunk[target_chunk],
+                assume_unique=False,
+            ).astype(np.int32)
         if not len(selected_group):
-            raise RuntimeError("Selected source has no shared generated-only surfels")
+            raise RuntimeError(
+                "Selected source has no active same-memory generated-only surfels"
+            )
 
         historical_grids = []
         raw_masks = []
@@ -657,9 +820,13 @@ def build_reentry_virtual_recent_plans(
                 "edge_safe_view_adaptive_reentry_rgb_wre"
                 if edge_safe
                 else (
-                    "view_adaptive_reentry_rgb_wre"
-                    if view_adaptive_source
-                    else "reentry_only_rgb_wre"
+                    "same_surface_view_adaptive_reentry_rgb_wre"
+                    if same_surface_source
+                    else (
+                        "view_adaptive_reentry_rgb_wre"
+                        if view_adaptive_source
+                        else f"{refresh_policy}_rgb_wre"
+                    )
                 )
             ),
             geometry_audit={
@@ -668,6 +835,7 @@ def build_reentry_virtual_recent_plans(
                 "surface_group_anchor_chunk": int(source_chunk),
                 "surface_group_cells": int(len(anchor_indices)),
                 "selected_observation_cells": int(len(selected_group)),
+                "same_surface_source": bool(same_surface_source),
                 "generated_only_threshold": float(
                     generated_only_threshold
                 ),
@@ -679,10 +847,16 @@ def build_reentry_virtual_recent_plans(
                 "per_frame": geometry_audits,
             },
             audit={
-                "memory_lifecycle": "reentry_once_then_native_recent_handoff",
+                "memory_lifecycle": refresh_policy,
                 "episode_id": episode_id,
+                "refresh_ttl_blocks": (
+                    int(refresh_ttl_blocks)
+                    if refresh_policy == "per_surface_ttl"
+                    else None
+                ),
                 "selected_source_locked_for_episode": True,
                 "view_adaptive_source": bool(view_adaptive_source),
+                "same_surface_source": bool(same_surface_source),
                 "observation_ranking": ranking,
                 "first_episode_candidate_chunks": candidates,
                 "first_absence_start_chunk": int(first_absence_start),

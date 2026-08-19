@@ -27,6 +27,8 @@ from mapkv.canonical_kv import _memory_token_gate, _warp_token_payload
 from mapkv.retrieval import GeometryChunkRetriever
 from mapkv.reentry_memory import (
     MemoryEpisodeState,
+    PerSurfaceRefreshLifecycle,
+    ReentryEpisodeLifecycle,
     ReentryMemoryLifecycle,
     erode_binary_coverage,
     inward_feather_token_gate,
@@ -1592,6 +1594,47 @@ def test_reentry_lifecycle_reads_once_after_two_absent_blocks():
     assert handoff.read_long_term is False
 
 
+def test_reentry_episode_continuously_reads_after_true_absence():
+    lifecycle = ReentryEpisodeLifecycle(absent_blocks=2)
+    assert lifecycle.step(visible=True, read_support=True).read_long_term is False
+    assert lifecycle.step(visible=False, read_support=False).read_long_term is False
+    absent = lifecycle.step(visible=False, read_support=False)
+    assert absent.state_after == MemoryEpisodeState.ABSENT
+    waiting = lifecycle.step(visible=True, read_support=False)
+    assert waiting.state_after == MemoryEpisodeState.REENTRY_ACTIVE
+    assert waiting.read_long_term is False
+    first_read = lifecycle.step(visible=True, read_support=True)
+    second_read = lifecycle.step(visible=True, read_support=True)
+    assert first_read.read_long_term is True
+    assert second_read.read_long_term is True
+    assert second_read.episode_id == first_read.episode_id == 1
+
+
+def test_per_surface_ttl_refreshes_later_entering_surfaces_independently():
+    lifecycle = PerSurfaceRefreshLifecycle(
+        [1, 2], absent_blocks=2, refresh_ttl_blocks=2
+    )
+    assert not lifecycle.step(
+        visible_surface_ids=[1, 2], readable_surface_ids=[1, 2]
+    ).active_surface_ids
+    lifecycle.step(visible_surface_ids=[], readable_surface_ids=[])
+    lifecycle.step(visible_surface_ids=[], readable_surface_ids=[])
+    first = lifecycle.step(
+        visible_surface_ids=[1], readable_surface_ids=[1]
+    )
+    assert first.newly_reentered_surface_ids == (1,)
+    assert first.active_surface_ids == (1,)
+    second = lifecycle.step(
+        visible_surface_ids=[1, 2], readable_surface_ids=[1, 2]
+    )
+    assert second.newly_reentered_surface_ids == (2,)
+    assert second.active_surface_ids == (1, 2)
+    third = lifecycle.step(
+        visible_surface_ids=[1, 2], readable_surface_ids=[1, 2]
+    )
+    assert third.active_surface_ids == (2,)
+
+
 def test_edge_safe_masks_never_expand_outside_support():
     support = torch.zeros(1, 1, 7, 7)
     support[:, :, 1:6, 1:6] = 1
@@ -1700,3 +1743,62 @@ def test_view_adaptive_score_prefers_camera_aligned_pure_rotation():
     assert [item["chunk_id"] for item in ranking] == [1, 0]
     assert ranking[0]["camera_orientation_alignment"] == pytest.approx(1.0)
     assert ranking[1]["camera_orientation_alignment"] < 0.2
+
+
+def test_same_surface_view_selection_rejects_unrelated_pose_match():
+    cells = [
+        SimpleNamespace(
+            xyz=np.array([0.0, 0.0, 1.0]),
+            view_dirs={0: np.array([0.0, 0.0, -1.0])},
+            chunk_weights={0: 1.0},
+            image_center_margins={0: 1.0},
+        ),
+        SimpleNamespace(
+            xyz=np.array([0.0, 0.0, 1.0]),
+            view_dirs={1: np.array([0.0, 0.0, -1.0])},
+            chunk_weights={1: 1.0},
+            image_center_margins={1: 1.0},
+        ),
+    ]
+
+    class FakeIndex:
+        def __init__(self):
+            self.cells = cells
+
+        def generated_only_cell_indices(self, chunk, **_):
+            return np.array([int(chunk)], dtype=np.int32)
+
+        def visible_cells(self, *_, eligible_indices, **__):
+            index = int(eligible_indices[0])
+            return {
+                "pixels": np.array([[0, 0]], dtype=np.int32),
+                "indices": np.array([index], dtype=np.int32),
+            }
+
+    poses = np.repeat(np.eye(4, dtype=np.float64)[None], 4, axis=0)
+    angle = np.deg2rad(20.0)
+    poses[0, :3, :3] = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ]
+    )
+    ranking = score_view_adaptive_observations(
+        surfel_index=FakeIndex(),
+        candidate_chunks=(0, 1),
+        surface_group_indices=np.array([0], dtype=np.int32),
+        target_chunk=3,
+        query_pose=np.eye(4),
+        intrinsics=np.eye(3),
+        source_image_hw=(1, 1),
+        target_hw=(1, 1),
+        poses=poses,
+        latent_length=4,
+        rgb_length=4,
+        frames_per_block=1,
+        reference_blind_threshold=0.75,
+        same_surface_only=True,
+    )
+    assert [item["chunk_id"] for item in ranking] == [0]
+    assert ranking[0]["shared_anchor_surfels"] == 1

@@ -179,11 +179,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reentry_memory",
         action="store_true",
-        help="Read long-term memory once after a true absence episode.",
+        help="Enable lifecycle-gated long-term re-entry memory.",
     )
     parser.add_argument("--reentry_observation_start_chunk", type=int)
     parser.add_argument("--reentry_absent_blocks", type=int, default=2)
+    parser.add_argument(
+        "--reentry_refresh_policy",
+        choices=("one_shot", "episode_continuous", "per_surface_ttl"),
+        default="one_shot",
+    )
+    parser.add_argument("--reentry_refresh_ttl_blocks", type=int, default=2)
     parser.add_argument("--reentry_view_adaptive_source", action="store_true")
+    parser.add_argument("--reentry_same_surface_source", action="store_true")
     parser.add_argument("--reentry_edge_safe", action="store_true")
     parser.add_argument(
         "--reentry_warp_valid_erosion_kernel", type=int, default=3
@@ -878,8 +885,13 @@ def main() -> None:
                         vae=pipeline.vae,
                         reference_mask_latent=mask_latent,
                         absent_blocks=args.reentry_absent_blocks,
+                        refresh_policy=args.reentry_refresh_policy,
+                        refresh_ttl_blocks=args.reentry_refresh_ttl_blocks,
                         view_adaptive_source=(
                             args.reentry_view_adaptive_source
+                        ),
+                        same_surface_source=(
+                            args.reentry_same_surface_source
                         ),
                         edge_safe=args.reentry_edge_safe,
                         reference_protection_dilation_kernel=(
@@ -1363,8 +1375,15 @@ def main() -> None:
                     args.reentry_observation_start_chunk
                 ),
                 "reentry_absent_blocks": args.reentry_absent_blocks,
+                "reentry_refresh_policy": args.reentry_refresh_policy,
+                "reentry_refresh_ttl_blocks": (
+                    args.reentry_refresh_ttl_blocks
+                ),
                 "reentry_view_adaptive_source": bool(
                     args.reentry_view_adaptive_source
+                ),
+                "reentry_same_surface_source": bool(
+                    args.reentry_same_surface_source
                 ),
                 "reentry_edge_safe": bool(args.reentry_edge_safe),
                 "reentry_warp_valid_erosion_kernel": (

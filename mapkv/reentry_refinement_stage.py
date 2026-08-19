@@ -119,6 +119,9 @@ def _memory_command(
     view_adaptive: bool,
     edge_safe: bool,
     final_step_stabilized: bool,
+    refresh_policy: str = "one_shot",
+    refresh_ttl_blocks: int = 2,
+    same_surface_source: bool = False,
 ) -> list[str]:
     command = _base_inference_command(
         python=python,
@@ -180,6 +183,10 @@ def _memory_command(
         str(observation_start_chunk),
         "--reentry_absent_blocks",
         "2",
+        "--reentry_refresh_policy",
+        refresh_policy,
+        "--reentry_refresh_ttl_blocks",
+        str(refresh_ttl_blocks),
         "--reentry_warp_valid_erosion_kernel",
         "3",
         "--compare_latents_to",
@@ -187,6 +194,8 @@ def _memory_command(
     ]
     if view_adaptive:
         command.append("--reentry_view_adaptive_source")
+    if same_surface_source:
+        command.append("--reentry_same_surface_source")
     if edge_safe:
         command.append("--reentry_edge_safe")
     return command

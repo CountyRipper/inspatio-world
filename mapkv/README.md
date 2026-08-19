@@ -237,3 +237,34 @@ reported as `REENTRY_HANDOFF_INSUFFICIENT`: group-level one-shot serving fixes
 the first-departure transition but retains too little long-term memory and
 marks later re-entering surfaces served too early. The next scoped correction
 is per-surfel one-shot lifecycle, not another alpha/mask/CUT3R sweep.
+
+## Re-entry continuous refresh
+
+Run the gated lifecycle convergence stage with:
+
+    bash scripts/run_mapkv_reentry_refresh.sh --stage full --gpu 0
+
+The full command reuses the same controlled trajectory, canonical chunk-11
+identity target, known-pose CUT3R map, noise, checkpoint, and RGB-Warp WRE
+quality path. It advances conditionally:
+
+1. first-visit write-only, then continuous read throughout the true re-entry
+   episode;
+2. per-surface TTL=2 only after the episode policy succeeds;
+3. view-adaptive observation selection restricted to actual shared chunk-11
+   anchor surfel IDs;
+4. edge-safe support and memory steps [0,1,2] on the best successful
+   lifecycle/source.
+
+All methods are evaluated against canonical chunk 11 even when another
+observation is selected. The default output is
+`results/mapkv_fast/yaw45m20to35_scene01_seed0_reentry_refresh`, with complete
+453-frame synchronized revisit videos, departure/re-entry clips, real-RGB
+surfel views, a lifecycle timeline, architecture/change graph, metrics, and a
+Chinese HTML report.
+
+The controlled result is `REENTRY_EPISODE_CONTINUOUS_WORKS`: it preserves
+102.8% of the old continuously-reading memory gain while restoring the first
+departure peak to baseline. TTL=2, same-surface view adaptation, edge-safe
+support, and steps012 do not improve the retained chunk-11 identity and remain
+rejected ablations.
