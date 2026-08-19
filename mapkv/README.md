@@ -296,3 +296,36 @@ GEOMETRY_ADDRESS_REPAIR_WORKS: the pure-yaw angular Gate and translation
 depth Gate both pass. Strictly freezing every previous depth was implemented
 and audited but did not converge as a quality path; the current quality oracle
 uses a causal full-prefix joint fixed-pose alignment.
+
+## Frozen memory-interface convergence
+
+Run the fixed-memory interface ladder with:
+
+    bash scripts/run_mapkv_memory_interface.sh --stage full --gpu 0
+
+This stage reuses the validated geometry, fixed canonical chunk 11,
+episode-continuous re-entry lifecycle, exact RGB camera warp, Wan VAE, source
+protection, deterministic noise bundle, and the same hard `M_need`. It changes
+only the frozen model interface:
+
+1. matched masked final-x0 replacement (`MaskedHardX0` quality upper bound);
+2. two coherent full denoising branches with independent raw/Virtual Recent
+   caches (`DualBranchRecent`);
+3. source-priority fusion through InSpatio's native render+validity channels
+   (`MemoryRender`);
+4. noise-consistent x0 anchoring before the same scheduler re-noise on steps
+   `[0,1,2]`, plus the conditional all-four-step diagnostic.
+
+The default output is
+`results/mapkv_fast/yaw45m20to35_scene01_seed0_memory_interface`. The report
+contains Chinese method/focus labels, a complete pipeline/change graph,
+complete 453-frame synchronized revisit videos, re-entry clips, and automatic
+generated-history structure crops. Average L1 is explicitly reported as
+historical *appearance* proximity; `STRONG/PARTIAL/NONE` identity ratings come
+from the synchronized videos and crops.
+
+The current controlled decision is `LATENT_ANCHOR_REQUIRED`: coherent Recent
+guidance is partial, native Render memory does not recover the canonical
+instances, and a free final denoising step washes out most steps-012 anchoring.
+All-four-step latent anchoring matches the hard upper bound while keeping the
+measured first-departure and re-entry peaks close to baseline.

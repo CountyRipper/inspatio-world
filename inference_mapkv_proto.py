@@ -38,6 +38,11 @@ from mapkv_proto.retrieval import RetrievalPlan
 from mapkv_proto.revisit_pair import build_block_mapping
 from mapkv_proto.visualization import save_gate_overlay
 from mapkv.latent_control import LatentBlockIntervention
+from mapkv.memory_interface import (
+    MEMORY_INTERFACE_MODES,
+    from_warp_reencode_plans,
+    save_memory_interface_artifacts,
+)
 from mapkv.canonical_kv import (
     build_canonical_readdress_contexts,
     save_canonical_audit,
@@ -124,6 +129,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warp_reencode_recent", action="store_true")
     parser.add_argument("--continuous_virtual_recent", action="store_true")
     parser.add_argument("--canonical_kv_readdress", action="store_true")
+    parser.add_argument(
+        "--memory_interface",
+        choices=sorted(MEMORY_INTERFACE_MODES),
+        help=(
+            "Frozen-model interface ladder using the same target-aligned "
+            "RGB-Warp memory and M_need."
+        ),
+    )
+    parser.add_argument(
+        "--memory_interface_steps",
+        nargs="+",
+        type=int,
+        default=(0, 1, 2),
+        help="Denoising-step indices used by latent_anchor.",
+    )
     parser.add_argument(
         "--continuous_recent_fallback",
         choices=("raw", "warped"),
@@ -302,6 +322,7 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
         and not mapkv.target_chunks
         and not args.continuous_virtual_recent
         and not args.canonical_kv_readdress
+        and not args.memory_interface
     ):
         raise ValueError("MapKV is enabled but target_chunks is empty")
     return config, experiment, mapkv
@@ -598,15 +619,17 @@ def main() -> None:
             args.warp_reencode_recent,
             args.continuous_virtual_recent,
             args.canonical_kv_readdress,
+            args.memory_interface,
         )
     ) > 1:
         raise ValueError(
-            "Block-on WRE, Continuous WRE, and Canonical-K are mutually exclusive"
+            "WRE, Canonical-K, and the memory-interface ladder are mutually exclusive"
         )
     if (
         args.warp_reencode_recent
         or args.continuous_virtual_recent
         or args.canonical_kv_readdress
+        or args.memory_interface
     ):
         if not args.warp_source_latents or not args.warp_intrinsics_path:
             raise ValueError(
@@ -621,7 +644,11 @@ def main() -> None:
             )
         if args.latent_memory_path:
             raise ValueError("Warp-reencode and direct latent control are separate runs")
-    if (args.continuous_virtual_recent or args.canonical_kv_readdress) and (
+    if (
+        args.continuous_virtual_recent
+        or args.canonical_kv_readdress
+        or args.memory_interface
+    ) and (
         not args.warp_surfel_index or not args.warp_surfel_sequence
     ):
         raise ValueError(
@@ -762,7 +789,9 @@ def main() -> None:
             capture_chunk_ids=args.capture_chunks,
         )
     virtual_recent_contexts = {}
+    memory_interface_contexts = {}
     canonical_audit = None
+    memory_interface_manifest = None
     inference_conditioning = None
     if args.canonical_kv_readdress:
         if not mapkv_config.enabled or mapkv_config.mode != "oracle":
@@ -818,7 +847,11 @@ def main() -> None:
             )
         )
         save_canonical_audit(canonical_audit, output_root)
-    elif args.warp_reencode_recent or args.continuous_virtual_recent:
+    elif (
+        args.warp_reencode_recent
+        or args.continuous_virtual_recent
+        or args.memory_interface
+    ):
         if not mapkv_config.enabled or mapkv_config.mode != "oracle":
             raise ValueError(
                 "Warp-reencode requires enabled manual oracle mode with a fixed source"
@@ -859,7 +892,63 @@ def main() -> None:
             device=device,
             dtype=dtype,
         )
-        if args.continuous_virtual_recent:
+        if args.memory_interface:
+            if not args.reentry_memory:
+                raise ValueError("Memory-interface ladder requires re-entry lifecycle")
+            if args.reentry_observation_start_chunk is None:
+                raise ValueError(
+                    "Memory-interface ladder requires --reentry_observation_start_chunk"
+                )
+            if not args.source_protected_memory:
+                raise ValueError("Memory-interface ladder requires source protection")
+            if args.warp_history_representation != "rgb_warp_vae":
+                raise ValueError(
+                    "Memory-interface ladder requires target-aligned RGB-Warp→VAE"
+                )
+            if args.reentry_refresh_policy != "episode_continuous":
+                raise ValueError(
+                    "Memory-interface ladder freezes episode_continuous lifecycle"
+                )
+            if args.reentry_view_adaptive_source:
+                raise ValueError("Memory-interface ladder freezes canonical chunk selection")
+            raw_interface_plans, memory_selections = (
+                build_reentry_virtual_recent_plans(
+                    **common_virtual_kwargs,
+                    observation_start_chunk=args.reentry_observation_start_chunk,
+                    surfel_index_path=args.warp_surfel_index,
+                    surfel_sequence_path=args.warp_surfel_sequence,
+                    vae=pipeline.vae,
+                    reference_mask_latent=mask_latent,
+                    absent_blocks=args.reentry_absent_blocks,
+                    refresh_policy="episode_continuous",
+                    refresh_ttl_blocks=args.reentry_refresh_ttl_blocks,
+                    view_adaptive_source=False,
+                    same_surface_source=False,
+                    edge_safe=False,
+                    reference_protection_dilation_kernel=(
+                        args.warp_reference_protection_kernel
+                    ),
+                    generated_only_threshold=args.warp_generated_only_threshold,
+                    memory_dilation_kernel=args.warp_memory_dilation_kernel,
+                    query_feather_kernel=args.warp_query_feather_kernel,
+                    warp_valid_erosion_kernel=(
+                        args.reentry_warp_valid_erosion_kernel
+                    ),
+                )
+            )
+            memory_interface_contexts = from_warp_reencode_plans(
+                raw_interface_plans,
+                mode=args.memory_interface,
+                anchor_step_indices=args.memory_interface_steps,
+            )
+            if args.memory_interface == "dual_branch_recent":
+                expected_layers = tuple(range(pipeline.num_transformer_blocks))
+                if tuple(selected_writer_layers) != expected_layers:
+                    raise ValueError(
+                        "DualBranchRecent quality oracle requires all transformer layers"
+                    )
+            virtual_recent_contexts = {}
+        elif args.continuous_virtual_recent:
             if args.reentry_memory:
                 if args.reentry_observation_start_chunk is None:
                     raise ValueError(
@@ -982,7 +1071,7 @@ def main() -> None:
         )
     latent_block_interventions = {}
     if args.latent_memory_path:
-        if mapkv_config.enabled:
+        if mapkv_config.enabled or memory_interface_contexts:
             raise ValueError("KV memory and direct latent control must run separately")
         latent_memory = torch.load(
             Path(args.latent_memory_path).resolve(),
@@ -1035,6 +1124,7 @@ def main() -> None:
             after_context_write=bank_writer,
             memory_contexts=memory_contexts or None,
             virtual_recent_contexts=virtual_recent_contexts or None,
+            memory_interface_contexts=memory_interface_contexts or None,
             latent_block_interventions=latent_block_interventions or None,
             conditional_dict=inference_conditioning,
         )
@@ -1053,6 +1143,7 @@ def main() -> None:
             mapkv_config.enabled
             or memory_contexts
             or virtual_recent_contexts
+            or memory_interface_contexts
             or latent_block_interventions
         ):
             raise ValueError("--verify_memory_off_replay is valid for memory-off only")
@@ -1155,6 +1246,12 @@ def main() -> None:
             vae=pipeline.vae,
             output_root=output_root,
             device=device,
+        )
+    if memory_interface_contexts:
+        memory_interface_manifest = save_memory_interface_artifacts(
+            plans=memory_interface_contexts,
+            vae=pipeline.vae,
+            output_root=output_root,
         )
 
     video_uint8 = (
@@ -1399,6 +1496,20 @@ def main() -> None:
             "canonical_kv": {
                 "enabled": args.canonical_kv_readdress,
                 "audit": canonical_audit,
+            },
+            "memory_interface": {
+                "enabled": bool(memory_interface_contexts),
+                "mode": args.memory_interface,
+                "fixed_source_chunk": mapkv_config.source_chunk,
+                "fixed_lifecycle": "episode_continuous",
+                "target_aligned_memory": "RGB-Warp→Wan-VAE",
+                "mask": "M_need_generated_history_x_current_reference_blind",
+                "anchor_step_indices": list(args.memory_interface_steps),
+                "manifest": memory_interface_manifest,
+                "audits": {
+                    str(target): audit
+                    for target, audit in pipeline.last_memory_interface_audits.items()
+                },
             },
         },
         "latent_control": {

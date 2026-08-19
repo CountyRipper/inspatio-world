@@ -11,6 +11,10 @@ from PIL import Image
 
 from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv.latent_control import LatentBlockIntervention
+from mapkv.memory_interface import (
+    MemoryInterfacePlan,
+    build_dual_recent_cache,
+)
 from mapkv.locality_evaluation import _rotation_warp
 from mapkv.surfel_index import (
     surfel_display_axis_labels,
@@ -497,6 +501,134 @@ def test_noise_bundle_roundtrip_and_provider_does_not_use_global_rng(tmp_path):
     second, _ = denoise_block(**kwargs)
     assert torch.equal(state_before, state_after)
     torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+def test_memory_interface_hard_x0_and_latent_anchor_use_exact_need_mask():
+    mask = torch.zeros(1, 3, 2, 2)
+    mask[..., 0] = 1
+    memory = torch.ones(1, 3, 1, 2, 2)
+    predicted = torch.zeros_like(memory)
+    hard = MemoryInterfacePlan(
+        target_block=5,
+        source_chunk=1,
+        mode="masked_hard_x0",
+        memory_latent=memory,
+        need_coverage=mask,
+    )
+    torch.testing.assert_close(
+        hard.apply_x0(predicted, step_index=2, total_steps=4), predicted
+    )
+    hard_result = hard.apply_x0(predicted, step_index=3, total_steps=4)
+    torch.testing.assert_close(hard_result[..., 0], torch.ones_like(hard_result[..., 0]))
+    torch.testing.assert_close(hard_result[..., 1], torch.zeros_like(hard_result[..., 1]))
+
+    anchor = MemoryInterfacePlan(
+        target_block=5,
+        source_chunk=1,
+        mode="latent_anchor",
+        memory_latent=memory,
+        need_coverage=mask,
+        anchor_step_indices=(0, 1, 2),
+    )
+    for step in range(3):
+        assert torch.count_nonzero(
+            anchor.apply_x0(predicted, step_index=step, total_steps=4)
+        ) > 0
+    torch.testing.assert_close(
+        anchor.apply_x0(predicted, step_index=3, total_steps=4), predicted
+    )
+
+
+def test_memory_render_preserves_source_priority_and_marks_memory_valid():
+    render = torch.full((1, 3, 1, 2, 4), 2.0)
+    memory = torch.full_like(render, 7.0)
+    mask = -torch.ones(1, 3, 4, 2, 4)
+    mask[..., :2] = 1.0
+    need = torch.ones(1, 3, 2, 4)
+    plan = MemoryInterfacePlan(
+        target_block=5,
+        source_chunk=1,
+        mode="native_render",
+        memory_latent=memory,
+        need_coverage=need,
+    )
+    fused_render, fused_mask = plan.fuse_native_render(render, mask)
+    torch.testing.assert_close(fused_render[..., :2], render[..., :2])
+    torch.testing.assert_close(fused_render[..., 2:], memory[..., 2:])
+    torch.testing.assert_close(fused_mask, torch.ones_like(fused_mask))
+    assert plan.audit["source_region_render_max_abs_diff"] == 0.0
+
+
+def test_dual_recent_cache_replaces_only_clone_recent_slot():
+    base = [{
+        "k": torch.arange(6, dtype=torch.float32).reshape(1, 6, 1, 1),
+        "v": torch.arange(6, dtype=torch.float32).reshape(1, 6, 1, 1) + 10,
+    }]
+    before_k = base[0]["k"].clone()
+    before_v = base[0]["v"].clone()
+    payloads = {
+        0: (
+            torch.full((1, 2, 1, 1), 30.0),
+            torch.full((1, 2, 1, 1), 40.0),
+        )
+    }
+    dual = build_dual_recent_cache(base, payloads, recent_slot_len=2)
+    torch.testing.assert_close(base[0]["k"], before_k)
+    torch.testing.assert_close(base[0]["v"], before_v)
+    torch.testing.assert_close(dual[0]["k"][:, :2], before_k[:, :2])
+    torch.testing.assert_close(dual[0]["k"][:, 2:4], payloads[0][0])
+    torch.testing.assert_close(dual[0]["v"][:, 2:4], payloads[0][1])
+    torch.testing.assert_close(dual[0]["k"][:, 4:], before_k[:, 4:])
+
+
+def test_dual_branch_recent_blends_complete_x0_only_inside_need_mask():
+    class Generator:
+        def __call__(self, *, noisy_image_or_video, kv_cache, kv_size, **kwargs):
+            if kv_size[1] < 0:
+                return torch.zeros_like(noisy_image_or_video)
+            bias = kv_cache[0]["v"][:, 2:4].mean().to(noisy_image_or_video)
+            prediction = noisy_image_or_video + bias
+            return torch.zeros_like(prediction), prediction
+
+    class Scheduler:
+        @staticmethod
+        def add_noise(x, noise, timestep):
+            return x + noise
+
+    noisy = torch.zeros(1, 3, 1, 2, 2)
+    coverage = torch.zeros(1, 3, 2, 2)
+    coverage[..., 0] = 1
+    plan = MemoryInterfacePlan(
+        target_block=5,
+        source_chunk=1,
+        mode="dual_branch_recent",
+        memory_latent=torch.ones_like(noisy),
+        need_coverage=coverage,
+        selected_layers=(0,),
+    )
+    plan.set_dual_recent_payloads(
+        {0: (torch.zeros(1, 2, 1, 1), torch.full((1, 2, 1, 1), 2.0))},
+        {},
+    )
+    base_cache = [{
+        "k": torch.zeros(1, 4, 1, 1),
+        "v": torch.zeros(1, 4, 1, 1),
+    }]
+    result, _ = denoise_block(
+        Generator(),
+        Scheduler(),
+        noisy,
+        {},
+        base_cache,
+        denoising_steps=torch.tensor([1]),
+        block_id=5,
+        memory_interface=plan,
+        recent_slot_len=2,
+        denoising_kv_size=4,
+    )
+    torch.testing.assert_close(result[..., 0], torch.full_like(result[..., 0], 2.0))
+    torch.testing.assert_close(result[..., 1], torch.zeros_like(result[..., 1]))
+    assert plan.audit["base_and_memory_cache_independent"] is True
 
 
 def test_kv_bank_captures_only_clean_recent_slot(tmp_path):

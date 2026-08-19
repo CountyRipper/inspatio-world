@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from einops import rearrange
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.render_warper import convert_mask_video
+from mapkv.memory_interface import build_dual_recent_cache
 
 
 def _model_config_value(model, name):
@@ -35,6 +36,8 @@ def denoise_block(
     after_context_write=None,
     noise_provider=None,
     memory_context=None,
+    memory_interface=None,
+    recent_slot_len=0,
 ):
     """
     Shared block-based diffusion core: optional context encoding pass + denoising.
@@ -64,6 +67,27 @@ def denoise_block(
                 kv_cache=kv_cache,
                 context_frames=context_frames,
             )
+
+    dual_cache = None
+    if memory_interface is not None and memory_interface.needs_dual_recent_writer:
+        if memory_context is not None:
+            raise ValueError("DualBranchRecent cannot use layer-wise memory attention")
+        if not recent_slot_len:
+            raise ValueError("DualBranchRecent requires the runtime recent-slot length")
+        if memory_interface.dual_recent_payloads is None:
+            raise ValueError("DualBranchRecent is missing native-writer Recent K/V")
+        dual_cache = build_dual_recent_cache(
+            kv_cache,
+            memory_interface.dual_recent_payloads,
+            recent_slot_len=recent_slot_len,
+        )
+        memory_interface.audit.update(
+            {
+                "base_and_memory_cache_independent": True,
+                "dual_branch_compute": "two_complete_denoising_forwards",
+                "recent_slot_len": int(recent_slot_len),
+            }
+        )
 
     cache_snapshots = None
     if memory_context is not None and memory_context.alpha != 0.0:
@@ -98,6 +122,22 @@ def denoise_block(
             if step_memory is not None:
                 generator_kwargs["memory_context"] = step_memory
             _, denoised_pred = generator(**generator_kwargs)
+            if dual_cache is not None:
+                memory_kwargs = dict(generator_kwargs)
+                memory_kwargs["kv_cache"] = dual_cache
+                _, memory_pred = generator(**memory_kwargs)
+                denoised_pred = memory_interface.blend_dual_predictions(
+                    denoised_pred,
+                    memory_pred,
+                    step_index=index,
+                )
+
+        if memory_interface is not None:
+            denoised_pred = memory_interface.apply_x0(
+                denoised_pred,
+                step_index=index,
+                total_steps=len(denoising_steps),
+            )
 
         if is_last_step:
             noise_before_last_step = noisy_input.clone()
@@ -191,6 +231,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.last_block_latencies = {}
         self.last_virtual_memory_contexts = {}
         self.last_virtual_recent_audits = {}
+        self.last_memory_interface_audits = {}
 
     def inference(
         self,
@@ -204,6 +245,7 @@ class CausalInferencePipeline(torch.nn.Module):
         after_context_write=None,
         memory_contexts: Optional[Mapping[int, object]] = None,
         virtual_recent_contexts: Optional[Mapping[int, object]] = None,
+        memory_interface_contexts: Optional[Mapping[int, object]] = None,
         latent_block_interventions: Optional[Mapping[int, object]] = None,
         conditional_dict: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
@@ -228,6 +270,7 @@ class CausalInferencePipeline(torch.nn.Module):
         if (
             memory_contexts
             or virtual_recent_contexts
+            or memory_interface_contexts
             or latent_block_interventions
             or after_context_write is not None
         ):
@@ -266,12 +309,27 @@ class CausalInferencePipeline(torch.nn.Module):
         self.last_block_latencies = {}
         self.last_virtual_memory_contexts = {}
         self.last_virtual_recent_audits = {}
+        self.last_memory_interface_audits = {}
         for block_id, num_block_frame in enumerate(all_num_frames):
             block_start_time = time.time()
             noisy_input = noise[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             ref_block = ref_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
+            interface_plan = (memory_interface_contexts or {}).get(block_id)
+            if interface_plan is not None:
+                if int(interface_plan.target_block) != block_id:
+                    raise ValueError(
+                        f"Memory-interface target {interface_plan.target_block} "
+                        f"does not match block {block_id}"
+                    )
+                if int(interface_plan.source_chunk) >= block_id - 1:
+                    raise ValueError(
+                        "Memory-interface source must be older than the runtime Recent chunk"
+                    )
+                render_block, mask_block = interface_plan.fuse_native_render(
+                    render_block, mask_block
+                )
             render_block = torch.cat([mask_block, render_block], dim=2)
 
             recent_slot_len = layout["recent_slot_len"]
@@ -293,9 +351,12 @@ class CausalInferencePipeline(torch.nn.Module):
 
             block_memory = (memory_contexts or {}).get(block_id)
             virtual_plan = (virtual_recent_contexts or {}).get(block_id)
-            if block_memory is not None and virtual_plan is not None:
+            if sum(
+                value is not None
+                for value in (block_memory, virtual_plan, interface_plan)
+            ) > 1:
                 raise ValueError(
-                    f"Block {block_id} cannot use stored-KV and warp-reencode memory together"
+                    f"Block {block_id} cannot combine stored-KV, WRE, and memory-interface methods"
                 )
             if virtual_plan is not None:
                 if block_id == 0 or last_pred is None:
@@ -324,6 +385,22 @@ class CausalInferencePipeline(torch.nn.Module):
                 )
                 self.last_virtual_memory_contexts[block_id] = block_memory
                 self.last_virtual_recent_audits[block_id] = virtual_plan.audit
+            if interface_plan is not None and interface_plan.needs_dual_recent_writer:
+                if block_id == 0 or last_pred is None:
+                    raise ValueError("DualBranchRecent requires a previous generated block")
+                virtual_recent = interface_plan.compose_virtual_recent(last_pred)
+                layer_payloads, writer_audit = (
+                    self.encode_clean_latent_as_recent_slot(
+                        reference_context=ref_block,
+                        clean_recent_latent=virtual_recent,
+                        conditional_dict=conditional_dict,
+                        selected_layers=interface_plan.selected_layers,
+                        render_block=render_block,
+                    )
+                )
+                interface_plan.set_dual_recent_payloads(
+                    layer_payloads, writer_audit
+                )
             if block_memory is not None:
                 if block_id == 0:
                     raise ValueError("Memory cannot be activated on the first block")
@@ -374,15 +451,26 @@ class CausalInferencePipeline(torch.nn.Module):
                 after_context_write=after_context_write,
                 noise_provider=noise_provider,
                 memory_context=block_memory,
+                memory_interface=interface_plan,
+                recent_slot_len=recent_slot_len,
             )
             latent_intervention = (latent_block_interventions or {}).get(block_id)
             if latent_intervention is not None:
+                if interface_plan is not None:
+                    raise ValueError(
+                        "Legacy latent intervention and memory-interface control are separate"
+                    )
                 if int(latent_intervention.target_block) != block_id:
                     raise ValueError(
                         f"Latent intervention target {latent_intervention.target_block} "
                         f"does not match block {block_id}"
                     )
                 denoised_pred = latent_intervention.apply(denoised_pred)
+
+            if interface_plan is not None:
+                self.last_memory_interface_audits[block_id] = dict(
+                    interface_plan.audit
+                )
 
 
 
