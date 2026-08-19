@@ -20,6 +20,10 @@ from mapkv_proto.pose_utils import (
 )
 
 from .surfel_index import SurfelIndex
+from .reentry_memory import (
+    ReentryMemoryLifecycle,
+    erode_binary_coverage,
+)
 
 
 def load_intrinsics(path: str | Path) -> np.ndarray:
@@ -208,7 +212,10 @@ def reference_protected_coverage(
 
 
 def warp_latent(
-    historical_latent: torch.Tensor, grid: torch.Tensor
+    historical_latent: torch.Tensor,
+    grid: torch.Tensor,
+    *,
+    padding_mode: str = "zeros",
 ) -> torch.Tensor:
     """Warp BFCHW latent frames with one target->source grid per frame."""
     if historical_latent.ndim != 5:
@@ -234,6 +241,8 @@ def warp_latent(
     # CUDA grid_sample does not accept bf16 input with an fp32 grid. The
     # reprojection is cheap relative to DiT inference, so compute it in fp32
     # and restore the native latent dtype afterwards.
+    if padding_mode not in {"zeros", "border", "reflection"}:
+        raise ValueError(f"Unsupported grid-sample padding mode: {padding_mode}")
     source_dtype = historical_latent.dtype
     warped = F.grid_sample(
         historical_latent.float().reshape(
@@ -241,7 +250,7 @@ def warp_latent(
         ),
         grid.reshape(batch * frames, height, width, 2),
         mode="bilinear",
-        padding_mode="zeros",
+        padding_mode=padding_mode,
         align_corners=False,
     )
     return warped.reshape(batch, frames, channels, height, width).to(
@@ -271,11 +280,15 @@ class WarpReencodePlan:
     reference_valid_coverage: torch.Tensor | None = None
     reference_protected_coverage: torch.Tensor | None = None
     need_coverage: torch.Tensor | None = None
+    warp_valid_coverage: torch.Tensor | None = None
+    reentry_coverage: torch.Tensor | None = None
+    safe_coverage: torch.Tensor | None = None
     query_coverage: torch.Tensor | None = None
     query_feather_kernel: int = 1
     reference_protection_kernel: int = 3
     historical_representation: str = "latent_warp"
     historical_is_target_aligned: bool = False
+    rgb_padding_mode: str = "zeros"
     rgb_preview_source: torch.Tensor | None = None
     rgb_preview_target: torch.Tensor | None = None
     rgb_warp_coverage_preview: torch.Tensor | None = None
@@ -298,7 +311,11 @@ class WarpReencodePlan:
         warped = (
             historical
             if self.historical_is_target_aligned
-            else warp_latent(historical, self.target_to_source_grid)
+            else warp_latent(
+                historical,
+                self.target_to_source_grid,
+                padding_mode=self.rgb_padding_mode,
+            )
         )
         if self.recent_target_to_source_grid is None:
             warped_recent = current_recent
@@ -358,6 +375,18 @@ class WarpReencodePlan:
             self.artifacts["need_coverage"] = (
                 self.need_coverage.detach().cpu()
             )
+        if self.warp_valid_coverage is not None:
+            self.artifacts["warp_valid_coverage"] = (
+                self.warp_valid_coverage.detach().cpu()
+            )
+        if self.reentry_coverage is not None:
+            self.artifacts["reentry_coverage"] = (
+                self.reentry_coverage.detach().cpu()
+            )
+        if self.safe_coverage is not None:
+            self.artifacts["safe_coverage"] = (
+                self.safe_coverage.detach().cpu()
+            )
         if self.query_coverage is not None:
             self.artifacts["query_coverage_source"] = (
                 self.query_coverage.detach().cpu()
@@ -383,6 +412,7 @@ class WarpReencodePlan:
                 "mode": self.mode,
                 "historical_representation": self.historical_representation,
                 "historical_is_target_aligned": self.historical_is_target_aligned,
+                "rgb_padding_mode": self.rgb_padding_mode,
                 "target_block": int(self.target_block),
                 "source_chunk": int(self.source_chunk),
                 "coverage_fraction": float(coverage.mean().item()),
@@ -437,6 +467,7 @@ class WarpReencodePlan:
             "surfel_exact",
             "surfel_support_preserving",
             "surfel_source_protected",
+            "surfel_edge_safe_source_protected",
         }:
             raise ValueError(
                 f"Unsupported Virtual Recent query gate: {self.query_gate_mode}"
@@ -477,6 +508,7 @@ class WarpReencodePlan:
                     in {
                         "surfel_support_preserving",
                         "surfel_source_protected",
+                        "surfel_edge_safe_source_protected",
                     }
                 ),
                 "query_feather_kernel": int(self.query_feather_kernel),
@@ -640,6 +672,7 @@ def _surfel_coverage_for_pose(
     target_hw: tuple[int, int],
     generated_only: bool = False,
     reference_blind_threshold: float = 0.5,
+    eligible_indices: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Project source-chunk surfels after eligibility filtering."""
     eligible = [
@@ -666,6 +699,15 @@ def _surfel_coverage_for_pose(
         generated_only_indices = surfel_index.generated_only_cell_indices(
             source_chunk,
             reference_blind_threshold=reference_blind_threshold,
+        )
+    if eligible_indices is not None:
+        restricted = np.asarray(eligible_indices, dtype=np.int32).reshape(-1)
+        generated_only_indices = (
+            restricted
+            if generated_only_indices is None
+            else np.intersect1d(
+                generated_only_indices, restricted, assume_unique=False
+            ).astype(np.int32)
         )
     visible = surfel_index.visible_cells(
         query_pose,
@@ -695,6 +737,7 @@ def _surfel_coverage_for_pose(
             if generated_only_indices is None
             else int(len(generated_only_indices))
         ),
+        "surface_group_restricted": eligible_indices is not None,
         "num_eligible_surfels": int(visible["num_eligible_cells"]),
         "num_visible_surfels": int(visible["num_visible_cells"]),
         "num_visible_pixels": int(len(pixels)),
@@ -1240,6 +1283,9 @@ def save_warp_reencode_artifacts(
             "reference_valid_coverage": "M_ref_valid.png",
             "reference_protected_coverage": "M_ref_protected.png",
             "need_coverage": "M_need.png",
+            "warp_valid_coverage": "M_warp_valid.png",
+            "reentry_coverage": "M_reentry.png",
+            "safe_coverage": "M_safe.png",
             "memory_coverage": "M_memory.png",
             "query_coverage_source": "M_query_source.png",
             "query_gate_tokens": "M_query.png",

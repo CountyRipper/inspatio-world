@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 
-INDEX_VERSION = 3
+INDEX_VERSION = 4
 
 
 @dataclass
@@ -30,6 +30,8 @@ class SurfelCell:
     chunk_weights: dict[int, float] = field(default_factory=dict)
     view_dirs: dict[int, np.ndarray] = field(default_factory=dict)
     reference_blind_at_write: dict[int, float] = field(default_factory=dict)
+    source_pixels: dict[int, np.ndarray] = field(default_factory=dict)
+    image_center_margins: dict[int, float] = field(default_factory=dict)
     observation_weight: float = 0.0
 
 
@@ -49,6 +51,20 @@ def _sample_grid(array: np.ndarray, grid_hw: tuple[int, int]) -> np.ndarray:
     yy = np.rint(np.linspace(0, height - 1, min(grid_hw[0], height))).astype(int)
     xx = np.rint(np.linspace(0, width - 1, min(grid_hw[1], width))).astype(int)
     return array[np.ix_(yy, xx)]
+
+
+def _sample_pixel_grid(
+    source_hw: tuple[int, int], grid_hw: tuple[int, int]
+) -> np.ndarray:
+    height, width = source_hw
+    yy = np.rint(
+        np.linspace(0, height - 1, min(grid_hw[0], height))
+    ).astype(np.float32)
+    xx = np.rint(
+        np.linspace(0, width - 1, min(grid_hw[1], width))
+    ).astype(np.float32)
+    pixel_x, pixel_y = np.meshgrid(xx, yy, indexing="xy")
+    return np.stack([pixel_y, pixel_x], axis=-1)
 
 
 def _scale_intrinsics(
@@ -205,17 +221,16 @@ class SurfelIndex:
                     + observation.chunk_weights.get(chunk, 0.0)
                 )
                 incoming = observation.view_dirs.get(chunk)
-                if incoming is None:
-                    continue
-                previous = match.view_dirs.get(chunk)
-                if previous is None:
-                    match.view_dirs[chunk] = incoming.copy()
-                else:
-                    value = previous + incoming
-                    norm = float(np.linalg.norm(value))
-                    match.view_dirs[chunk] = (
-                        value / norm if norm > 1e-8 else previous
-                    )
+                if incoming is not None:
+                    previous = match.view_dirs.get(chunk)
+                    if previous is None:
+                        match.view_dirs[chunk] = incoming.copy()
+                    else:
+                        value = previous + incoming
+                        norm = float(np.linalg.norm(value))
+                        match.view_dirs[chunk] = (
+                            value / norm if norm > 1e-8 else previous
+                        )
                 incoming_blind = observation.reference_blind_at_write.get(
                     chunk
                 )
@@ -224,6 +239,16 @@ class SurfelIndex:
                         float(incoming_blind),
                         float(match.reference_blind_at_write.get(chunk, 0.0)),
                     )
+                incoming_margin = observation.image_center_margins.get(chunk)
+                if incoming_margin is not None and (
+                    chunk not in match.image_center_margins
+                    or float(incoming_margin)
+                    > float(match.image_center_margins[chunk])
+                ):
+                    match.image_center_margins[chunk] = float(incoming_margin)
+                    incoming_pixel = observation.source_pixels.get(chunk)
+                    if incoming_pixel is not None:
+                        match.source_pixels[chunk] = incoming_pixel.copy()
             match.observing_chunks.sort()
             merged += 1
 
@@ -255,6 +280,7 @@ class SurfelIndex:
         source_hw = tuple(int(x) for x in np.asarray(confidence).shape)
         points = _sample_grid(np.asarray(pts3d, dtype=np.float32), grid_hw)
         conf = _sample_grid(np.asarray(confidence, dtype=np.float32), grid_hw)
+        source_pixels = _sample_pixel_grid(source_hw, grid_hw)
         colors = None if rgb is None else _sample_grid(np.asarray(rgb), grid_hw)
         reference_valid = None
         if reference_validity is not None:
@@ -307,6 +333,7 @@ class SurfelIndex:
         depth_flat = depth[valid]
         normals_flat = normals[valid]
         colors_flat = None if colors is None else colors[valid]
+        source_pixels_flat = source_pixels[valid]
         reference_valid_flat = (
             None if reference_valid is None else reference_valid[valid]
         )
@@ -359,6 +386,16 @@ class SurfelIndex:
                 if colors_flat is None
                 else colors_flat[index].astype(np.float32)
             )
+            pixel_y, pixel_x = source_pixels_flat[index]
+            x_margin = min(
+                float(pixel_x) + 0.5,
+                float(source_hw[1]) - 0.5 - float(pixel_x),
+            ) / max(0.5 * float(source_hw[1]), 1.0)
+            y_margin = min(
+                float(pixel_y) + 0.5,
+                float(source_hw[0]) - 0.5 - float(pixel_y),
+            ) / max(0.5 * float(source_hw[0]), 1.0)
+            center_margin = float(np.clip(min(x_margin, y_margin), 0.0, 1.0))
             observations.append(
                 SurfelCell(
                     voxel_key=self._key(point),
@@ -381,6 +418,12 @@ class SurfelIndex:
                             )
                         }
                     ),
+                    source_pixels={
+                        int(chunk_id): source_pixels_flat[index].copy()
+                    },
+                    image_center_margins={
+                        int(chunk_id): center_margin
+                    },
                     observation_weight=float(weight),
                 )
             )
@@ -642,6 +685,8 @@ class SurfelIndex:
         chunk_weights: list[float] = []
         view_dirs: list[np.ndarray] = []
         reference_blind_at_write: list[float] = []
+        source_pixels: list[np.ndarray] = []
+        image_center_margins: list[float] = []
         offsets = [0]
         for cell in self.cells:
             for chunk_id in sorted(set(cell.observing_chunks)):
@@ -650,6 +695,14 @@ class SurfelIndex:
                 view_dirs.append(cell.view_dirs.get(chunk_id, np.zeros(3)))
                 reference_blind_at_write.append(
                     float(cell.reference_blind_at_write.get(chunk_id, np.nan))
+                )
+                source_pixels.append(
+                    cell.source_pixels.get(
+                        chunk_id, np.full(2, np.nan, dtype=np.float32)
+                    )
+                )
+                image_center_margins.append(
+                    float(cell.image_center_margins.get(chunk_id, np.nan))
                 )
             offsets.append(len(chunk_ids))
         np.savez_compressed(
@@ -693,6 +746,12 @@ class SurfelIndex:
             reference_blind_at_write=np.asarray(
                 reference_blind_at_write, dtype=np.float32
             ),
+            source_pixels=np.asarray(
+                source_pixels, dtype=np.float32
+            ).reshape(-1, 2),
+            image_center_margins=np.asarray(
+                image_center_margins, dtype=np.float32
+            ),
             offsets=np.asarray(offsets, dtype=np.int64),
         )
 
@@ -733,9 +792,13 @@ class SurfelIndex:
 
     @classmethod
     def load(cls, path: str | Path) -> "SurfelIndex":
-        payload = np.load(path)
+        # NpzFile lazily decompresses on every ``__getitem__`` call.  Loading
+        # fields inside the per-cell loop makes even a 2 MB index take minutes.
+        # Materialize every compact array once, then assemble Python records.
+        with np.load(path) as archive:
+            payload = {name: archive[name] for name in archive.files}
         version = int(payload["version"][0])
-        if version not in (1, 2, INDEX_VERSION):
+        if version not in (1, 2, 3, INDEX_VERSION):
             raise ValueError(f"Unsupported surfel index version: {version}")
         offsets = payload["offsets"]
         voxel_size = float(payload["voxel_size"][0])
@@ -748,6 +811,16 @@ class SurfelIndex:
             blind_values = (
                 payload["reference_blind_at_write"][start:stop]
                 if version >= 3
+                else np.full(len(chunks), np.nan, dtype=np.float32)
+            )
+            source_pixels = (
+                payload["source_pixels"][start:stop]
+                if version >= 4
+                else np.full((len(chunks), 2), np.nan, dtype=np.float32)
+            )
+            center_margins = (
+                payload["image_center_margins"][start:stop]
+                if version >= 4
                 else np.full(len(chunks), np.nan, dtype=np.float32)
             )
             chunk_weights = {
@@ -779,6 +852,16 @@ class SurfelIndex:
                     reference_blind_at_write={
                         int(chunk): float(value)
                         for chunk, value in zip(chunks, blind_values)
+                        if np.isfinite(value)
+                    },
+                    source_pixels={
+                        int(chunk): pixel.copy()
+                        for chunk, pixel in zip(chunks, source_pixels)
+                        if np.isfinite(pixel).all()
+                    },
+                    image_center_margins={
+                        int(chunk): float(value)
+                        for chunk, value in zip(chunks, center_margins)
                         if np.isfinite(value)
                     },
                     observation_weight=float(
@@ -1000,6 +1083,7 @@ def build_from_sequence(
     index.write_ply(output_dir / "surfel_index.ply")
     stats = {
         **index.stats(),
+        "index_version": INDEX_VERSION,
         "representation": "radius_normal_surfel_with_voxel_acceleration",
         "voxel_only_merge": False,
         "voxel_size_mode": voxel_size_mode,
@@ -1030,6 +1114,13 @@ def build_from_sequence(
             ),
             "tagged_observations": tagged_observations,
             "semantics": "1 - upstream reference_valid at observation pixel",
+        },
+        "observation_view_metadata": {
+            "source_pixels": True,
+            "image_center_margins": True,
+            "view_directions": True,
+            "chunk_confidence_weights": True,
+            "purpose": "stable view-adaptive first-episode source scoring",
         },
     }
     (output_dir / "stats.json").write_text(

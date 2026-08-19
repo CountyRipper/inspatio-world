@@ -43,6 +43,7 @@ from mapkv.canonical_kv import (
     save_canonical_audit,
 )
 from mapkv.kv_bank import resolve_memory_layers
+from mapkv.reentry_wre import build_reentry_virtual_recent_plans
 from mapkv.warp_reencode import (
     build_continuous_virtual_recent_plans,
     build_warp_reencode_plans,
@@ -131,7 +132,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--continuous_query_gate",
-        choices=("global", "surfel", "support_preserving", "source_protected"),
+        choices=(
+            "global",
+            "surfel",
+            "support_preserving",
+            "source_protected",
+            "edge_safe",
+        ),
         default="surfel",
         help="Apply Virtual Recent delta globally or only at M_history query tokens.",
     )
@@ -168,6 +175,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--warp_generated_only_threshold", type=float, default=0.5
+    )
+    parser.add_argument(
+        "--reentry_memory",
+        action="store_true",
+        help="Read long-term memory once after a true absence episode.",
+    )
+    parser.add_argument("--reentry_observation_start_chunk", type=int)
+    parser.add_argument("--reentry_absent_blocks", type=int, default=2)
+    parser.add_argument("--reentry_view_adaptive_source", action="store_true")
+    parser.add_argument("--reentry_edge_safe", action="store_true")
+    parser.add_argument(
+        "--reentry_warp_valid_erosion_kernel", type=int, default=3
     )
     parser.add_argument("--compare_latents_to")
     parser.add_argument("--verify_memory_off_replay", action="store_true")
@@ -834,48 +853,104 @@ def main() -> None:
             dtype=dtype,
         )
         if args.continuous_virtual_recent:
-            virtual_recent_contexts, memory_selections = (
-                build_continuous_virtual_recent_plans(
-                    **common_virtual_kwargs,
-                    surfel_index_path=args.warp_surfel_index,
-                    surfel_sequence_path=args.warp_surfel_sequence,
-                    min_history_gap_chunks=args.warp_min_history_gap,
-                    warp_short_term_recent=(
-                        args.continuous_recent_fallback == "warped"
-                    ),
-                    query_gate_mode=(
-                        "surfel_exact"
-                        if args.continuous_query_gate == "surfel"
-                        else (
-                            "surfel_support_preserving"
-                            if args.continuous_query_gate == "support_preserving"
-                            else (
-                                "surfel_source_protected"
-                                if args.continuous_query_gate
-                                == "source_protected"
-                                else "global"
-                            )
-                        )
-                    ),
-                    mask_policy=args.continuous_mask_policy,
-                    memory_dilation_kernel=args.warp_memory_dilation_kernel,
-                    query_feather_kernel=args.warp_query_feather_kernel,
-                    historical_representation=args.warp_history_representation,
-                    vae=(
-                        pipeline.vae
-                        if args.warp_history_representation == "rgb_warp_vae"
-                        else None
-                    ),
-                    reference_mask_latent=mask_latent,
-                    source_protection=args.source_protected_memory,
-                    reference_protection_dilation_kernel=(
-                        args.warp_reference_protection_kernel
-                    ),
-                    generated_only_threshold=(
-                        args.warp_generated_only_threshold
-                    ),
+            if args.reentry_memory:
+                if args.reentry_observation_start_chunk is None:
+                    raise ValueError(
+                        "Re-entry memory requires "
+                        "--reentry_observation_start_chunk"
+                    )
+                if not args.source_protected_memory:
+                    raise ValueError(
+                        "Re-entry memory requires source protection"
+                    )
+                if args.warp_history_representation != "rgb_warp_vae":
+                    raise ValueError(
+                        "Re-entry memory requires RGB-Warp→VAE"
+                    )
+                virtual_recent_contexts, memory_selections = (
+                    build_reentry_virtual_recent_plans(
+                        **common_virtual_kwargs,
+                        observation_start_chunk=(
+                            args.reentry_observation_start_chunk
+                        ),
+                        surfel_index_path=args.warp_surfel_index,
+                        surfel_sequence_path=args.warp_surfel_sequence,
+                        vae=pipeline.vae,
+                        reference_mask_latent=mask_latent,
+                        absent_blocks=args.reentry_absent_blocks,
+                        view_adaptive_source=(
+                            args.reentry_view_adaptive_source
+                        ),
+                        edge_safe=args.reentry_edge_safe,
+                        reference_protection_dilation_kernel=(
+                            args.warp_reference_protection_kernel
+                        ),
+                        generated_only_threshold=(
+                            args.warp_generated_only_threshold
+                        ),
+                        memory_dilation_kernel=(
+                            args.warp_memory_dilation_kernel
+                        ),
+                        query_feather_kernel=args.warp_query_feather_kernel,
+                        warp_valid_erosion_kernel=(
+                            args.reentry_warp_valid_erosion_kernel
+                        ),
+                    )
                 )
-            )
+            else:
+                if args.continuous_query_gate == "edge_safe":
+                    raise ValueError(
+                        "edge_safe query gating is defined for re-entry "
+                        "memory only"
+                    )
+                virtual_recent_contexts, memory_selections = (
+                    build_continuous_virtual_recent_plans(
+                        **common_virtual_kwargs,
+                        surfel_index_path=args.warp_surfel_index,
+                        surfel_sequence_path=args.warp_surfel_sequence,
+                        min_history_gap_chunks=args.warp_min_history_gap,
+                        warp_short_term_recent=(
+                            args.continuous_recent_fallback == "warped"
+                        ),
+                        query_gate_mode=(
+                            "surfel_exact"
+                            if args.continuous_query_gate == "surfel"
+                            else (
+                                "surfel_support_preserving"
+                                if args.continuous_query_gate
+                                == "support_preserving"
+                                else (
+                                    "surfel_source_protected"
+                                    if args.continuous_query_gate
+                                    == "source_protected"
+                                    else "global"
+                                )
+                            )
+                        ),
+                        mask_policy=args.continuous_mask_policy,
+                        memory_dilation_kernel=(
+                            args.warp_memory_dilation_kernel
+                        ),
+                        query_feather_kernel=args.warp_query_feather_kernel,
+                        historical_representation=(
+                            args.warp_history_representation
+                        ),
+                        vae=(
+                            pipeline.vae
+                            if args.warp_history_representation
+                            == "rgb_warp_vae"
+                            else None
+                        ),
+                        reference_mask_latent=mask_latent,
+                        source_protection=args.source_protected_memory,
+                        reference_protection_dilation_kernel=(
+                            args.warp_reference_protection_kernel
+                        ),
+                        generated_only_threshold=(
+                            args.warp_generated_only_threshold
+                        ),
+                    )
+                )
         else:
             virtual_recent_contexts, memory_selections = (
                 build_warp_reencode_plans(
@@ -1282,6 +1357,18 @@ def main() -> None:
                     args.continuous_query_gate
                     if args.continuous_virtual_recent
                     else "global"
+                ),
+                "reentry_memory": bool(args.reentry_memory),
+                "reentry_observation_start_chunk": (
+                    args.reentry_observation_start_chunk
+                ),
+                "reentry_absent_blocks": args.reentry_absent_blocks,
+                "reentry_view_adaptive_source": bool(
+                    args.reentry_view_adaptive_source
+                ),
+                "reentry_edge_safe": bool(args.reentry_edge_safe),
+                "reentry_warp_valid_erosion_kernel": (
+                    args.reentry_warp_valid_erosion_kernel
                 ),
                 "writer_isolated_from_runtime_cache": True,
                 "manifest": warp_reencode_manifest,

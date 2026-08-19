@@ -202,3 +202,38 @@ Canonical capture is forbidden during denoising and must reconstruct source
 post-RoPE K/V exactly before generation. The report contains complete B1-to-B2
 videos, Chinese method labels, real-RGB surfel views, object identity crops,
 and the full architecture/change graph.
+
+## Re-entry memory refinement
+
+Run the lifecycle / observation / edge-safety matrix while reusing the
+validated baseline and causal CUT3R prefix:
+
+    bash scripts/run_mapkv_reentry_refinement.sh --stage full --gpu 0
+
+The stage compares:
+
+1. the original Source-Protected RGB-Warp WRE that reads whenever history is
+   visible;
+2. a group-level re-entry-only policy with fixed chunk 11;
+3. a stable view-adaptive first-episode observation;
+4. the view-adaptive method with `reference_blind_at_write >= 0.75`, an
+   eroded warp-valid interior, RGB border padding, and inward-only query
+   feathering;
+5. the same edge-safe path on denoising steps `[0,1,2]` only.
+
+The lifecycle is causal: the first visibility episode only writes memory,
+two consecutive absent blocks arm re-entry, the first source-blind supported
+block reads once, and the group is then handed back to native Recent. Source
+selection uses the first-episode generated-only observations and scores
+`coverage × camera-view alignment × observation quality × center margin`;
+the selected chunk is locked for the episode.
+
+The default output is
+`results/mapkv_fast/yaw45m20to35_scene01_seed0_reentry_refinement`. It includes
+complete 453-frame comparison videos, separate first-departure and re-entry
+clips, a lifecycle timeline, real-RGB surfels, a B2 right-edge review, metrics,
+and the architecture graph. The current controlled result is intentionally
+reported as `REENTRY_HANDOFF_INSUFFICIENT`: group-level one-shot serving fixes
+the first-departure transition but retains too little long-term memory and
+marks later re-entering surfaces served too early. The next scoped correction
+is per-surfel one-shot lifecycle, not another alpha/mask/CUT3R sweep.

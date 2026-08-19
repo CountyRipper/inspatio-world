@@ -6,6 +6,8 @@ from typing import Iterable
 import torch
 import torch.nn.functional as F
 
+from mapkv.reentry_memory import inward_feather_token_gate
+
 from .config import resolve_indices
 
 
@@ -267,6 +269,25 @@ class MemoryContext:
                 dilation_kernel=self.reference_protection_kernel,
             )
             gate = gate * (1.0 - protected)
+        elif self.gate_mode == "surfel_edge_safe_source_protected":
+            if self.coverage is None:
+                raise ValueError(
+                    "surfel_edge_safe_source_protected gate requires coverage"
+                )
+            gate = inward_feather_token_gate(
+                self.coverage,
+                batch=batch,
+                frames=frames,
+                token_hw=token_hw,
+                device=mask_block.device,
+                feather_kernel=self.smooth_kernel,
+            )
+            protected = reference_protected_token_mask(
+                mask_block,
+                token_hw,
+                dilation_kernel=self.reference_protection_kernel,
+            )
+            gate = gate * (1.0 - protected)
         elif self.gate_mode in {"surfel", "surfel_ref_blind"}:
             if self.coverage is None:
                 raise ValueError(f"{self.gate_mode} gate requires a coverage mask")
@@ -355,6 +376,7 @@ def make_memory_context(
             "surfel_exact",
             "surfel_support_preserving",
             "surfel_source_protected",
+            "surfel_edge_safe_source_protected",
         }
         and coverage is not None
         and not bool(coverage.any())

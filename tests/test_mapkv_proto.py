@@ -25,6 +25,13 @@ from mapkv_proto.memory_context import (
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.canonical_kv import _memory_token_gate, _warp_token_payload
 from mapkv.retrieval import GeometryChunkRetriever
+from mapkv.reentry_memory import (
+    MemoryEpisodeState,
+    ReentryMemoryLifecycle,
+    erode_binary_coverage,
+    inward_feather_token_gate,
+)
+from mapkv.reentry_wre import score_view_adaptive_observations
 from mapkv.report_framework import (
     ArchitectureChange,
     ArchitectureEdge,
@@ -1511,6 +1518,11 @@ def test_surfel_reference_blind_observation_roundtrips(tmp_path):
             chunk_weights={3: 1.0, 8: 1.0},
             view_dirs={},
             reference_blind_at_write={3: 0.1, 8: 0.9},
+            source_pixels={
+                3: np.array([5.0, 7.0], dtype=np.float32),
+                8: np.array([9.0, 11.0], dtype=np.float32),
+            },
+            image_center_margins={3: 0.2, 8: 0.8},
             observation_weight=2.0,
         )
     ]
@@ -1519,6 +1531,13 @@ def test_surfel_reference_blind_observation_roundtrips(tmp_path):
     loaded = VoxelSurfelIndex.load(path)
     assert loaded.cells[0].reference_blind_at_write == pytest.approx(
         {3: 0.1, 8: 0.9}
+    )
+    np.testing.assert_array_equal(
+        loaded.cells[0].source_pixels[8],
+        np.array([9.0, 11.0], dtype=np.float32),
+    )
+    assert loaded.cells[0].image_center_margins == pytest.approx(
+        {3: 0.2, 8: 0.8}
     )
     np.testing.assert_array_equal(
         loaded.generated_only_cell_indices(8), np.array([0], dtype=np.int32)
@@ -1550,3 +1569,134 @@ def test_source_protected_gate_is_zero_for_reference_valid_tokens():
     protected = reference_protected_coverage(mask, dilation_kernel=1)
     assert torch.all(protected[:, :, :, :2] == 1)
     assert torch.all(protected[:, :, :, 2:] == 0)
+
+
+def test_reentry_lifecycle_reads_once_after_two_absent_blocks():
+    lifecycle = ReentryMemoryLifecycle(absent_blocks=2)
+    first = lifecycle.step(visible=True, read_support=True)
+    assert first.state_after == MemoryEpisodeState.VISIBLE_RECENT
+    assert first.read_long_term is False
+    one_absent = lifecycle.step(visible=False, read_support=False)
+    assert one_absent.state_after == MemoryEpisodeState.VISIBLE_RECENT
+    assert one_absent.absence_count == 1
+    absent = lifecycle.step(visible=False, read_support=False)
+    assert absent.state_after == MemoryEpisodeState.ABSENT
+    waiting = lifecycle.step(visible=True, read_support=False)
+    assert waiting.state_after == MemoryEpisodeState.REENTERED
+    assert waiting.read_long_term is False
+    served = lifecycle.step(visible=True, read_support=True)
+    assert served.state_after == MemoryEpisodeState.SERVED
+    assert served.read_long_term is True
+    handoff = lifecycle.step(visible=True, read_support=True)
+    assert handoff.state_after == MemoryEpisodeState.SERVED
+    assert handoff.read_long_term is False
+
+
+def test_edge_safe_masks_never_expand_outside_support():
+    support = torch.zeros(1, 1, 7, 7)
+    support[:, :, 1:6, 1:6] = 1
+    eroded = erode_binary_coverage(support, kernel_size=3)
+    expected = torch.zeros_like(support)
+    expected[:, :, 2:5, 2:5] = 1
+    torch.testing.assert_close(eroded, expected)
+    gate = inward_feather_token_gate(
+        support,
+        batch=1,
+        frames=1,
+        token_hw=(7, 7),
+        device=torch.device("cpu"),
+        feather_kernel=3,
+    )
+    assert torch.count_nonzero(gate * (1.0 - support)) == 0
+    assert torch.all(gate[:, :, 2:5, 2:5] == 1)
+    assert torch.all(gate[:, :, 1:6, 1:6] > 0)
+
+
+def test_rgb_warp_border_padding_avoids_black_invalid_samples():
+    image = torch.tensor(
+        [[[[[0.25, 0.5], [0.75, 1.0]]]]], dtype=torch.float32
+    ).expand(1, 3, 1, 2, 2)
+    outside = torch.full((3, 2, 2, 2), 2.0)
+    zero = warp_latent(image, outside, padding_mode="zeros")
+    border = warp_latent(image, outside, padding_mode="border")
+    assert torch.count_nonzero(zero) == 0
+    torch.testing.assert_close(border, torch.ones_like(border))
+
+
+def test_edge_safe_source_protected_gate_is_inward_and_source_zero():
+    coverage = torch.zeros(1, 3, 6, 6)
+    coverage[:, :, 1:5, 1:5] = 1
+    mask = -torch.ones(1, 3, 1, 6, 6)
+    mask[:, :, :, :, :2] = 1
+    context = MemoryContext(
+        target_block=9,
+        source_chunk=2,
+        layer_payloads={},
+        selected_layers=(0,),
+        selected_step_indices=(0,),
+        alpha=1.0,
+        gate_mode="surfel_edge_safe_source_protected",
+        smooth_kernel=3,
+        coverage=coverage,
+        reference_protection_kernel=1,
+    )
+    gate = context.with_query_gate(mask, (6, 6)).query_gate.reshape(
+        1, 3, 6, 6
+    )
+    assert torch.count_nonzero(gate[:, :, :, :2]) == 0
+    assert torch.count_nonzero(gate * (1.0 - coverage)) == 0
+    assert torch.all(gate[:, :, 2:4, 2:4] == 1)
+
+
+def test_view_adaptive_score_prefers_camera_aligned_pure_rotation():
+    cells = [
+        SimpleNamespace(
+            xyz=np.array([0.0, 0.0, 1.0]),
+            view_dirs={chunk: np.array([0.0, 0.0, -1.0])},
+            chunk_weights={chunk: 1.0},
+            image_center_margins={chunk: 1.0},
+        )
+        for chunk in (0, 1)
+    ]
+
+    class FakeIndex:
+        def __init__(self):
+            self.cells = cells
+
+        def generated_only_cell_indices(self, chunk, **_):
+            return np.array([int(chunk)], dtype=np.int32)
+
+        def visible_cells(self, *_, eligible_indices, **__):
+            index = int(eligible_indices[0])
+            return {
+                "pixels": np.array([[0, 0]], dtype=np.int32),
+                "indices": np.array([index], dtype=np.int32),
+            }
+
+    poses = np.repeat(np.eye(4, dtype=np.float64)[None], 4, axis=0)
+    angle = np.deg2rad(20.0)
+    poses[0, :3, :3] = np.array(
+        [
+            [np.cos(angle), 0.0, np.sin(angle)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(angle), 0.0, np.cos(angle)],
+        ]
+    )
+    ranking = score_view_adaptive_observations(
+        surfel_index=FakeIndex(),
+        candidate_chunks=(0, 1),
+        surface_group_indices=np.array([0, 1], dtype=np.int32),
+        target_chunk=3,
+        query_pose=np.eye(4),
+        intrinsics=np.eye(3),
+        source_image_hw=(1, 1),
+        target_hw=(1, 1),
+        poses=poses,
+        latent_length=4,
+        rgb_length=4,
+        frames_per_block=1,
+        reference_blind_threshold=0.75,
+    )
+    assert [item["chunk_id"] for item in ranking] == [1, 0]
+    assert ranking[0]["camera_orientation_alignment"] == pytest.approx(1.0)
+    assert ranking[1]["camera_orientation_alignment"] < 0.2
