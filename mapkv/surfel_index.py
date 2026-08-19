@@ -12,6 +12,37 @@ from PIL import Image
 
 
 INDEX_VERSION = 4
+DEFAULT_DISPLAY_Z_FLIPPED = True
+
+
+def surfel_display_coordinates(
+    xyz: np.ndarray,
+    *,
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
+) -> np.ndarray:
+    """Map world XYZ to plot X/Z/Y without mutating geometry.
+
+    Matplotlib's vertical plot axis displays world Y. The horizontal depth
+    axis displays world Z and is reversed by default for a more readable
+    camera-facing overview.
+    """
+    values = np.asarray(xyz, dtype=np.float64)
+    if values.shape[-1:] != (3,):
+        raise ValueError(f"Expected [...,3] XYZ values, got {values.shape}")
+    displayed = values[..., [0, 2, 1]].copy()
+    if display_z_flipped:
+        displayed[..., 1] *= -1.0
+    return displayed
+
+
+def surfel_display_axis_labels(
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
+) -> tuple[str, str, str]:
+    return (
+        "x",
+        "-z (display)" if display_z_flipped else "z",
+        "y",
+    )
 
 
 @dataclass
@@ -872,12 +903,86 @@ class SurfelIndex:
         return cls(voxel_size, cells)
 
 
+def _set_surfel_display_bounds(
+    axis,
+    displayed_positions: np.ndarray,
+    voxel_size: float,
+) -> None:
+    lower = np.quantile(displayed_positions, 0.01, axis=0)
+    upper = np.quantile(displayed_positions, 0.99, axis=0)
+    margin = np.maximum((upper - lower) * 0.04, voxel_size)
+    axis.set_xlim(lower[0] - margin[0], upper[0] + margin[0])
+    axis.set_ylim(lower[1] - margin[1], upper[1] + margin[1])
+    axis.set_zlim(lower[2] - margin[2], upper[2] + margin[2])
+    axis.set_box_aspect(np.maximum(upper - lower, voxel_size))
+
+
+def write_center_preview(
+    index: SurfelIndex,
+    path: str | Path,
+    *,
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
+) -> None:
+    """Render surfel centers in the display coordinate system only."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    positions = np.asarray(
+        [cell.xyz for cell in index.cells], dtype=np.float64
+    ).reshape(-1, 3)
+    displayed = surfel_display_coordinates(
+        positions, display_z_flipped=display_z_flipped
+    )
+    dominant = np.asarray(
+        [
+            max(cell.chunk_weights, key=cell.chunk_weights.get)
+            for cell in index.cells
+        ],
+        dtype=np.float32,
+    )
+    figure = plt.figure(figsize=(8, 6))
+    axis = figure.add_subplot(111, projection="3d")
+    if len(displayed):
+        scatter = axis.scatter(
+            displayed[:, 0],
+            displayed[:, 1],
+            displayed[:, 2],
+            c=dominant,
+            s=1.0,
+            cmap="turbo",
+            alpha=0.65,
+        )
+        figure.colorbar(scatter, ax=axis, label="dominant chunk")
+        _set_surfel_display_bounds(axis, displayed, index.voxel_size)
+    x_label, z_label, y_label = surfel_display_axis_labels(
+        display_z_flipped
+    )
+    axis.view_init(elev=30, azim=-68)
+    axis.set(
+        title=(
+            "Known-pose radius/normal surfel address "
+            f"(display Z flipped={display_z_flipped})"
+        ),
+        xlabel=x_label,
+        ylabel=z_label,
+        zlabel=y_label,
+    )
+    figure.tight_layout()
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+
+
 def write_oriented_disk_preview(
     index: SurfelIndex,
     path: str | Path,
     *,
     max_disks: int = 3000,
     vertices_per_disk: int = 12,
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
 ) -> None:
     """Render an inspectable VMem-style oriented-disk view without changing geometry."""
     import matplotlib
@@ -932,8 +1037,16 @@ def write_oriented_disk_preview(
             + radius * np.cos(theta)[:, None] * tangent[None]
             + radius * np.sin(theta)[:, None] * bitangent[None]
         )
-        polygons.append(disk[:, [0, 2, 1]])
-        centers.append(cell.xyz[[0, 2, 1]])
+        polygons.append(
+            surfel_display_coordinates(
+                disk, display_z_flipped=display_z_flipped
+            )
+        )
+        centers.append(
+            surfel_display_coordinates(
+                cell.xyz, display_z_flipped=display_z_flipped
+            )
+        )
         dominant_chunks.append(max(cell.chunk_weights, key=cell.chunk_weights.get))
 
     figure = plt.figure(figsize=(9, 7))
@@ -952,21 +1065,22 @@ def write_oriented_disk_preview(
         )
         axis.add_collection3d(collection)
         centers_array = np.asarray(centers)
-        lower = np.quantile(centers_array, 0.01, axis=0)
-        upper = np.quantile(centers_array, 0.99, axis=0)
-        margin = np.maximum((upper - lower) * 0.04, index.voxel_size)
-        axis.set_xlim(lower[0] - margin[0], upper[0] + margin[0])
-        axis.set_ylim(lower[1] - margin[1], upper[1] + margin[1])
-        axis.set_zlim(lower[2] - margin[2], upper[2] + margin[2])
-        axis.set_box_aspect(np.maximum(upper - lower, index.voxel_size))
+        _set_surfel_display_bounds(axis, centers_array, index.voxel_size)
         scalar = plt.cm.ScalarMappable(norm=normalize, cmap="turbo")
         scalar.set_array(dominant)
         figure.colorbar(scalar, ax=axis, shrink=0.7, label="dominant chunk")
+    x_label, z_label, y_label = surfel_display_axis_labels(
+        display_z_flipped
+    )
+    axis.view_init(elev=30, azim=-68)
     axis.set(
-        title=f"Oriented surfel disks (sampled {len(polygons)}/{len(index.cells)})",
-        xlabel="x",
-        ylabel="z",
-        zlabel="y",
+        title=(
+            f"Oriented surfel disks (sampled {len(polygons)}/"
+            f"{len(index.cells)}, display Z flipped={display_z_flipped})"
+        ),
+        xlabel=x_label,
+        ylabel=z_label,
+        zlabel=y_label,
     )
     figure.tight_layout()
     figure.savefig(path, dpi=170)
@@ -1150,41 +1264,8 @@ def build_from_sequence(
         json.dumps(coverage, indent=2), encoding="utf-8"
     )
 
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    positions = np.asarray([cell.xyz for cell in index.cells])
-    dominant = np.asarray(
-        [
-            max(cell.chunk_weights, key=cell.chunk_weights.get)
-            for cell in index.cells
-        ]
-    )
-    fig = plt.figure(figsize=(8, 6))
-    axis = fig.add_subplot(111, projection="3d")
-    if len(positions):
-        scatter = axis.scatter(
-            positions[:, 0],
-            positions[:, 2],
-            positions[:, 1],
-            c=dominant,
-            s=1.0,
-            cmap="turbo",
-            alpha=0.65,
-        )
-        fig.colorbar(scatter, ax=axis, label="dominant chunk")
-    axis.set(
-        title="Known-pose radius/normal surfel address",
-        xlabel="x",
-        ylabel="z",
-        zlabel="y",
-    )
-    fig.tight_layout()
-    fig.savefig(output_dir / "surfel_preview.png", dpi=160)
-    fig.savefig(output_dir / "surfel_center_preview.png", dpi=160)
-    plt.close(fig)
+    write_center_preview(index, output_dir / "surfel_preview.png")
+    write_center_preview(index, output_dir / "surfel_center_preview.png")
     write_oriented_disk_preview(
         index, output_dir / "surfel_disk_preview.png"
     )

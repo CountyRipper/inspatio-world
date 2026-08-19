@@ -335,8 +335,8 @@ R3 Re-entry Episode Continuous Refresh。首次 B1 episode 只写不读；anchor
 {render_changes_html(snapshot)}</section>
 
 <section><h2>B. Geometry、Canonical Identity 与 Lifecycle</h2><div class='images'>
-<figure><figcaption>真实 RGB surfel splats</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
-<figure><figcaption>真实 RGB oriented disks</figcaption><img src='surfel_rgb_options/B_rgb_oriented_disks.png'></figure>
+<figure><figcaption>真实 RGB surfel splats（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
+<figure><figcaption>真实 RGB oriented disks（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/B_rgb_oriented_disks.png'></figure>
 <figure><figcaption>Canonical B1 chunk 11</figcaption><img src='assets/reentry_refresh/canonical_b1_chunk11.png'></figure>
 <figure><figcaption>Chunk 11 warp 到 B2</figcaption><img src='assets/reentry_refresh/canonical_b1_warped_to_b2.png'></figure>
 <figure><figcaption>Canonical revisit mask</figcaption><img src='assets/reentry_refresh/M_canonical_revisit_eval.png'></figure>

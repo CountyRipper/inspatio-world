@@ -32,6 +32,11 @@ architecture:
 
 surfel:
   primary_color_source: generated_historical_rgb_observations
+  display_coordinate_system:
+    plot_axes: [x, -z, y]
+    display_z_flipped: true
+    geometry_coordinates_changed: false
+    affects_retrieval_or_warp: false
   primary_views:
     - rgb_world_overview
     - rgb_target_camera_zbuffer

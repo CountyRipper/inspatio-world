@@ -10,7 +10,12 @@ from PIL import Image, ImageOps
 
 from mapkv_proto.pose_utils import to_cut3r_c2w
 
-from .surfel_index import SurfelIndex
+from .surfel_index import (
+    DEFAULT_DISPLAY_Z_FLIPPED,
+    SurfelIndex,
+    surfel_display_axis_labels,
+    surfel_display_coordinates,
+)
 
 
 def _prepare_cut3r_rgb(path: str | Path, shape: tuple[int, int]) -> np.ndarray:
@@ -99,14 +104,16 @@ def sample_historical_rgb(
     return colors, valid, color_chunks, stats
 
 
-def _set_world_bounds(axis, positions: np.ndarray, voxel_size: float) -> None:
-    lower = np.quantile(positions, 0.01, axis=0)
-    upper = np.quantile(positions, 0.99, axis=0)
+def _set_world_bounds(
+    axis, displayed_positions: np.ndarray, voxel_size: float
+) -> None:
+    lower = np.quantile(displayed_positions, 0.01, axis=0)
+    upper = np.quantile(displayed_positions, 0.99, axis=0)
     margin = np.maximum((upper - lower) * 0.04, voxel_size)
     axis.set_xlim(lower[0] - margin[0], upper[0] + margin[0])
-    axis.set_ylim(lower[2] - margin[2], upper[2] + margin[2])
-    axis.set_zlim(lower[1] - margin[1], upper[1] + margin[1])
-    axis.set_box_aspect(np.maximum((upper - lower)[[0, 2, 1]], voxel_size))
+    axis.set_ylim(lower[1] - margin[1], upper[1] + margin[1])
+    axis.set_zlim(lower[2] - margin[2], upper[2] + margin[2])
+    axis.set_box_aspect(np.maximum(upper - lower, voxel_size))
 
 
 def render_rgb_world_splats(
@@ -114,6 +121,8 @@ def render_rgb_world_splats(
     colors: np.ndarray,
     valid: np.ndarray,
     path: str | Path,
+    *,
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
 ) -> None:
     import matplotlib
 
@@ -122,20 +131,34 @@ def render_rgb_world_splats(
 
     positions = np.asarray([cell.xyz for cell in index.cells], dtype=np.float32)
     keep = valid & np.isfinite(positions).all(axis=1)
+    displayed = surfel_display_coordinates(
+        positions[keep], display_z_flipped=display_z_flipped
+    )
     figure = plt.figure(figsize=(10, 7), facecolor="#101418")
     axis = figure.add_subplot(111, projection="3d", facecolor="#101418")
     axis.scatter(
-        positions[keep, 0],
-        positions[keep, 2],
-        positions[keep, 1],
+        displayed[:, 0],
+        displayed[:, 1],
+        displayed[:, 2],
         c=colors[keep].astype(np.float32) / 255.0,
         s=7,
         alpha=0.94,
         depthshade=False,
     )
-    _set_world_bounds(axis, positions[keep], index.voxel_size)
+    _set_world_bounds(axis, displayed, index.voxel_size)
     axis.view_init(elev=30, azim=-68)
-    axis.set(title="A — RGB world-space surfel splats", xlabel="x", ylabel="z", zlabel="y")
+    x_label, z_label, y_label = surfel_display_axis_labels(
+        display_z_flipped
+    )
+    axis.set(
+        title=(
+            "A — RGB world-space surfel splats "
+            f"(display Z flipped={display_z_flipped})"
+        ),
+        xlabel=x_label,
+        ylabel=z_label,
+        zlabel=y_label,
+    )
     axis.tick_params(colors="white")
     axis.title.set_color("white")
     axis.xaxis.label.set_color("white")
@@ -153,6 +176,7 @@ def render_rgb_oriented_disks(
     path: str | Path,
     *,
     max_disks: int = 3500,
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
 ) -> None:
     import matplotlib
 
@@ -195,9 +219,17 @@ def render_rgb_oriented_disks(
             + radius * np.cos(theta)[:, None] * tangent[None]
             + radius * np.sin(theta)[:, None] * bitangent[None]
         )
-        polygons.append(disk[:, [0, 2, 1]])
+        polygons.append(
+            surfel_display_coordinates(
+                disk, display_z_flipped=display_z_flipped
+            )
+        )
         facecolors.append(colors[item].astype(np.float32) / 255.0)
-        positions.append(cell.xyz)
+        positions.append(
+            surfel_display_coordinates(
+                cell.xyz, display_z_flipped=display_z_flipped
+            )
+        )
     figure = plt.figure(figsize=(10, 7), facecolor="#101418")
     axis = figure.add_subplot(111, projection="3d", facecolor="#101418")
     collection = Poly3DCollection(
@@ -206,7 +238,18 @@ def render_rgb_oriented_disks(
     axis.add_collection3d(collection)
     _set_world_bounds(axis, np.asarray(positions), index.voxel_size)
     axis.view_init(elev=30, azim=-68)
-    axis.set(title="B — RGB oriented surfel disks", xlabel="x", ylabel="z", zlabel="y")
+    x_label, z_label, y_label = surfel_display_axis_labels(
+        display_z_flipped
+    )
+    axis.set(
+        title=(
+            "B — RGB oriented surfel disks "
+            f"(display Z flipped={display_z_flipped})"
+        ),
+        xlabel=x_label,
+        ylabel=z_label,
+        zlabel=y_label,
+    )
     axis.tick_params(colors="white")
     axis.title.set_color("white")
     axis.xaxis.label.set_color("white")
@@ -308,8 +351,10 @@ figure{{margin:0}}figcaption{{min-height:70px}}img{{width:100%;background:#111;b
 code{{background:#eef1f5;padding:2px 5px}}</style></head><body><main>
 <section><h1>MapKV RGB Surfel 可视化候选</h1>
 <p><b>本次关注：</b>选择未来 HTML report 的默认 surfel 主视图。</p>
-<p>所有颜色均来自真实 generated historical frame 的 first-seen observation；
-没有使用 chunk 伪彩色，也没有改变 CUT3R geometry / merge / retrieval。</p>
+	<p>所有颜色均来自真实 generated historical frame 的 first-seen observation；
+	没有使用 chunk 伪彩色，也没有改变 CUT3R geometry / merge / retrieval。</p>
+    <p><b>显示坐标：</b>world Z 在 3D overview 中默认反向，仅改变图片朝向；
+    实际 surfel XYZ、camera、visibility 和 retrieval 均保持原值。</p>
 	<p>请直接回复 A / B / C / D / E，或组合，例如
 	<code>D 主视图 + E 对齐审计 + A 补充</code>。</p></section>
 <section class='grid'>{figures}</section>
@@ -327,6 +372,7 @@ def generate_options(
     source_chunk: int,
     output_dir: str | Path,
     generated_only_source: bool = False,
+    display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
 ) -> dict:
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -336,10 +382,18 @@ def generate_options(
         index, sequence_path
     )
     render_rgb_world_splats(
-        index, colors, valid, output_dir / "A_rgb_world_splats.png"
+        index,
+        colors,
+        valid,
+        output_dir / "A_rgb_world_splats.png",
+        display_z_flipped=display_z_flipped,
     )
     render_rgb_oriented_disks(
-        index, colors, valid, output_dir / "B_rgb_oriented_disks.png"
+        index,
+        colors,
+        valid,
+        output_dir / "B_rgb_oriented_disks.png",
+        display_z_flipped=display_z_flipped,
     )
     mapping_path = Path(block_mapping_path).resolve()
     mapping_payload = json.loads(mapping_path.read_text(encoding="utf-8"))
@@ -409,6 +463,16 @@ def generate_options(
         "target_camera_all_history": all_stats,
         "target_camera_b1_only": b1_stats,
         "b1_visualization_generated_only": bool(generated_only_source),
+        "display_coordinate_system": {
+            "plot_axes": [
+                "x",
+                "-z" if display_z_flipped else "z",
+                "y",
+            ],
+            "display_z_flipped": bool(display_z_flipped),
+            "geometry_coordinates_changed": False,
+            "affects_retrieval_or_warp": False,
+        },
         "generated_only_source_cells": (
             None
             if generated_only_indices is None
@@ -454,6 +518,7 @@ def main() -> None:
     parser.add_argument("--target_chunk", type=int, required=True)
     parser.add_argument("--source_chunk", type=int, required=True)
     parser.add_argument("--generated_only_source", action="store_true")
+    parser.add_argument("--no_display_z_flip", action="store_true")
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
     print(
@@ -466,6 +531,7 @@ def main() -> None:
                 source_chunk=args.source_chunk,
                 output_dir=args.output_dir,
                 generated_only_source=args.generated_only_source,
+                display_z_flipped=not args.no_display_z_flip,
             ),
             indent=2,
         )

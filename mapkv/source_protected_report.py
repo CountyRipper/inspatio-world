@@ -368,8 +368,8 @@ source chunk {metrics['trajectory']['source_chunk']}，target chunk
 </div><div class='images'>{mask_html}</div></section>
 
 <section><h2>C. Real-RGB Surfel（主视图）</h2><div class='images'>
-<figure><figcaption>真实历史 RGB world splats</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
-<figure><figcaption>真实历史 RGB oriented disks</figcaption><img src='surfel_rgb_options/B_rgb_oriented_disks.png'></figure>
+<figure><figcaption>真实历史 RGB world splats（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
+<figure><figcaption>真实历史 RGB oriented disks（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/B_rgb_oriented_disks.png'></figure>
 <figure><figcaption>B1 generated-only 在 B2 的 RGB z-buffer</figcaption><img src='surfel_rgb_options/D_rgb_b1_target_zbuffer.png'></figure>
 <figure><figcaption>B1/B2 support overlay</figcaption><img src='surfel_rgb_options/E_rgb_b1_target_overlay.png'></figure>
 </div></section>

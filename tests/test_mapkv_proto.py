@@ -12,7 +12,11 @@ from PIL import Image
 from mapkv_proto.cut3r.surfel_index import KVSurfel, SurfelIndex
 from mapkv.latent_control import LatentBlockIntervention
 from mapkv.locality_evaluation import _rotation_warp
-from mapkv.surfel_index import write_oriented_disk_preview
+from mapkv.surfel_index import (
+    surfel_display_axis_labels,
+    surfel_display_coordinates,
+    write_oriented_disk_preview,
+)
 from mapkv.surfel_rgb_options import sample_historical_rgb
 from mapkv_proto.deterministic_noise import DeterministicNoiseBundle
 from mapkv_proto.kv_bank import KVBank, KVBankWriter
@@ -1444,6 +1448,25 @@ def test_oriented_disk_surfel_preview_is_visualization_only(tmp_path):
     write_oriented_disk_preview(index, output, max_disks=10)
     assert output.exists() and output.stat().st_size > 0
     np.testing.assert_array_equal(index.cells[0].xyz, before)
+
+
+def test_surfel_display_coordinates_flip_world_z_without_mutating_geometry():
+    world = np.asarray(
+        [[1.0, 2.0, 3.0], [-1.0, -2.0, -3.0]], dtype=np.float32
+    )
+    before = world.copy()
+    displayed = surfel_display_coordinates(world)
+    unflipped = surfel_display_coordinates(world, display_z_flipped=False)
+    np.testing.assert_allclose(
+        displayed,
+        np.asarray([[1.0, -3.0, 2.0], [-1.0, 3.0, -2.0]]),
+    )
+    np.testing.assert_allclose(
+        unflipped,
+        np.asarray([[1.0, 3.0, 2.0], [-1.0, -3.0, -2.0]]),
+    )
+    np.testing.assert_array_equal(world, before)
+    assert surfel_display_axis_labels() == ("x", "-z (display)", "y")
 
 
 def test_slot_selection_does_not_call_both_required_for_a_near_tie():

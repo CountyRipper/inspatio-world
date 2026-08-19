@@ -180,7 +180,7 @@ button{{padding:8px 12px;margin:0 6px 10px 0}}.architecture{{overflow-x:auto}}.a
 与原始 B1 clean-context bank 的全层 K/V abs-mean 最大差 = <b>{metrics['priority_3']['original_b1_bank_abs_mean_max_diff']:.2e}</b>；payload bytes = {metrics['priority_3']['memory_bytes']:,}。</p>
 <p>Canonical overlap gap to RGB oracle = <b>{_fmt(metrics['priority_3']['canonical_overlap_gap_to_rgb'])}</b>；结论：<b>未逼近 quality oracle</b>。</p></section>
 <section><h2>RGB Surfel（真实历史观测颜色）</h2><div class='grid'>
-<figure><figcaption>RGB world splats</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
+<figure><figcaption>RGB world splats（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
 <figure><figcaption>RGB B1 target z-buffer</figcaption><img src='surfel_rgb_options/D_rgb_b1_target_zbuffer.png'></figure>
 <figure><figcaption>B1→B2 RGB support overlay</figcaption><img src='surfel_rgb_options/E_rgb_b1_target_overlay.png'></figure></div>
 <p><a href='surfel_rgb_options/report.html'>打开全部 RGB surfel 选项</a>；chunk-ID/disk 仅作 secondary audit。</p></section>

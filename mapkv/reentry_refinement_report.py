@@ -396,8 +396,8 @@ surfel-level identity correspondence 已建立。这与 E3/E4 的 duplicate appe
 是同一处需要继续定位的证据。</p></section>
 
 <section><h2>C. Geometry / Safe Support</h2><div class='images'>
-<figure><figcaption>真实历史 RGB surfel splats</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
-<figure><figcaption>真实历史 RGB oriented disks</figcaption><img src='surfel_rgb_options/B_rgb_oriented_disks.png'></figure>
+<figure><figcaption>真实历史 RGB surfel splats（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/A_rgb_world_splats.png'></figure>
+<figure><figcaption>真实历史 RGB oriented disks（显示坐标 Z 反向）</figcaption><img src='surfel_rgb_options/B_rgb_oriented_disks.png'></figure>
 <figure><figcaption>选中 observation warp 到 B2</figcaption><img src='assets/reentry_refinement/selected_observation_warped_to_b2.png'></figure>
 <figure><figcaption>Anchor chunk 11 warp 到 B2</figcaption><img src='assets/reentry_refinement/anchor_b1_warped_to_b2.png'></figure>
 <figure><figcaption>B2 historical visibility</figcaption><img src='assets/reentry_refinement/M_history_b2.png'></figure>
