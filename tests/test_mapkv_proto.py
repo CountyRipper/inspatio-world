@@ -28,6 +28,12 @@ from mapkv_proto.memory_context import (
 )
 from mapkv.kv_bank import KVChunkBank, resolve_memory_layers
 from mapkv.canonical_kv import _memory_token_gate, _warp_token_payload
+from mapkv.cut3r_adapter import (
+    _depth_to_world,
+    _intrinsics_after_cut3r_resize_crop,
+    _load_intrinsics,
+    _reuse_previous_depths,
+)
 from mapkv.retrieval import GeometryChunkRetriever
 from mapkv.reentry_memory import (
     MemoryEpisodeState,
@@ -54,6 +60,7 @@ from mapkv.warp_reencode import (
     strong_memory_coverage,
     warp_latent,
 )
+from scripts.render_point_cloud import read_da3_depth
 from mapkv_proto.reference_kv_bank import ReferenceKVBankWriter
 from mapkv_proto.retrieval import RetrievalPlan
 from mapkv.surfel_index import (
@@ -774,7 +781,7 @@ def test_uniform_layers_and_voxel_surfel_retrieval_roundtrip(tmp_path):
     pose = np.eye(4, dtype=np.float32)
     index = VoxelSurfelIndex(voxel_size=0.15)
     index.insert_frame(points, confidence, pose, 1, grid_hw=(6, 8))
-    index.insert_frame(points, confidence, pose, 3, grid_hw=(6, 8))
+    index.insert_frame(points, confidence, pose, 2, grid_hw=(6, 8))
     index.insert_frame(points, confidence, pose, 3, grid_hw=(6, 8))
     path = tmp_path / "surfel.npz"
     index.save(path)
@@ -822,6 +829,9 @@ def test_retrieval_without_pose_clusters_uses_single_chunk_clusters():
                     1: np.array([0.0, 0.0, -1.0], dtype=np.float32)
                 },
                 observation_weight=1.0,
+                calibrated_confidence=1.0,
+                consistent_observations=3,
+                stable=True,
             )
         ],
     )
@@ -864,6 +874,9 @@ def test_current_surfel_filters_recent_geometry_before_zbuffer():
                 chunk: np.array([0.0, 0.0, -1.0], dtype=np.float32)
             },
             observation_weight=1.0,
+            calibrated_confidence=1.0,
+            consistent_observations=3,
+            stable=True,
         )
 
     # Chunk 4 is nearer at the same pixel but is immediate-recent for target 5.
@@ -907,6 +920,9 @@ def test_candidate_control_filters_noncandidate_before_zbuffer():
             chunk_weights={chunk: 1.0},
             view_dirs={chunk: np.array([0.0, 0.0, -1.0], dtype=np.float32)},
             observation_weight=1.0,
+            calibrated_confidence=1.0,
+            consistent_observations=3,
+            stable=True,
         )
 
     index = VoxelSurfelIndex(0.1, [cell(2.0, 7), cell(1.0, 14)])
@@ -962,6 +978,100 @@ def test_radius_normal_fusion_crosses_voxel_boundaries():
     assert merged["cross_voxel_merges"] == 1
     assert len(index.cells) == 1
     assert index.cells[0].observing_chunks == [1, 3]
+
+
+def test_fixed_intrinsics_resize_depth_backprojection_and_previous_freeze(
+    tmp_path,
+):
+    intrinsic_path = tmp_path / "intrinsics.txt"
+    intrinsic_path.write_text(
+        "[[723.32342529, 0., 416.], [0., 781.30383301, 240.], "
+        "[0., 0., 1.]]"
+    )
+    image_path = tmp_path / "frame.png"
+    Image.new("RGB", (832, 480)).save(image_path)
+    intrinsic = _load_intrinsics(intrinsic_path)
+    resized = _intrinsics_after_cut3r_resize_crop(
+        intrinsic, image_path, (288, 512)
+    )
+    assert resized[0, 0] == pytest.approx(445.1221, rel=1e-5)
+    assert resized[1, 1] == pytest.approx(480.8024, rel=1e-5)
+    assert resized[0, 2] == pytest.approx(256.0, abs=1e-6)
+    depth = np.ones((2, 3), dtype=np.float32)
+    camera, world = _depth_to_world(depth, resized, np.eye(4))
+    np.testing.assert_allclose(camera, world)
+    np.testing.assert_allclose(camera[..., 2], 1.0)
+
+    scene = SimpleNamespace(
+        im_depthmaps=torch.nn.Parameter(torch.zeros(3, 4))
+    )
+    hook = _reuse_previous_depths(
+        scene,
+        [
+            np.ones((2, 2), dtype=np.float32),
+            np.full((2, 2), 2.0, dtype=np.float32),
+        ],
+    )
+    scene.im_depthmaps.sum().backward()
+    assert torch.count_nonzero(scene.im_depthmaps.grad[:2]) == 0
+    torch.testing.assert_close(
+        scene.im_depthmaps.grad[2], torch.ones(4)
+    )
+    torch.testing.assert_close(
+        scene.im_depthmaps.data[1].exp(), torch.full((4,), 2.0)
+    )
+    hook.remove()
+
+
+def test_renderer_reads_pi3_uint16_depth_proxy(tmp_path):
+    depth_root = tmp_path / "depth"
+    depth_root.mkdir()
+    (tmp_path / "metadata.txt").write_text("1.0 3.0\n")
+    path = depth_root / "000000.png"
+    Image.fromarray(
+        np.asarray([[0, 65535]], dtype=np.uint16)
+    ).save(path)
+    decoded = read_da3_depth(path)
+    np.testing.assert_allclose(decoded, [[1.0, 3.0]], atol=1e-5)
+
+
+def test_surfel_promotes_only_after_three_consistent_observations():
+    def observation(chunk):
+        return SurfelCell(
+            voxel_key=(0, 0, 20),
+            xyz=np.array([0.0, 0.0, 2.0], dtype=np.float32),
+            confidence=3.0,
+            normal=np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            radius=0.1,
+            rgb_preview=None,
+            first_seen_chunk=chunk,
+            last_seen_chunk=chunk,
+            observing_chunks=[chunk],
+            chunk_weights={chunk: 1.0},
+            view_dirs={chunk: np.array([0.0, 0.0, -1.0])},
+            camera_forwards={chunk: np.array([0.0, 0.0, 1.0])},
+            camera_centers={chunk: np.zeros(3)},
+            source_pixels={chunk: np.array([5.0, 5.0])},
+            calibrated_confidence=1.0,
+            observation_weight=1.0,
+        )
+
+    index = VoxelSurfelIndex(0.05, [observation(1)])
+    index.merge_observations(
+        [observation(2)],
+        position_threshold=0.1,
+        normal_cosine=0.8,
+        min_stable_observations=3,
+    )
+    assert index.cells[0].stable is False
+    index.merge_observations(
+        [observation(3)],
+        position_threshold=0.1,
+        normal_cosine=0.8,
+        min_stable_observations=3,
+    )
+    assert index.cells[0].stable is True
+    assert index.cells[0].consistent_observations == 3
 
 
 def test_surfel_merge_serialization_and_causal_visibility_vote(tmp_path):

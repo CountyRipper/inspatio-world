@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .surfel_index import SurfelIndex
+from .surfel_index import SurfelCell, SurfelIndex
 
 
 def _rotation_distance(left: np.ndarray, right: np.ndarray) -> float:
@@ -61,10 +61,26 @@ class GeometryChunkRetriever:
         min_history_gap_chunks: int = 2,
         use_view_alignment: bool = True,
         use_occlusion: bool = True,
+        stable_only: bool = True,
+        view_orientation_sigma_degrees: float = 15.0,
+        view_translation_sigma: float = 0.03,
+        surface_neighbor_radius_scale: float = 2.5,
+        surface_neighbor_normal_cosine: float = 0.8,
     ):
         self.min_history_gap_chunks = int(min_history_gap_chunks)
         self.use_view_alignment = bool(use_view_alignment)
         self.use_occlusion = bool(use_occlusion)
+        self.stable_only = bool(stable_only)
+        self.view_orientation_sigma_degrees = float(
+            view_orientation_sigma_degrees
+        )
+        self.view_translation_sigma = float(view_translation_sigma)
+        self.surface_neighbor_radius_scale = float(
+            surface_neighbor_radius_scale
+        )
+        self.surface_neighbor_normal_cosine = float(
+            surface_neighbor_normal_cosine
+        )
 
     def retrieve(
         self,
@@ -101,47 +117,95 @@ class GeometryChunkRetriever:
             source_image_size=source_image_size,
             eligible_max_chunk=eligible_max,
             eligible_chunks=candidate_set,
+            stable_only=self.stable_only,
             use_occlusion=self.use_occlusion,
         )
         scores: dict[int, float] = {}
         support: dict[int, int] = {}
+        pixel_support: dict[int, int] = {}
         confidence_sum: dict[int, float] = {}
         cell_support: dict[int, set[int]] = {}
-        cell_contributions: list[set[int]] = []
+        cell_contributions: dict[int, set[int]] = {}
         query_camera = np.asarray(query_pose)[:3, 3]
+        query_forward = np.asarray(query_pose)[:3, 2].astype(np.float64)
+        query_forward /= max(float(np.linalg.norm(query_forward)), 1e-8)
         visible_cell_ids = np.unique(visible["indices"])
-        confidence_values = np.asarray(
+        stable_ids = np.asarray(
             [
-                surfel_index.cells[int(index)].confidence
-                for index in visible_cell_ids
+                index
+                for index, candidate in enumerate(surfel_index.cells)
+                if (not self.stable_only or candidate.stable)
             ],
+            dtype=np.int32,
+        )
+        stable_positions = np.asarray(
+            [surfel_index.cells[int(index)].xyz for index in stable_ids],
             dtype=np.float32,
-        )
-        confidence_cap = (
-            float(np.quantile(confidence_values, 0.95))
-            if confidence_values.size
-            else 1.0
-        )
+        ).reshape(-1, 3)
+        try:
+            from scipy.spatial import cKDTree
+
+            stable_tree = (
+                cKDTree(stable_positions) if len(stable_positions) else None
+            )
+        except ImportError:
+            stable_tree = None
+        neighbor_counts: list[int] = []
         total_visible_weight = 0.0
-        for visible_offset, cell_index in enumerate(visible["indices"]):
+        for cell_index in visible_cell_ids:
             cell_index = int(cell_index)
             cell = surfel_index.cells[cell_index]
-            eligible_observations = sorted(
-                {
-                    int(chunk)
-                    for chunk in cell.observing_chunks
-                    if 0 <= int(chunk) <= eligible_max
-                    and (
-                        candidate_set is None
-                        or int(chunk) in candidate_set
-                    )
-                }
+            offsets = np.flatnonzero(visible["indices"] == cell_index)
+            visible_offset = int(offsets[0])
+            neighbor_radius = max(
+                self.surface_neighbor_radius_scale
+                * max(float(cell.radius), surfel_index.voxel_size),
+                2.0 * surfel_index.voxel_size,
             )
+            if stable_tree is None:
+                neighbor_ids = np.asarray([cell_index], dtype=np.int32)
+            else:
+                local = stable_tree.query_ball_point(
+                    cell.xyz, neighbor_radius
+                )
+                neighbor_ids = stable_ids[np.asarray(local, dtype=np.int32)]
+            if cell.normal is not None and len(neighbor_ids):
+                neighbor_ids = np.asarray(
+                    [
+                        index
+                        for index in neighbor_ids
+                        if surfel_index.cells[int(index)].normal is not None
+                        and float(
+                            np.dot(
+                                cell.normal,
+                                surfel_index.cells[int(index)].normal,
+                            )
+                        )
+                        >= self.surface_neighbor_normal_cosine
+                    ],
+                    dtype=np.int32,
+                )
+            if cell_index not in set(int(value) for value in neighbor_ids):
+                neighbor_ids = np.append(neighbor_ids, cell_index)
+            neighbor_counts.append(int(len(neighbor_ids)))
+            observation_cells: dict[int, list[SurfelCell]] = {}
+            for neighbor_id in neighbor_ids:
+                neighbor = surfel_index.cells[int(neighbor_id)]
+                for chunk in neighbor.observing_chunks:
+                    chunk = int(chunk)
+                    if not 0 <= chunk <= eligible_max:
+                        continue
+                    if candidate_set is not None and chunk not in candidate_set:
+                        continue
+                    observation_cells.setdefault(chunk, []).append(neighbor)
+            eligible_observations = sorted(observation_cells)
             if not eligible_observations:
                 raise AssertionError(
                     "Ineligible surfel survived pre-z-buffer causal filtering"
                 )
-            confidence = min(max(float(cell.confidence), 0.0), confidence_cap)
+            confidence = float(
+                np.clip(cell.calibrated_confidence, 0.05, 1.0)
+            )
             normal_factor = max(
                 float(visible["normal_cosine"][visible_offset]), 0.05
             )
@@ -157,16 +221,72 @@ class GeometryChunkRetriever:
             # There is intentionally no per-cell chunk-weight partitioning.
             for chunk in eligible_observations:
                 alignment = 1.0
-                if self.use_view_alignment and chunk in cell.view_dirs:
-                    alignment = max(
-                        0.0,
-                        float(
-                            np.dot(
-                                target_direction,
-                                cell.view_dirs[chunk],
-                            )
-                        ),
+                alignments = []
+                for observation_cell in observation_cells[chunk]:
+                    surface_alignment = 1.0
+                    if (
+                        self.use_view_alignment
+                        and chunk in observation_cell.view_dirs
+                    ):
+                        surface_alignment = max(
+                            0.0,
+                            float(
+                                np.dot(
+                                    target_direction,
+                                    observation_cell.view_dirs[chunk],
+                                )
+                            ),
+                        )
+                    source_forward = observation_cell.camera_forwards.get(
+                        chunk
                     )
+                    if self.use_view_alignment and source_forward is not None:
+                        source_forward = np.asarray(
+                            source_forward, dtype=np.float64
+                        )
+                        source_forward /= max(
+                            float(np.linalg.norm(source_forward)), 1e-8
+                        )
+                        angle = float(
+                            np.arccos(
+                                np.clip(
+                                    np.dot(query_forward, source_forward),
+                                    -1.0,
+                                    1.0,
+                                )
+                            )
+                        )
+                        sigma = np.deg2rad(
+                            self.view_orientation_sigma_degrees
+                        )
+                        surface_alignment *= float(
+                            np.exp(
+                                -0.5
+                                * (angle / max(sigma, 1e-8)) ** 2
+                            )
+                        )
+                    source_center = observation_cell.camera_centers.get(
+                        chunk
+                    )
+                    if self.use_view_alignment and source_center is not None:
+                        center_distance = float(
+                            np.linalg.norm(
+                                query_camera
+                                - np.asarray(source_center, dtype=np.float64)
+                            )
+                        )
+                        surface_alignment *= float(
+                            np.exp(
+                                -0.5
+                                * (
+                                    center_distance
+                                    / max(self.view_translation_sigma, 1e-8)
+                                )
+                                ** 2
+                            )
+                        )
+                    alignments.append(surface_alignment)
+                alignment = max(alignments, default=0.0)
                 contribution = base * alignment
                 if contribution <= 0:
                     continue
@@ -177,7 +297,12 @@ class GeometryChunkRetriever:
                     confidence_sum.get(chunk, 0.0) + cell.confidence
                 )
                 cell_support.setdefault(chunk, set()).add(cell_index)
-            cell_contributions.append(contributed)
+            cell_contributions[cell_index] = contributed
+        for cell_index, count in zip(
+            *np.unique(visible["indices"], return_counts=True)
+        ):
+            for chunk in cell_contributions.get(int(cell_index), set()):
+                pixel_support[chunk] = pixel_support.get(chunk, 0) + int(count)
 
         clusters: list[list[int]] = []
         assigned: set[int] = set()
@@ -194,7 +319,7 @@ class GeometryChunkRetriever:
             [chunk] for chunk in scores if chunk not in assigned
         )
         cluster_scores = [
-            sum(scores[chunk] for chunk in cluster)
+            max(scores[chunk] for chunk in cluster)
             for cluster in clusters
         ]
         ranked_cluster_indices = sorted(
@@ -210,6 +335,36 @@ class GeometryChunkRetriever:
         explained_cluster_indices = ranked_cluster_indices[
             : max(3, top_k)
         ]
+        cluster_score_sum = float(sum(cluster_scores))
+        cluster_probabilities = (
+            np.asarray(cluster_scores, dtype=np.float64)
+            / max(cluster_score_sum, 1e-12)
+        )
+        normalized_entropy = (
+            float(
+                -np.sum(
+                    cluster_probabilities
+                    * np.log(np.maximum(cluster_probabilities, 1e-12))
+                )
+                / np.log(len(cluster_probabilities))
+            )
+            if len(cluster_probabilities) > 1
+            else 0.0
+        )
+        top1_margin = (
+            float(
+                (
+                    cluster_scores[ranked_cluster_indices[0]]
+                    - cluster_scores[ranked_cluster_indices[1]]
+                )
+                / max(
+                    cluster_scores[ranked_cluster_indices[0]],
+                    1e-12,
+                )
+            )
+            if len(ranked_cluster_indices) > 1
+            else (1.0 if ranked_cluster_indices else 0.0)
+        )
 
         def representative(cluster_index: int) -> int:
             return min(
@@ -247,6 +402,9 @@ class GeometryChunkRetriever:
                     cluster_scores[cluster_index]
                 ),
                 "visible_support": int(support[chunk]),
+                "visible_pixel_support": int(
+                    pixel_support.get(chunk, 0)
+                ),
                 "visible_cell_support": int(len(cell_support[chunk])),
                 "mean_confidence": float(
                     confidence_sum[chunk] / max(support[chunk], 1)
@@ -261,11 +419,41 @@ class GeometryChunkRetriever:
         selected_chunk = selected[0] if selected else None
         if selected_chunk is not None:
             for pixel, contributions in zip(
-                visible["pixels"], cell_contributions
+                visible["pixels"],
+                (
+                    cell_contributions.get(int(cell_index), set())
+                    for cell_index in visible["indices"]
+                ),
             ):
                 if selected_chunk in contributions:
                     coverage[int(pixel[0]), int(pixel[1])] = 1.0
         positive = sorted({int(chunk) for chunk in positive_chunks})
+        positive_cluster_indices = [
+            index
+            for index, cluster in enumerate(clusters)
+            if any(chunk in positive for chunk in cluster)
+        ]
+        negative_cluster_indices = [
+            index
+            for index in range(len(clusters))
+            if index not in positive_cluster_indices
+        ]
+        best_positive_score = max(
+            (cluster_scores[index] for index in positive_cluster_indices),
+            default=0.0,
+        )
+        best_negative_score = max(
+            (cluster_scores[index] for index in negative_cluster_indices),
+            default=0.0,
+        )
+        positive_vs_negative_margin = float(
+            (best_positive_score - best_negative_score)
+            / max(best_positive_score, 1e-12)
+        )
+        positive_score_mass = float(
+            sum(cluster_scores[index] for index in positive_cluster_indices)
+            / max(sum(cluster_scores), 1e-12)
+        )
         result = {
             "target_chunk": int(current_chunk),
             "query_pose_mode": query_pose_mode,
@@ -280,6 +468,20 @@ class GeometryChunkRetriever:
                 else sorted(candidate_set)
             ),
             "voting_mode": "simple_observing_chunk_vote",
+            "voting_unit": "unique_stable_surfel",
+            "cluster_aggregation": "max",
+            "stable_only": self.stable_only,
+            "surface_neighbor_radius_scale": (
+                self.surface_neighbor_radius_scale
+            ),
+            "surface_neighbor_normal_cosine": (
+                self.surface_neighbor_normal_cosine
+            ),
+            "mean_surface_neighbors": (
+                float(np.mean(neighbor_counts)) if neighbor_counts else 0.0
+            ),
+            "top1_margin": top1_margin,
+            "normalized_entropy": normalized_entropy,
             "eligibility_before_zbuffer": True,
             "eligible_max_chunk": eligible_max,
             "num_eligible_surfels": int(visible["num_eligible_cells"]),
@@ -337,6 +539,8 @@ class GeometryChunkRetriever:
                 for chunk in sorted(scores)
             },
             "positive_cluster": positive,
+            "positive_vs_negative_margin": positive_vs_negative_margin,
+            "positive_score_mass": positive_score_mass,
             "positive_cluster_hit": bool(
                 selected and selected[0] in positive
             ),
@@ -356,13 +560,17 @@ class GeometryChunkRetriever:
             "coverage_mask_path": None,
             "coverage_fraction": float(coverage.mean()),
             "total_visible_weight": float(total_visible_weight),
-            "confidence_cap_p95": confidence_cap,
+            "confidence_calibration": "per_frame_quantile_at_insert",
             "retrieval_ms": (
                 time.perf_counter() - started
             )
             * 1000.0,
             "min_history_gap_chunks": self.min_history_gap_chunks,
             "use_view_alignment": self.use_view_alignment,
+            "view_orientation_sigma_degrees": (
+                self.view_orientation_sigma_degrees
+            ),
+            "view_translation_sigma": self.view_translation_sigma,
             "use_occlusion": self.use_occlusion,
         }
         return result, {"visible": visible, "coverage": coverage}
@@ -450,8 +658,11 @@ def build_retrieval(
     min_history_gap_chunks: int = 2,
     use_view_alignment: bool = True,
     use_occlusion: bool = True,
+    stable_only: bool = True,
     positive_chunks: list[int] | tuple[int, ...] = (),
     candidate_chunks: list[int] | tuple[int, ...] | None = None,
+    pose_cluster_rotation_tolerance_degrees: float = 0.25,
+    pose_cluster_translation_tolerance: float = 1e-4,
 ) -> tuple[list[dict], list[dict]]:
     sequence_path = Path(sequence_path).resolve()
     sequence = json.loads(sequence_path.read_text(encoding="utf-8"))
@@ -484,8 +695,15 @@ def build_retrieval(
         min_history_gap_chunks=min_history_gap_chunks,
         use_view_alignment=use_view_alignment,
         use_occlusion=use_occlusion,
+        stable_only=stable_only,
     )
-    chunk_clusters = contiguous_pose_clusters(sequence)
+    chunk_clusters = contiguous_pose_clusters(
+        sequence,
+        rotation_tolerance_degrees=(
+            pose_cluster_rotation_tolerance_degrees
+        ),
+        translation_tolerance=pose_cluster_translation_tolerance,
+    )
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     surfel_entries = []
@@ -555,8 +773,12 @@ def build_retrieval(
         ),
         "pose_cluster_rule": {
             "contiguous_only": True,
-            "rotation_tolerance_degrees": 0.25,
-            "translation_tolerance": 0.0001,
+            "rotation_tolerance_degrees": (
+                pose_cluster_rotation_tolerance_degrees
+            ),
+            "translation_tolerance": (
+                pose_cluster_translation_tolerance
+            ),
         },
     }
     (output_dir / "retrieval.json").write_text(
@@ -635,6 +857,17 @@ def main() -> None:
     )
     parser.add_argument("--no_view_alignment", action="store_true")
     parser.add_argument("--no_occlusion", action="store_true")
+    parser.add_argument("--include_tentative", action="store_true")
+    parser.add_argument(
+        "--pose_cluster_rotation_tolerance_degrees",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--pose_cluster_translation_tolerance",
+        type=float,
+        default=1e-4,
+    )
     args = parser.parse_args()
     targets = args.target_chunks
     if targets is None:
@@ -652,8 +885,15 @@ def main() -> None:
         min_history_gap_chunks=args.min_history_gap_chunks,
         use_view_alignment=not args.no_view_alignment,
         use_occlusion=not args.no_occlusion,
+        stable_only=not args.include_tentative,
         positive_chunks=args.positive_chunks,
         candidate_chunks=args.candidate_chunks,
+        pose_cluster_rotation_tolerance_degrees=(
+            args.pose_cluster_rotation_tolerance_degrees
+        ),
+        pose_cluster_translation_tolerance=(
+            args.pose_cluster_translation_tolerance
+        ),
     )
 
 

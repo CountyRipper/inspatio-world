@@ -271,6 +271,7 @@ def render_target_rgb(
     eligible_chunks: set[int] | None = None,
     eligible_max_chunk: int | None = None,
     eligible_indices: np.ndarray | None = None,
+    stable_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     visible = index.visible_cells(
         query_pose,
@@ -280,6 +281,7 @@ def render_target_rgb(
         eligible_max_chunk=eligible_max_chunk,
         eligible_chunks=eligible_chunks,
         eligible_indices=eligible_indices,
+        stable_only=stable_only,
         use_occlusion=True,
         front_facing=False,
         maximum_radius_pixels=12.0,
@@ -299,6 +301,7 @@ def render_target_rgb(
         "visible_cells": int(visible["num_visible_cells"]),
         "rgb_pixels": int(mask.sum()),
         "rgb_coverage": float(mask.mean()),
+        "stable_only": bool(stable_only),
     }
     return rendered, mask, stats
 
@@ -373,6 +376,7 @@ def generate_options(
     output_dir: str | Path,
     generated_only_source: bool = False,
     display_z_flipped: bool = DEFAULT_DISPLAY_Z_FLIPPED,
+    stable_only_world: bool = False,
 ) -> dict:
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +385,8 @@ def generate_options(
     colors, valid, color_chunks, color_stats = sample_historical_rgb(
         index, sequence_path
     )
+    if stable_only_world:
+        valid &= np.asarray([cell.stable for cell in index.cells], dtype=bool)
     render_rgb_world_splats(
         index,
         colors,
@@ -414,6 +420,7 @@ def generate_options(
         intrinsics,
         image_hw,
         eligible_max_chunk=int(sequence["prefix_last_chunk"]),
+        stable_only=stable_only_world,
     )
     Image.fromarray(all_rgb).save(output_dir / "C_rgb_target_zbuffer.png")
     generated_only_indices = (
@@ -435,6 +442,7 @@ def generate_options(
         eligible_chunks={int(source_chunk)},
         eligible_max_chunk=int(target_chunk) - 2,
         eligible_indices=generated_only_indices,
+        stable_only=stable_only_world,
     )
     target_rgb = _prepare_cut3r_rgb(
         mapping_path.parent / target["png_path"], image_hw
@@ -463,6 +471,7 @@ def generate_options(
         "target_camera_all_history": all_stats,
         "target_camera_b1_only": b1_stats,
         "b1_visualization_generated_only": bool(generated_only_source),
+        "world_visualization_stable_only": bool(stable_only_world),
         "display_coordinate_system": {
             "plot_axes": [
                 "x",
@@ -519,6 +528,7 @@ def main() -> None:
     parser.add_argument("--source_chunk", type=int, required=True)
     parser.add_argument("--generated_only_source", action="store_true")
     parser.add_argument("--no_display_z_flip", action="store_true")
+    parser.add_argument("--stable_only_world", action="store_true")
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
     print(
@@ -532,6 +542,7 @@ def main() -> None:
                 output_dir=args.output_dir,
                 generated_only_source=args.generated_only_source,
                 display_z_flipped=not args.no_display_z_flip,
+                stable_only_world=args.stable_only_world,
             ),
             indent=2,
         )

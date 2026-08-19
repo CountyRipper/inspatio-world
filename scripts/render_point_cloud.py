@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -489,9 +490,17 @@ class DepthWarper:
 
 
 def read_da3_depth(path):
-    """Read DA3 RGBA PNG where each pixel stores one float32 depth value."""
+    """Read DA3 RGBA float depth or Pi3 uint16+metadata proxy depth."""
     img = Image.open(path)
     depth_uint8 = np.array(img)
+    if depth_uint8.ndim == 2 and depth_uint8.dtype == np.uint16:
+        metadata = Path(path).resolve().parents[1] / "metadata.txt"
+        depth_min, depth_max = [
+            float(value) for value in metadata.read_text().split()
+        ]
+        return (
+            depth_uint8.astype(np.float32) / 65535.0
+        ) * (depth_max - depth_min) + depth_min
     h, w = depth_uint8.shape[:2]
     return np.frombuffer(depth_uint8.tobytes(), dtype=np.float32).reshape(h, w).copy()
 

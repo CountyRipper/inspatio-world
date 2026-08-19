@@ -11,7 +11,7 @@ import numpy as np
 from PIL import Image
 
 
-INDEX_VERSION = 4
+INDEX_VERSION = 5
 DEFAULT_DISPLAY_Z_FLIPPED = True
 
 
@@ -60,10 +60,17 @@ class SurfelCell:
     observing_chunks: list[int] = field(default_factory=list)
     chunk_weights: dict[int, float] = field(default_factory=dict)
     view_dirs: dict[int, np.ndarray] = field(default_factory=dict)
+    camera_forwards: dict[int, np.ndarray] = field(default_factory=dict)
+    camera_centers: dict[int, np.ndarray] = field(default_factory=dict)
     reference_blind_at_write: dict[int, float] = field(default_factory=dict)
     source_pixels: dict[int, np.ndarray] = field(default_factory=dict)
     image_center_margins: dict[int, float] = field(default_factory=dict)
     observation_weight: float = 0.0
+    calibrated_confidence: float = 0.0
+    consistent_observations: int = 1
+    reprojection_residual_sum: float = 0.0
+    reprojection_residual_max: float = 0.0
+    stable: bool = False
 
 
 def _normal_grid(points: np.ndarray) -> np.ndarray:
@@ -111,6 +118,27 @@ def _scale_intrinsics(
     return result
 
 
+def _project_world_to_pixel(
+    xyz: np.ndarray,
+    camera_pose: np.ndarray,
+    intrinsics: np.ndarray,
+) -> np.ndarray | None:
+    homogeneous = np.append(np.asarray(xyz, dtype=np.float64), 1.0)
+    camera = np.linalg.inv(
+        np.asarray(camera_pose, dtype=np.float64)
+    ) @ homogeneous
+    if not np.isfinite(camera).all() or camera[2] <= 1e-8:
+        return None
+    intrinsic = np.asarray(intrinsics, dtype=np.float64)
+    return np.asarray(
+        [
+            intrinsic[1, 1] * camera[1] / camera[2] + intrinsic[1, 2],
+            intrinsic[0, 0] * camera[0] / camera[2] + intrinsic[0, 2],
+        ],
+        dtype=np.float64,
+    )
+
+
 class SurfelIndex:
     """Radius/normal surfel fusion with a voxel hash used only for acceleration."""
 
@@ -145,6 +173,10 @@ class SurfelIndex:
         *,
         position_threshold: float | None = None,
         normal_cosine: float = 0.6,
+        camera_pose: np.ndarray | None = None,
+        intrinsics: np.ndarray | None = None,
+        max_reprojection_error_pixels: float = 12.0,
+        min_stable_observations: int = 3,
     ) -> dict:
         """Merge a new view into existing surfaces, never within the same view.
 
@@ -194,6 +226,7 @@ class SurfelIndex:
         added: list[SurfelCell] = []
         merged = 0
         cross_voxel_merges = 0
+        accepted_reprojection_residuals: list[float] = []
         for observation in observations:
             search_radius = max(
                 position_threshold,
@@ -212,6 +245,7 @@ class SurfelIndex:
 
             match_index = None
             best_distance = np.inf
+            best_reprojection_residual = np.inf
             for index in candidates:
                 if index >= existing_count:
                     continue
@@ -225,12 +259,41 @@ class SurfelIndex:
                     0.5 * (float(existing.radius) + float(observation.radius)),
                 )
                 distance = float(np.linalg.norm(existing.xyz - observation.xyz))
-                if distance <= allowed and distance < best_distance:
+                reprojection_residual = 0.0
+                if camera_pose is not None and intrinsics is not None:
+                    chunk = int(observation.observing_chunks[0])
+                    observed_pixel = observation.source_pixels.get(chunk)
+                    projected_pixel = _project_world_to_pixel(
+                        existing.xyz, camera_pose, intrinsics
+                    )
+                    if observed_pixel is None or projected_pixel is None:
+                        continue
+                    reprojection_residual = float(
+                        np.linalg.norm(projected_pixel - observed_pixel)
+                    )
+                    if (
+                        reprojection_residual
+                        > float(max_reprojection_error_pixels)
+                    ):
+                        continue
+                if distance <= allowed and (
+                    distance < best_distance
+                    or (
+                        np.isclose(distance, best_distance)
+                        and reprojection_residual
+                        < best_reprojection_residual
+                    )
+                ):
                     match_index = int(index)
                     best_distance = distance
+                    best_reprojection_residual = reprojection_residual
 
             if match_index is None:
                 observation.voxel_key = self._key(observation.xyz)
+                observation.stable = (
+                    observation.consistent_observations
+                    >= int(min_stable_observations)
+                )
                 added.append(observation)
                 continue
 
@@ -243,10 +306,26 @@ class SurfelIndex:
                 match.last_seen_chunk, observation.last_seen_chunk
             )
             match.observation_weight += observation.observation_weight
+            match.calibrated_confidence = max(
+                match.calibrated_confidence,
+                observation.calibrated_confidence,
+            )
             for chunk in observation.observing_chunks:
                 chunk = int(chunk)
-                if chunk not in match.observing_chunks:
+                is_new_observation = chunk not in match.observing_chunks
+                if is_new_observation:
                     match.observing_chunks.append(chunk)
+                    match.consistent_observations += 1
+                    match.reprojection_residual_sum += float(
+                        best_reprojection_residual
+                    )
+                    match.reprojection_residual_max = max(
+                        match.reprojection_residual_max,
+                        float(best_reprojection_residual),
+                    )
+                    accepted_reprojection_residuals.append(
+                        float(best_reprojection_residual)
+                    )
                 match.chunk_weights[chunk] = (
                     match.chunk_weights.get(chunk, 0.0)
                     + observation.chunk_weights.get(chunk, 0.0)
@@ -262,6 +341,12 @@ class SurfelIndex:
                         match.view_dirs[chunk] = (
                             value / norm if norm > 1e-8 else previous
                         )
+                incoming_forward = observation.camera_forwards.get(chunk)
+                if incoming_forward is not None:
+                    match.camera_forwards[chunk] = incoming_forward.copy()
+                incoming_center = observation.camera_centers.get(chunk)
+                if incoming_center is not None:
+                    match.camera_centers[chunk] = incoming_center.copy()
                 incoming_blind = observation.reference_blind_at_write.get(
                     chunk
                 )
@@ -281,6 +366,10 @@ class SurfelIndex:
                     if incoming_pixel is not None:
                         match.source_pixels[chunk] = incoming_pixel.copy()
             match.observing_chunks.sort()
+            match.stable = (
+                match.consistent_observations
+                >= int(min_stable_observations)
+            )
             merged += 1
 
         self.cells.extend(added)
@@ -290,6 +379,18 @@ class SurfelIndex:
             "merged": merged,
             "cross_voxel_merges": cross_voxel_merges,
             "position_threshold": position_threshold,
+            "mean_reprojection_residual_pixels": (
+                float(np.mean(accepted_reprojection_residuals))
+                if accepted_reprojection_residuals
+                else 0.0
+            ),
+            "max_reprojection_residual_pixels": (
+                float(np.max(accepted_reprojection_residuals))
+                if accepted_reprojection_residuals
+                else 0.0
+            ),
+            "stable_cells": int(sum(cell.stable for cell in self.cells)),
+            "min_stable_observations": int(min_stable_observations),
         }
 
     def insert_frame(
@@ -307,6 +408,9 @@ class SurfelIndex:
         radius_scale: float = 0.5,
         normal_cosine: float = 0.6,
         position_threshold: float | None = None,
+        confidence_keep_quantile: float = 0.35,
+        max_reprojection_error_pixels: float = 12.0,
+        min_stable_observations: int = 3,
     ) -> dict:
         source_hw = tuple(int(x) for x in np.asarray(confidence).shape)
         points = _sample_grid(np.asarray(pts3d, dtype=np.float32), grid_hw)
@@ -342,14 +446,28 @@ class SurfelIndex:
         depth = camera_points[..., 2]
         finite_depth = depth[np.isfinite(depth) & (depth > 0)]
         far = float(np.quantile(finite_depth, 0.995)) if finite_depth.size else 0.0
-        valid = (
+        base_valid = (
             np.isfinite(points).all(-1)
             & np.isfinite(conf)
-            & (conf >= confidence_threshold)
             & (depth > 0)
             & (depth <= far)
             & (np.linalg.norm(normals, axis=-1) > 1e-6)
         )
+        finite_confidence = conf[base_valid]
+        quantile_threshold = (
+            float(
+                np.quantile(
+                    finite_confidence,
+                    float(confidence_keep_quantile),
+                )
+            )
+            if finite_confidence.size
+            else float(confidence_threshold)
+        )
+        effective_confidence_threshold = max(
+            float(confidence_threshold), quantile_threshold
+        )
+        valid = base_valid & (conf >= effective_confidence_threshold)
         if not np.any(valid):
             return {
                 "chunk_id": int(chunk_id),
@@ -357,6 +475,9 @@ class SurfelIndex:
                 "added": 0,
                 "merged": 0,
                 "cross_voxel_merges": 0,
+                "effective_confidence_threshold": (
+                    effective_confidence_threshold
+                ),
             }
 
         points_flat = points[valid]
@@ -394,9 +515,11 @@ class SurfelIndex:
             / (0.2 + 0.8 * incidence)
         )
         upper = float(np.quantile(conf_flat, 0.95))
-        denom = max(upper - confidence_threshold, 1e-6)
+        denom = max(upper - effective_confidence_threshold, 1e-6)
         weights = np.clip(
-            (conf_flat - confidence_threshold) / denom, 0.05, 1.0
+            (conf_flat - effective_confidence_threshold) / denom,
+            0.05,
+            1.0,
         )
 
         observations = []
@@ -440,6 +563,10 @@ class SurfelIndex:
                     observing_chunks=[int(chunk_id)],
                     chunk_weights={int(chunk_id): float(weight)},
                     view_dirs={int(chunk_id): view_dir.copy()},
+                    camera_forwards={
+                        int(chunk_id): pose[:3, 2].copy()
+                    },
+                    camera_centers={int(chunk_id): camera.copy()},
                     reference_blind_at_write=(
                         {}
                         if reference_valid_flat is None
@@ -456,12 +583,21 @@ class SurfelIndex:
                         int(chunk_id): center_margin
                     },
                     observation_weight=float(weight),
+                    calibrated_confidence=float(weight),
+                    consistent_observations=1,
+                    stable=(int(min_stable_observations) <= 1),
                 )
             )
         merged = self.merge_observations(
             observations,
             position_threshold=position_threshold,
             normal_cosine=normal_cosine,
+            camera_pose=pose,
+            intrinsics=(
+                None if intrinsics is None else np.asarray(intrinsics)
+            ),
+            max_reprojection_error_pixels=max_reprojection_error_pixels,
+            min_stable_observations=min_stable_observations,
         )
         return {
             "chunk_id": int(chunk_id),
@@ -471,6 +607,10 @@ class SurfelIndex:
                 if observations
                 else 0.0
             ),
+            "effective_confidence_threshold": (
+                effective_confidence_threshold
+            ),
+            "confidence_keep_quantile": float(confidence_keep_quantile),
             **merged,
         }
 
@@ -479,6 +619,7 @@ class SurfelIndex:
         eligible_max_chunk: int | None,
         eligible_chunks: set[int] | None = None,
         eligible_indices: np.ndarray | None = None,
+        stable_only: bool = False,
     ) -> np.ndarray:
         allowed = (
             None
@@ -489,6 +630,7 @@ class SurfelIndex:
             eligible_max_chunk is None
             and eligible_chunks is None
             and allowed is None
+            and not stable_only
         ):
             return np.arange(len(self.cells), dtype=np.int32)
         return np.asarray(
@@ -496,6 +638,7 @@ class SurfelIndex:
                 index
                 for index, cell in enumerate(self.cells)
                 if (allowed is None or index in allowed)
+                and (not stable_only or cell.stable)
                 and any(
                     (eligible_max_chunk is None or 0 <= int(chunk) <= int(eligible_max_chunk))
                     and (eligible_chunks is None or int(chunk) in eligible_chunks)
@@ -534,13 +677,17 @@ class SurfelIndex:
         eligible_max_chunk: int | None = None,
         eligible_chunks: set[int] | None = None,
         eligible_indices: np.ndarray | None = None,
+        stable_only: bool = False,
         use_occlusion: bool = True,
         front_facing: bool = False,
         maximum_radius_pixels: float = 12.0,
     ) -> dict[str, np.ndarray | int]:
         """Project only causally eligible surfaces, then apply the z-buffer."""
         candidates = self.eligible_cell_indices(
-            eligible_max_chunk, eligible_chunks, eligible_indices
+            eligible_max_chunk,
+            eligible_chunks,
+            eligible_indices,
+            stable_only,
         )
         empty = {
             "indices": np.empty(0, dtype=np.int32),
@@ -684,6 +831,16 @@ class SurfelIndex:
             len(set(cell.observing_chunks)) for cell in self.cells
         ]
         radii = np.asarray([cell.radius for cell in self.cells], dtype=np.float32)
+        stable = np.asarray([cell.stable for cell in self.cells], dtype=bool)
+        residual_means = np.asarray(
+            [
+                cell.reprojection_residual_sum
+                / max(cell.consistent_observations - 1, 1)
+                for cell in self.cells
+                if cell.consistent_observations > 1
+            ],
+            dtype=np.float32,
+        )
         return {
             "num_cells": len(self.cells),
             "voxel_size": self.voxel_size,
@@ -693,6 +850,21 @@ class SurfelIndex:
             "multi_view_cell_fraction": (
                 float(np.mean(np.asarray(observation_counts) > 1))
                 if observation_counts
+                else 0.0
+            ),
+            "stable_cells": int(stable.sum()),
+            "stable_cell_fraction": (
+                float(stable.mean()) if stable.size else 0.0
+            ),
+            "tentative_cells": int((~stable).sum()),
+            "mean_reprojection_residual_pixels": (
+                float(residual_means.mean())
+                if residual_means.size
+                else 0.0
+            ),
+            "reprojection_residual_p95_pixels": (
+                float(np.quantile(residual_means, 0.95))
+                if residual_means.size
                 else 0.0
             ),
             "mean_radius": float(radii.mean()) if radii.size else 0.0,
@@ -715,6 +887,8 @@ class SurfelIndex:
         chunk_ids: list[int] = []
         chunk_weights: list[float] = []
         view_dirs: list[np.ndarray] = []
+        camera_forwards: list[np.ndarray] = []
+        camera_centers: list[np.ndarray] = []
         reference_blind_at_write: list[float] = []
         source_pixels: list[np.ndarray] = []
         image_center_margins: list[float] = []
@@ -724,6 +898,12 @@ class SurfelIndex:
                 chunk_ids.append(chunk_id)
                 chunk_weights.append(cell.chunk_weights.get(chunk_id, 0.0))
                 view_dirs.append(cell.view_dirs.get(chunk_id, np.zeros(3)))
+                camera_forwards.append(
+                    cell.camera_forwards.get(chunk_id, np.zeros(3))
+                )
+                camera_centers.append(
+                    cell.camera_centers.get(chunk_id, np.zeros(3))
+                )
                 reference_blind_at_write.append(
                     float(cell.reference_blind_at_write.get(chunk_id, np.nan))
                 )
@@ -771,9 +951,35 @@ class SurfelIndex:
                 [cell.observation_weight for cell in self.cells],
                 dtype=np.float32,
             ),
+            calibrated_confidence=np.asarray(
+                [cell.calibrated_confidence for cell in self.cells],
+                dtype=np.float32,
+            ),
+            consistent_observations=np.asarray(
+                [cell.consistent_observations for cell in self.cells],
+                dtype=np.int32,
+            ),
+            reprojection_residual_sum=np.asarray(
+                [cell.reprojection_residual_sum for cell in self.cells],
+                dtype=np.float32,
+            ),
+            reprojection_residual_max=np.asarray(
+                [cell.reprojection_residual_max for cell in self.cells],
+                dtype=np.float32,
+            ),
+            stable=np.asarray(
+                [cell.stable for cell in self.cells],
+                dtype=np.bool_,
+            ),
             chunk_ids=np.asarray(chunk_ids, dtype=np.int32),
             chunk_weights=np.asarray(chunk_weights, dtype=np.float32),
             view_dirs=np.asarray(view_dirs, dtype=np.float32).reshape(-1, 3),
+            camera_forwards=np.asarray(
+                camera_forwards, dtype=np.float32
+            ).reshape(-1, 3),
+            camera_centers=np.asarray(
+                camera_centers, dtype=np.float32
+            ).reshape(-1, 3),
             reference_blind_at_write=np.asarray(
                 reference_blind_at_write, dtype=np.float32
             ),
@@ -829,7 +1035,7 @@ class SurfelIndex:
         with np.load(path) as archive:
             payload = {name: archive[name] for name in archive.files}
         version = int(payload["version"][0])
-        if version not in (1, 2, 3, INDEX_VERSION):
+        if version not in (1, 2, 3, 4, INDEX_VERSION):
             raise ValueError(f"Unsupported surfel index version: {version}")
         offsets = payload["offsets"]
         voxel_size = float(payload["voxel_size"][0])
@@ -839,6 +1045,16 @@ class SurfelIndex:
             chunks = payload["chunk_ids"][start:stop]
             weights = payload["chunk_weights"][start:stop]
             directions = payload["view_dirs"][start:stop]
+            forwards = (
+                payload["camera_forwards"][start:stop]
+                if "camera_forwards" in payload
+                else np.zeros((len(chunks), 3), dtype=np.float32)
+            )
+            centers = (
+                payload["camera_centers"][start:stop]
+                if "camera_centers" in payload
+                else np.zeros((len(chunks), 3), dtype=np.float32)
+            )
             blind_values = (
                 payload["reference_blind_at_write"][start:stop]
                 if version >= 3
@@ -858,6 +1074,11 @@ class SurfelIndex:
                 int(chunk): float(weight)
                 for chunk, weight in zip(chunks, weights)
             }
+            consistent_observations = (
+                int(payload["consistent_observations"][index])
+                if version >= 5
+                else len(chunk_weights)
+            )
             cells.append(
                 SurfelCell(
                     voxel_key=tuple(
@@ -880,6 +1101,15 @@ class SurfelIndex:
                         int(chunk): direction.copy()
                         for chunk, direction in zip(chunks, directions)
                     },
+                    camera_forwards={
+                        int(chunk): forward.copy()
+                        for chunk, forward in zip(chunks, forwards)
+                        if np.linalg.norm(forward) > 1e-8
+                    },
+                    camera_centers={
+                        int(chunk): center.copy()
+                        for chunk, center in zip(chunks, centers)
+                    },
                     reference_blind_at_write={
                         int(chunk): float(value)
                         for chunk, value in zip(chunks, blind_values)
@@ -897,6 +1127,33 @@ class SurfelIndex:
                     },
                     observation_weight=float(
                         payload["observation_weight"][index]
+                    ),
+                    calibrated_confidence=(
+                        float(payload["calibrated_confidence"][index])
+                        if version >= 5
+                        else min(
+                            max(
+                                float(payload["confidence"][index]),
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                    ),
+                    consistent_observations=consistent_observations,
+                    reprojection_residual_sum=(
+                        float(payload["reprojection_residual_sum"][index])
+                        if version >= 5
+                        else 0.0
+                    ),
+                    reprojection_residual_max=(
+                        float(payload["reprojection_residual_max"][index])
+                        if version >= 5
+                        else 0.0
+                    ),
+                    stable=(
+                        bool(payload["stable"][index])
+                        if version >= 5
+                        else consistent_observations >= 3
                     ),
                 )
             )
@@ -1091,6 +1348,7 @@ def _relative_voxel_size(
     sequence_path: Path,
     grid_hw: tuple[int, int],
     confidence_threshold: float,
+    confidence_keep_quantile: float,
     fraction: float,
 ) -> tuple[float, float]:
     sequence = json.loads(sequence_path.read_text(encoding="utf-8"))
@@ -1099,10 +1357,21 @@ def _relative_voxel_size(
         payload = np.load(sequence_path.parent / item["data_path"])
         points = _sample_grid(payload["pts3d"], grid_hw)
         confidence = _sample_grid(payload["confidence"], grid_hw)
+        finite = confidence[
+            np.isfinite(points).all(-1) & np.isfinite(confidence)
+        ]
+        effective_threshold = max(
+            float(confidence_threshold),
+            (
+                float(np.quantile(finite, confidence_keep_quantile))
+                if finite.size
+                else float(confidence_threshold)
+            ),
+        )
         valid = (
             np.isfinite(points).all(-1)
             & np.isfinite(confidence)
-            & (confidence >= confidence_threshold)
+            & (confidence >= effective_threshold)
         )
         if np.any(valid):
             samples.append(points[valid])
@@ -1126,6 +1395,9 @@ def build_from_sequence(
     grid_hw: tuple[int, int] = (30, 52),
     radius_scale: float = 0.5,
     merge_normal_cosine: float = 0.6,
+    confidence_keep_quantile: float = 0.35,
+    max_reprojection_error_pixels: float = 12.0,
+    min_stable_observations: int = 3,
     reference_mask_root: str | Path | None = None,
 ) -> SurfelIndex:
     started = time.perf_counter()
@@ -1140,6 +1412,7 @@ def build_from_sequence(
             sequence_path,
             grid_hw,
             confidence_threshold,
+            confidence_keep_quantile,
             relative_scene_fraction,
         )
     elif voxel_size_mode == "explicit" and voxel_size is not None:
@@ -1186,6 +1459,9 @@ def build_from_sequence(
             grid_hw=grid_hw,
             radius_scale=radius_scale,
             normal_cosine=merge_normal_cosine,
+            confidence_keep_quantile=confidence_keep_quantile,
+            max_reprojection_error_pixels=max_reprojection_error_pixels,
+            min_stable_observations=min_stable_observations,
         )
         insertions.append(insertion)
         if reference_validity is not None:
@@ -1206,6 +1482,9 @@ def build_from_sequence(
         "grid_hw": list(grid_hw),
         "radius_scale": radius_scale,
         "merge_normal_cosine": merge_normal_cosine,
+        "confidence_keep_quantile": confidence_keep_quantile,
+        "max_reprojection_error_pixels": max_reprojection_error_pixels,
+        "min_stable_observations": min_stable_observations,
         "raw_points": raw_points,
         "accepted_grid_points": int(
             sum(item["accepted"] for item in insertions)
@@ -1293,6 +1572,15 @@ def main() -> None:
     parser.add_argument("--radius_scale", type=float, default=0.5)
     parser.add_argument("--merge_normal_cosine", type=float, default=0.6)
     parser.add_argument(
+        "--confidence_keep_quantile", type=float, default=0.35
+    )
+    parser.add_argument(
+        "--max_reprojection_error_pixels", type=float, default=12.0
+    )
+    parser.add_argument(
+        "--min_stable_observations", type=int, default=3
+    )
+    parser.add_argument(
         "--reference_mask_root",
         help=(
             "Optional baseline masks directory. When set, every observation "
@@ -1310,6 +1598,11 @@ def main() -> None:
         grid_hw=(args.grid_height, args.grid_width),
         radius_scale=args.radius_scale,
         merge_normal_cosine=args.merge_normal_cosine,
+        confidence_keep_quantile=args.confidence_keep_quantile,
+        max_reprojection_error_pixels=(
+            args.max_reprojection_error_pixels
+        ),
+        min_stable_observations=args.min_stable_observations,
         reference_mask_root=args.reference_mask_root,
     )
 

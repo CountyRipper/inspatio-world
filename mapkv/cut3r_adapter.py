@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from mapkv_proto.pose_utils import pose_distance, to_cut3r_c2w
 
@@ -96,6 +97,249 @@ def _intrinsics_from_pointmap(points_self: torch.Tensor) -> torch.Tensor:
     intrinsics[:, 0, 2] = principal[:, 0]
     intrinsics[:, 1, 2] = principal[:, 1]
     return intrinsics
+
+
+def _load_intrinsics(path: str | Path) -> np.ndarray:
+    path = Path(path).resolve()
+    try:
+        value = np.asarray(json.loads(path.read_text()), dtype=np.float64)
+    except (json.JSONDecodeError, ValueError):
+        cleaned = (
+            path.read_text()
+            .replace("[", " ")
+            .replace("]", " ")
+            .replace(",", " ")
+        )
+        value = np.fromstring(cleaned, sep=" ", dtype=np.float64)
+        if value.size == 9:
+            value = value.reshape(3, 3)
+    if value.shape != (3, 3):
+        raise ValueError(f"Expected 3x3 intrinsics at {path}, got {value.shape}")
+    return value
+
+
+def _intrinsics_after_cut3r_resize_crop(
+    intrinsic: np.ndarray,
+    image_path: str | Path,
+    target_hw: tuple[int, int],
+) -> np.ndarray:
+    """Apply CUT3R's long-edge resize and centered crop to known K."""
+    with Image.open(image_path) as image:
+        source_w, source_h = image.size
+    target_h, target_w = (int(target_hw[0]), int(target_hw[1]))
+    scale = max(target_w / source_w, target_h / source_h)
+    resized_w = int(round(source_w * scale))
+    resized_h = int(round(source_h * scale))
+    crop_left = 0.5 * (resized_w - target_w)
+    crop_top = 0.5 * (resized_h - target_h)
+    result = np.asarray(intrinsic, dtype=np.float64).copy()
+    result[0] *= scale
+    result[1] *= scale
+    result[0, 2] -= crop_left
+    result[1, 2] -= crop_top
+    return result
+
+
+def _pairwise_star_output(outputs: dict, prefix_length: int) -> dict:
+    """Build the view-0 star graph expected by CUT3R's global aligner."""
+    from dust3r.utils.device import collate_with_cat
+
+    if prefix_length < 2:
+        raise ValueError("Global alignment needs at least two views")
+    pairwise = {"view1": [], "view2": [], "pred1": [], "pred2": []}
+    for view_id in range(1, int(prefix_length)):
+        pairwise["view1"].append(outputs["views"][0])
+        pairwise["view2"].append(outputs["views"][view_id])
+        pairwise["pred1"].append(outputs["pred"][0])
+        pairwise["pred2"].append(outputs["pred"][view_id])
+    return {
+        key: collate_with_cat(values)
+        for key, values in pairwise.items()
+    }
+
+
+def _depth_to_world(
+    depth: np.ndarray,
+    intrinsic: np.ndarray,
+    c2w: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Back-project aligned depth with exact known K and pose."""
+    depth = np.asarray(depth, dtype=np.float32)
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    height, width = depth.shape
+    yy, xx = np.meshgrid(
+        np.arange(height, dtype=np.float64),
+        np.arange(width, dtype=np.float64),
+        indexing="ij",
+    )
+    camera = np.stack(
+        [
+            (xx - intrinsic[0, 2]) * depth / intrinsic[0, 0],
+            (yy - intrinsic[1, 2]) * depth / intrinsic[1, 1],
+            depth,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    homogeneous = np.concatenate(
+        [camera.reshape(-1, 3), np.ones((height * width, 1), np.float32)],
+        axis=1,
+    )
+    world = (
+        homogeneous @ np.asarray(c2w, dtype=np.float32).T
+    )[:, :3].reshape(height, width, 3)
+    return camera, world
+
+
+def _reuse_previous_depths(
+    scene,
+    previous_depths: list[np.ndarray],
+):
+    """Initialize and freeze previous rows of the stacked depth parameter.
+
+    This is the adapter-side equivalent of VMem's preset_depth extension.
+    The alignment flow follows runjiali-rl/vmem@39291e4; VMem is MIT-licensed,
+    while CUT3R's optimizer retains its upstream non-commercial license.
+    """
+    if not previous_depths:
+        return None
+    with torch.no_grad():
+        for index, depth in enumerate(previous_depths):
+            flattened = torch.as_tensor(
+                depth,
+                device=scene.im_depthmaps.device,
+                dtype=scene.im_depthmaps.dtype,
+            ).reshape(-1)
+            scene.im_depthmaps.data[index, : len(flattened)] = (
+                flattened.clamp_min(1e-6).log()
+            )
+    gradient_mask = torch.ones_like(scene.im_depthmaps)
+    gradient_mask[: len(previous_depths)] = 0
+    return scene.im_depthmaps.register_hook(
+        lambda gradient: gradient * gradient_mask
+    )
+
+
+def _fixed_pose_incremental_alignment(
+    *,
+    outputs: dict,
+    known_poses: np.ndarray,
+    known_intrinsics: list[np.ndarray],
+    device: str,
+    niter_initial: int,
+    niter_incremental: int,
+    lr: float,
+    min_views: int = 4,
+) -> tuple[list[dict], list[dict]]:
+    """Causally align each prefix with fixed pose/K and frozen prior depths."""
+    from cloud_opt.dust3r_opt import global_aligner, GlobalAlignerMode
+
+    num_views = len(outputs["pred"])
+    if num_views < min_views:
+        raise ValueError(
+            f"Fixed global alignment needs at least {min_views} views"
+        )
+    previous_depths: list[np.ndarray] = []
+    aligned: list[dict | None] = [None] * num_views
+    audits: list[dict] = []
+    for prefix_length in range(min_views, num_views + 1):
+        pairwise = _pairwise_star_output(outputs, prefix_length)
+        scene = global_aligner(
+            pairwise,
+            device=device,
+            mode=GlobalAlignerMode.PointCloudOptimizer,
+            verbose=False,
+            optimize_pp=True,
+        )
+        scene.compute_global_alignment(
+            init="mst", niter=0, schedule="linear", lr=lr
+        )
+        poses = np.asarray(known_poses[:prefix_length], dtype=np.float32)
+        intrinsics = known_intrinsics[:prefix_length]
+        focals = [
+            float(np.sqrt(value[0, 0] * value[1, 1]))
+            for value in intrinsics
+        ]
+        principal_points = np.asarray(
+            [value[:2, 2] for value in intrinsics], dtype=np.float32
+        )
+        scene.preset_pose(poses)
+        scene.preset_focal(focals)
+        scene.preset_principal_point(principal_points)
+        depth_hook = _reuse_previous_depths(scene, previous_depths)
+        iterations = (
+            int(niter_initial)
+            if prefix_length == min_views
+            else int(niter_incremental)
+        )
+        started = time.perf_counter()
+        loss = scene.compute_global_alignment(
+            init=None,
+            niter=iterations,
+            schedule="linear",
+            lr=float(lr),
+        )
+        optimization_seconds = time.perf_counter() - started
+        if depth_hook is not None:
+            depth_hook.remove()
+        scene.clean_pointcloud()
+        depths = [
+            value.detach().cpu().numpy().astype(np.float32)
+            for value in scene.get_depthmaps()
+        ]
+        confidences = [
+            value.detach().cpu().numpy().astype(np.float32)
+            for value in scene.get_conf(mode="none")
+        ]
+        previous_change = (
+            max(
+                float(np.max(np.abs(depths[index] - previous_depths[index])))
+                for index in range(len(previous_depths))
+            )
+            if previous_depths
+            else 0.0
+        )
+        if previous_change > 1e-6:
+            raise RuntimeError(
+                "Previous aligned depth changed despite the freeze mask: "
+                f"{previous_change}"
+            )
+        newly_materialized = (
+            range(prefix_length)
+            if prefix_length == min_views
+            else (prefix_length - 1,)
+        )
+        for index in newly_materialized:
+            camera_points, world_points = _depth_to_world(
+                depths[index], known_intrinsics[index], known_poses[index]
+            )
+            aligned[index] = {
+                "pts3d": world_points,
+                "pts3d_self": camera_points,
+                "depth": depths[index],
+                "confidence": confidences[index],
+                "intrinsics": known_intrinsics[index].astype(np.float32),
+            }
+        audits.append(
+            {
+                "prefix_length": int(prefix_length),
+                "iterations": iterations,
+                "loss": float(loss),
+                "optimization_seconds": optimization_seconds,
+                "previous_depth_max_abs_change": previous_change,
+                "poses_frozen": not bool(scene.im_poses.requires_grad),
+                "focals_frozen": not bool(scene.im_focals.requires_grad),
+                "principal_points_frozen": not bool(
+                    scene.im_pp.requires_grad
+                ),
+            }
+        )
+        previous_depths = depths
+        del scene, pairwise
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+    if any(value is None for value in aligned):
+        raise RuntimeError("Fixed alignment did not materialize every frame")
+    return [value for value in aligned if value is not None], audits
 
 
 def _write_diagnostics(
@@ -210,6 +454,11 @@ class Cut3RAdapter:
         query_pose_mode: str = "controlled_same_pose_known",
         query_target_chunk: int | None = None,
         confidence_threshold: float = 1.5,
+        alignment_mode: str = "rigid_self_pointmap",
+        known_intrinsics_path: str | Path | None = None,
+        niter_initial: int = 100,
+        niter_incremental: int = 20,
+        alignment_lr: float = 0.01,
     ) -> Cut3RSequence:
         baseline_root = Path(baseline_root).resolve()
         mapping_payload = json.loads(Path(block_mapping).read_text(encoding="utf-8"))
@@ -233,6 +482,22 @@ class Cut3RAdapter:
             "known_target_pose",
         }:
             raise ValueError(f"Unsupported query pose mode: {query_pose_mode}")
+        if alignment_mode not in {
+            "rigid_self_pointmap",
+            "fixed_global_incremental",
+            "fixed_global_joint",
+        }:
+            raise ValueError(f"Unsupported alignment mode: {alignment_mode}")
+        if (
+            alignment_mode in {
+                "fixed_global_incremental",
+                "fixed_global_joint",
+            }
+            and known_intrinsics_path is None
+        ):
+            raise ValueError(
+                "fixed_global_incremental requires known_intrinsics_path"
+            )
         query_target_chunk = (
             int(target_chunk)
             if query_target_chunk is None
@@ -313,6 +578,41 @@ class Cut3RAdapter:
             pose_distance(known, predicted)
             for known, predicted in zip(known_poses, predicted_aligned)
         ]
+        alignment_audits: list[dict] = []
+        aligned_frames: list[dict] | None = None
+        known_intrinsics: list[np.ndarray] | None = None
+        if alignment_mode in {
+            "fixed_global_incremental",
+            "fixed_global_joint",
+        }:
+            base_intrinsics = _load_intrinsics(known_intrinsics_path)
+            known_intrinsics = [
+                _intrinsics_after_cut3r_resize_crop(
+                    base_intrinsics,
+                    image_path,
+                    tuple(
+                        int(value)
+                        for value in prediction["conf_self"].shape[-2:]
+                    ),
+                )
+                for image_path, prediction in zip(image_paths, predictions)
+            ]
+            aligned_frames, alignment_audits = (
+                _fixed_pose_incremental_alignment(
+                    outputs=outputs,
+                    known_poses=known_poses,
+                    known_intrinsics=known_intrinsics,
+                    device=self.device,
+                    niter_initial=niter_initial,
+                    niter_incremental=niter_incremental,
+                    lr=alignment_lr,
+                    min_views=(
+                        len(predictions)
+                        if alignment_mode == "fixed_global_joint"
+                        else 4
+                    ),
+                )
+            )
 
         frame_entries = []
         raw_points = 0
@@ -320,20 +620,38 @@ class Cut3RAdapter:
         for frame_id, (item, image_path, prediction) in enumerate(
             zip(history, image_paths, predictions)
         ):
-            points_self = prediction["pts3d_in_self_view"].float()
-            confidence = prediction["conf_self"].float()
-            known_c2w = torch.as_tensor(
-                known_poses[frame_id],
-                dtype=points_self.dtype,
-                device=points_self.device,
-            ).unsqueeze(0)
-            points_world = geotrf(known_c2w, points_self)
-            intrinsics = _intrinsics_from_pointmap(points_self)
-            points_np = points_world[0].cpu().numpy().astype(np.float32)
-            confidence_np = confidence[0].cpu().numpy().astype(np.float32)
+            if aligned_frames is not None:
+                aligned = aligned_frames[frame_id]
+                points_np = aligned["pts3d"]
+                points_self_np = aligned["pts3d_self"]
+                depth_np = aligned["depth"]
+                confidence_np = aligned["confidence"]
+                intrinsics_np = aligned["intrinsics"]
+            else:
+                points_self = prediction["pts3d_in_self_view"].float()
+                confidence = prediction["conf_self"].float()
+                known_c2w = torch.as_tensor(
+                    known_poses[frame_id],
+                    dtype=points_self.dtype,
+                    device=points_self.device,
+                ).unsqueeze(0)
+                points_world = geotrf(known_c2w, points_self)
+                intrinsics = _intrinsics_from_pointmap(points_self)
+                points_np = (
+                    points_world[0].cpu().numpy().astype(np.float32)
+                )
+                points_self_np = (
+                    points_self[0].cpu().numpy().astype(np.float32)
+                )
+                depth_np = points_self_np[..., 2]
+                confidence_np = (
+                    confidence[0].cpu().numpy().astype(np.float32)
+                )
+                intrinsics_np = (
+                    intrinsics[0].cpu().numpy().astype(np.float32)
+                )
             c2w_np = known_poses[frame_id]
             predicted_c2w_np = predicted_poses[frame_id]
-            intrinsics_np = intrinsics[0].cpu().numpy().astype(np.float32)
             raw_points += int(confidence_np.size)
             accepted_points += int(
                 np.count_nonzero(
@@ -346,7 +664,8 @@ class Cut3RAdapter:
             np.savez_compressed(
                 output_dir / relative_data,
                 pts3d=points_np,
-                pts3d_self=points_self[0].cpu().numpy().astype(np.float32),
+                pts3d_self=points_self_np,
+                depth=depth_np,
                 confidence=confidence_np,
                 c2w=c2w_np,
                 predicted_c2w=predicted_c2w_np,
@@ -362,6 +681,10 @@ class Cut3RAdapter:
                     "shape": list(confidence_np.shape),
                     "camera_pose": c2w_np.tolist(),
                     "camera_pose_source": "known_control_c2w",
+                    "alignment_mode": alignment_mode,
+                    "known_intrinsics_used": bool(
+                        known_intrinsics is not None
+                    ),
                     "predicted_camera_pose": predicted_c2w_np.tolist(),
                     "predicted_camera_pose_aligned": predicted_aligned[
                         frame_id
@@ -390,9 +713,18 @@ class Cut3RAdapter:
         cut3r_commit = _git(self.root, "rev-parse", "HEAD")
         cut3r_dirty = bool(_git(self.root, "status", "--short"))
         checkpoint_sha256 = _sha256(self.checkpoint)
+        backend_name = (
+            "official_CUT3R_fixed_global_incremental"
+            if alignment_mode == "fixed_global_incremental"
+            else (
+                "official_CUT3R_fixed_global_joint"
+                if alignment_mode == "fixed_global_joint"
+                else "official_CUT3R_rigid_self_pointmap"
+            )
+        )
         sequence_payload = {
-            "version": 2,
-            "backend": "official_CUT3R_known_pose",
+            "version": 3,
+            "backend": backend_name,
             "cut3r_commit": cut3r_commit,
             "cut3r_dirty": cut3r_dirty,
             "checkpoint": str(self.checkpoint),
@@ -405,7 +737,20 @@ class Cut3RAdapter:
             "confidence_interpretation": "exp confidence; larger is more reliable",
             "map_pose_source": "known_control_c2w",
             "cut3r_predicted_pose_used_for_map": False,
-            "reconstruction_mode": "fixed_pose_causal_prefix",
+            "reconstruction_mode": alignment_mode,
+            "known_intrinsics_path": (
+                None
+                if known_intrinsics_path is None
+                else str(Path(known_intrinsics_path).resolve())
+            ),
+            "fixed_global_alignment": (
+                alignment_mode
+                in {"fixed_global_incremental", "fixed_global_joint"}
+            ),
+            "previous_depths_reused": (
+                alignment_mode == "fixed_global_incremental"
+            ),
+            "alignment_audits": alignment_audits,
             "prefix_last_chunk": max(item["chunk_id"] for item in frame_entries),
             "target_chunk": int(target_chunk),
             "future_leakage": False,
@@ -420,7 +765,7 @@ class Cut3RAdapter:
             json.dumps(sequence_payload, indent=2), encoding="utf-8"
         )
         stats = {
-            "backend": "official_CUT3R_known_pose",
+            "backend": backend_name,
             "cut3r_commit": cut3r_commit,
             "cut3r_dirty": cut3r_dirty,
             "checkpoint": str(self.checkpoint),
@@ -438,6 +783,37 @@ class Cut3RAdapter:
             "query_pose_mode": query_pose_mode,
             "map_pose_source": "known_control_c2w",
             "cut3r_predicted_pose_used_for_map": False,
+            "alignment_mode": alignment_mode,
+            "known_intrinsics_fixed": bool(known_intrinsics is not None),
+            "previous_depths_reused": (
+                alignment_mode == "fixed_global_incremental"
+            ),
+            "alignment_niter_initial": (
+                int(niter_initial)
+                if alignment_mode
+                in {"fixed_global_incremental", "fixed_global_joint"}
+                else None
+            ),
+            "alignment_niter_incremental": (
+                int(niter_incremental)
+                if alignment_mode == "fixed_global_incremental"
+                else None
+            ),
+            "alignment_runtime_seconds": float(
+                sum(
+                    item["optimization_seconds"]
+                    for item in alignment_audits
+                )
+            ),
+            "maximum_previous_depth_change": float(
+                max(
+                    (
+                        item["previous_depth_max_abs_change"]
+                        for item in alignment_audits
+                    ),
+                    default=0.0,
+                )
+            ),
             "maximum_predicted_translation_drift": float(
                 max(error[1] for error in pose_errors)
             ),
@@ -448,21 +824,37 @@ class Cut3RAdapter:
         (output_dir / "stats.json").write_text(
             json.dumps(stats, indent=2), encoding="utf-8"
         )
+        stored_points_description = (
+            "- Stored points: globally aligned depth back-projected with fixed "
+            "known K and fixed controlled c2w; prior prefix depths are reused "
+            "and gradient-frozen when a new view is added.\n"
+            if alignment_mode == "fixed_global_incremental"
+            else "- Stored points: legacy independent CUT3R self-view pointmaps "
+            "rigidly transformed by controlled c2w; no global alignment.\n"
+        )
+        convention = "".join(
+            [
+                "# CUT3R coordinate convention\n\n",
+                "- Provider: official CUT3R feed-forward inference.\n",
+                stored_points_description,
+                "- Camera pose: c2w; camera coordinates use x-right, y-down, "
+                "z-forward.\n",
+                "- World frame: the exact InSpatio control trajectory after "
+                "the VMem Y/Z camera-basis conversion.\n",
+                "- Scale: arbitrary learned scene scale; voxel size is "
+                "therefore relative.\n",
+                "- CUT3R predicted poses are diagnostics only and never place "
+                "geometry.\n",
+                f"- Query: {query_pose_mode}; fixed known intrinsics are used "
+                "when alignment mode is fixed-global, and target chunk "
+                f"{query_target_chunk} provides the known pose when "
+                "known_target_pose is selected.\n",
+                "- Causality: only generated chunks strictly before B2 were "
+                "provided.\n",
+            ]
+        )
         (output_dir / "coordinate_convention.md").write_text(
-            "# CUT3R coordinate convention\n\n"
-            "- Provider: official CUT3R feed-forward inference.\n"
-            "- Stored points: CUT3R self-view pointmaps transformed by the known "
-            "controlled c2w for that generated chunk.\n"
-            "- Camera pose: c2w; camera coordinates use x-right, y-down, z-forward.\n"
-            "- World frame: the exact InSpatio control trajectory after the VMem "
-            "Y/Z camera-basis conversion.\n"
-            "- Scale: arbitrary learned scene scale; voxel size is therefore relative.\n"
-            "- CUT3R predicted poses are diagnostics only and never place geometry.\n"
-            f"- Query: {query_pose_mode}; source chunk {query_source_chunk} provides "
-            f"intrinsics and target chunk {query_target_chunk} provides the known "
-            "pose when known_target_pose is selected.\n"
-            "- Causality: only generated chunks strictly before B2 were provided.\n",
-            encoding="utf-8",
+            convention, encoding="utf-8"
         )
         _write_diagnostics(
             output_dir=output_dir,
@@ -512,6 +904,19 @@ def main() -> None:
     )
     parser.add_argument("--query_target_chunk", type=int)
     parser.add_argument("--confidence_threshold", type=float, default=1.5)
+    parser.add_argument(
+        "--alignment_mode",
+        choices=(
+            "rigid_self_pointmap",
+            "fixed_global_incremental",
+            "fixed_global_joint",
+        ),
+        default="rigid_self_pointmap",
+    )
+    parser.add_argument("--known_intrinsics")
+    parser.add_argument("--alignment_niter_initial", type=int, default=100)
+    parser.add_argument("--alignment_niter_incremental", type=int, default=20)
+    parser.add_argument("--alignment_lr", type=float, default=0.01)
     parser.add_argument("--image_size", type=int, default=512)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -530,6 +935,11 @@ def main() -> None:
         query_pose_mode=args.query_pose_mode,
         query_target_chunk=args.query_target_chunk,
         confidence_threshold=args.confidence_threshold,
+        alignment_mode=args.alignment_mode,
+        known_intrinsics_path=args.known_intrinsics,
+        niter_initial=args.alignment_niter_initial,
+        niter_incremental=args.alignment_niter_incremental,
+        alignment_lr=args.alignment_lr,
     )
 
 

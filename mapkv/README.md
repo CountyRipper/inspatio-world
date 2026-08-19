@@ -268,3 +268,31 @@ The controlled result is `REENTRY_EPISODE_CONTINUOUS_WORKS`: it preserves
 departure peak to baseline. TTL=2, same-surface view adaptation, edge-safe
 support, and steps012 do not improve the retained chunk-11 identity and remain
 rejected ablations.
+
+## Fixed 3D surfel address repair
+
+The former pts3d_in_self_view × known c2w path is retained only as the
+explicit legacy backend. The repaired geometry path adds:
+
+1. CUT3R cross-view global alignment with fixed known poses and intrinsics;
+2. an audited previous-depth incremental backend plus a full-prefix joint
+   quality backend;
+3. tentative/stable surfels with confidence calibration and reprojection
+   consistency;
+4. stable surface-neighborhood, unique-cell chunk voting with cluster-max
+   aggregation and retrieval margin/entropy;
+5. separate pure-yaw angular and 0.08-translation depth Gates.
+
+Run:
+
+    bash scripts/run_mapkv_geometry_repair.sh --stage full
+    bash scripts/run_mapkv_translation_geometry.sh --stage full
+    bash scripts/run_mapkv_geometry_repair.sh --stage report
+
+The combined report is written to
+results/mapkv_fast/yaw45m20to35_scene01_seed0_geometry_repair/report.html.
+No KV generation runs inside these stages. The observed result is
+GEOMETRY_ADDRESS_REPAIR_WORKS: the pure-yaw angular Gate and translation
+depth Gate both pass. Strictly freezing every previous depth was implemented
+and audited but did not converge as a quality path; the current quality oracle
+uses a causal full-prefix joint fixed-pose alignment.

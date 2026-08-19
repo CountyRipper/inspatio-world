@@ -15,7 +15,7 @@ Keep its environment separate from InSpatio:
 git clone https://github.com/CUT3R/CUT3R third_party/CUT3R
 git -C third_party/CUT3R checkout 8bc15dc92a6d7fd92920b4ec81540d3dec7d3ecf
 python -m venv --system-site-packages third_party/mapkv_cut3r_env
-third_party/mapkv_cut3r_env/bin/pip install accelerate gdown
+third_party/mapkv_cut3r_env/bin/pip install accelerate gdown viser
 ```
 
 Follow CUT3R's own installation instructions for its remaining dependencies
@@ -29,3 +29,9 @@ into MapKV.
 CUT3R and its weights retain their upstream copyright and license terms. This
 adapter is intended for the research prototype described here; check upstream
 terms before redistribution or commercial use.
+
+The fixed-pose incremental alignment flow was adapted from the research
+reference runjiali-rl/vmem@39291e4f272f6b4f270691d930926ab5930f942e,
+especially extern/CUT3R/surfel_inference.py. VMem is MIT-licensed. MapKV does
+not vendor VMem source; the adapter-side previous-depth gradient mask is an
+independent compatibility implementation for the upstream CUT3R optimizer.
