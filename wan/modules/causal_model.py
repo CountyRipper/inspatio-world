@@ -490,6 +490,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        # Optional MapKV sidecar. It is attached after loading the frozen
+        # InSpatio checkpoint, so the upstream checkpoint/schema stays intact.
+        self.memory_adapter = None
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
             nn.Linear(dim, dim))
@@ -546,6 +549,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         freqs_offset: int = 0,
         memory_context=None,
         canonical_capture=None,
+        memory_adapter_context=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -601,7 +605,24 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         assert(x.shape[1] == 36) 
         
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        model_input = x
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in model_input]
+        if memory_adapter_context is not None:
+            if kv_size[1] < 0:
+                raise ValueError("Memory adapter is forbidden during context writer passes")
+            if self.memory_adapter is None:
+                raise RuntimeError("Memory adapter context supplied without an installed adapter")
+            stacked_input = model_input
+            patch_residual = memory_adapter_context.patch_residual(
+                self.memory_adapter, stacked_input
+            )
+            native_shape = (len(x), *x[0].shape[1:])
+            if tuple(patch_residual.shape) != native_shape:
+                raise ValueError(
+                    "Adapter/native patch shape mismatch: "
+                    f"{tuple(patch_residual.shape)} vs {native_shape}"
+                )
+            x = [native + patch_residual[index:index + 1] for index, native in enumerate(x)]
         grid_sizes = torch.stack([
             torch.as_tensor(u.shape[2:], dtype=torch.long, device=u.device)
             for u in x
@@ -633,6 +654,23 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return custom_forward
 
         for block_index, block in enumerate(self.blocks):
+            if memory_adapter_context is not None:
+                config = self.memory_adapter.config
+                if config.inject_middle:
+                    memory_adapter_context.audit.update(
+                        {
+                            "middle_start": int(config.middle_start),
+                            "middle_stop": int(config.middle_stop),
+                        }
+                    )
+                    middle = memory_adapter_context.middle_residual(block_index)
+                    if middle is not None:
+                        if middle.shape != x.shape:
+                            raise ValueError(
+                                "Middle adapter/token shape mismatch: "
+                                f"{tuple(middle.shape)} vs {tuple(x.shape)}"
+                            )
+                        x = x + middle
             kwargs['kv_cache'] = kv_cache[block_index]
             kwargs.pop('layer_memory', None)
             if memory_context is not None:

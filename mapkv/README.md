@@ -344,3 +344,57 @@ target-view visibility → chunk voting → selected KV address. It uses only
 relative artifact paths, includes the full baseline revisit video, supports
 keyboard/fullscreen navigation and `?slide=N`, and ends with the controlled
 coarse-addressing result plus its unrestricted-retrieval limitation.
+
+## Lightweight changed-view memory adapter
+
+The adapter stage freezes the complete InSpatio/CUT3R memory pipeline and only
+trains a small parallel patch-token residual:
+
+```text
+known-pose generated history
+  -> RGB camera warp -> Wan VAE L_mem
+  -> M_need = generated-only history x current source-blind
+  -> concat[L_mem, raw last_pred, M_need]
+  -> 2 x Conv3D(32) + zero-init 1x1 projection
+  -> max-pooled token support x patch-token residual
+  -> frozen InSpatio transformer
+```
+
+The native patch embedding is untouched. With no adapter context, no additional
+Conv3D call is made. With a freshly initialized adapter, the residual is exactly
+zero; both controlled cases require a full latent `max_abs_diff == 0` before
+training. Backbone, text encoder, Wan VAE, scheduler, render/source pipeline,
+CUT3R, surfel map, camera warp, and re-entry lifecycle remain frozen.
+
+Run the cached two-scene workflow with:
+
+```bash
+bash scripts/run_mapkv_memory_adapter.sh \
+  --stage full --gpu 0 \
+  --output_root results/mapkv_fast/memory_adapter_two_scene
+```
+
+Individual stages are `prepare`, `zero_init`, `baselines`, `overfit`, `joint`,
+`evaluate`, and `report`. Training first overfits
+`yaw45m20to35_scene01`, then uses balanced sampling over the independent
+`yaw45m20to35_scene01/02` cases. It consumes only re-entry blocks with at least
+5% accepted `M_need` coverage. Checkpoints and videos are experiment artifacts
+under the result root and are not committed.
+
+If patch-only fails the two-scene identity gate, `full` performs exactly one
+allowed refinement: a second zero-init projection of the same compact memory
+feature into transformer blocks `[10,20)`. No geometry, mask, loss, width,
+step count, or backbone parameter changes. It is also runnable explicitly as
+`--stage refine`.
+
+Scene01 uses `0 -> +45 -> -20 -> +35`. The independent indoor scene02 keeps the
+same pure-yaw changed-view revisit class but uses `0 -> +45 -> -45 -> +35`:
+the stronger leave segment is required because its wide-FOV anchor surfaces
+never become fully absent at -20 degrees. The absence threshold and lifecycle
+are not relaxed.
+
+The final `report.html` includes the complete B1 -> leave -> re-entry -> B2
+videos for both scenes, Chinese labels for the current focus, architecture and
+architecture-change diagrams, target-aligned memory/mask previews,
+automatically selected generated-history identity crops, training curves, and
+separate identity/source/boundary/temporal measurements.

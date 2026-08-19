@@ -43,6 +43,12 @@ from mapkv.memory_interface import (
     from_warp_reencode_plans,
     save_memory_interface_artifacts,
 )
+from mapkv.memory_adapter import (
+    MemoryAdapterConfig,
+    MemoryPatchAdapter,
+    load_adapter_checkpoint,
+    plans_from_warp_reencode,
+)
 from mapkv.canonical_kv import (
     build_canonical_readdress_contexts,
     save_canonical_audit,
@@ -143,6 +149,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=(0, 1, 2),
         help="Denoising-step indices used by latent_anchor.",
+    )
+    parser.add_argument(
+        "--memory_adapter_checkpoint",
+        help="Trained CameraAlignedMemoryAdapter checkpoint.",
+    )
+    parser.add_argument(
+        "--memory_adapter_zero_init",
+        action="store_true",
+        help="Install a zero-init patch adapter for strict equivalence testing.",
+    )
+    parser.add_argument("--memory_adapter_hidden_channels", type=int, default=32)
+    parser.add_argument(
+        "--memory_adapter_middle",
+        action="store_true",
+        help="Enable the optional middle-third residual defined by the checkpoint.",
     )
     parser.add_argument(
         "--continuous_recent_fallback",
@@ -323,6 +344,8 @@ def _load_configs(args: argparse.Namespace, runtime_json: Path):
         and not args.continuous_virtual_recent
         and not args.canonical_kv_readdress
         and not args.memory_interface
+        and not args.memory_adapter_checkpoint
+        and not args.memory_adapter_zero_init
     ):
         raise ValueError("MapKV is enabled but target_chunks is empty")
     return config, experiment, mapkv
@@ -620,16 +643,22 @@ def main() -> None:
             args.continuous_virtual_recent,
             args.canonical_kv_readdress,
             args.memory_interface,
+            args.memory_adapter_checkpoint,
+            args.memory_adapter_zero_init,
         )
     ) > 1:
         raise ValueError(
-            "WRE, Canonical-K, and the memory-interface ladder are mutually exclusive"
+            "WRE, Canonical-K, memory-interface, and memory-adapter paths are mutually exclusive"
         )
+    if args.memory_adapter_checkpoint and args.memory_adapter_zero_init:
+        raise ValueError("Choose a trained adapter checkpoint or zero-init equivalence, not both")
     if (
         args.warp_reencode_recent
         or args.continuous_virtual_recent
         or args.canonical_kv_readdress
         or args.memory_interface
+        or args.memory_adapter_checkpoint
+        or args.memory_adapter_zero_init
     ):
         if not args.warp_source_latents or not args.warp_intrinsics_path:
             raise ValueError(
@@ -648,6 +677,8 @@ def main() -> None:
         args.continuous_virtual_recent
         or args.canonical_kv_readdress
         or args.memory_interface
+        or args.memory_adapter_checkpoint
+        or args.memory_adapter_zero_init
     ) and (
         not args.warp_surfel_index or not args.warp_surfel_sequence
     ):
@@ -693,6 +724,39 @@ def main() -> None:
     pipeline.generator.to(device=device)
     pipeline.vae.to(device=device)
     pipeline.eval().requires_grad_(False)
+    adapter_checkpoint_metadata = None
+    adapter_enabled = bool(
+        args.memory_adapter_checkpoint or args.memory_adapter_zero_init
+    )
+    if adapter_enabled:
+        model = pipeline.generator.model
+        model_dim = int(model.dim)
+        patch_size = tuple(int(value) for value in model.patch_size)
+        if args.memory_adapter_checkpoint:
+            adapter, adapter_checkpoint_metadata = load_adapter_checkpoint(
+                args.memory_adapter_checkpoint,
+                model_dim=model_dim,
+                patch_size=patch_size,
+            )
+            if bool(adapter.config.inject_middle) != bool(args.memory_adapter_middle):
+                raise ValueError(
+                    "--memory_adapter_middle must match the checkpoint architecture"
+                )
+        else:
+            middle_start = pipeline.num_transformer_blocks // 3
+            middle_stop = 2 * pipeline.num_transformer_blocks // 3
+            adapter = MemoryPatchAdapter(
+                MemoryAdapterConfig(
+                    hidden_channels=args.memory_adapter_hidden_channels,
+                    model_dim=model_dim,
+                    patch_size=patch_size,
+                    inject_middle=bool(args.memory_adapter_middle),
+                    middle_start=(middle_start if args.memory_adapter_middle else None),
+                    middle_stop=(middle_stop if args.memory_adapter_middle else None),
+                )
+            )
+        adapter = adapter.to(device=device, dtype=dtype).eval().requires_grad_(False)
+        model.memory_adapter = adapter
 
     dataset_config = OmegaConf.to_container(config.dataset, resolve=True)
     dataset = VideoDataset(**dataset_config)
@@ -790,6 +854,7 @@ def main() -> None:
         )
     virtual_recent_contexts = {}
     memory_interface_contexts = {}
+    memory_adapter_contexts = {}
     canonical_audit = None
     memory_interface_manifest = None
     inference_conditioning = None
@@ -851,6 +916,7 @@ def main() -> None:
         args.warp_reencode_recent
         or args.continuous_virtual_recent
         or args.memory_interface
+        or adapter_enabled
     ):
         if not mapkv_config.enabled or mapkv_config.mode != "oracle":
             raise ValueError(
@@ -892,7 +958,43 @@ def main() -> None:
             device=device,
             dtype=dtype,
         )
-        if args.memory_interface:
+        if adapter_enabled:
+            if not args.reentry_memory:
+                raise ValueError("Memory adapter requires the frozen re-entry lifecycle")
+            if args.reentry_observation_start_chunk is None:
+                raise ValueError("Memory adapter requires --reentry_observation_start_chunk")
+            if not args.source_protected_memory:
+                raise ValueError("Memory adapter requires source-protected M_need")
+            if args.warp_history_representation != "rgb_warp_vae":
+                raise ValueError("Memory adapter requires RGB-Warp→Wan-VAE memory")
+            if args.reentry_refresh_policy != "episode_continuous":
+                raise ValueError("Memory adapter freezes episode_continuous lifecycle")
+            if args.reentry_view_adaptive_source:
+                raise ValueError("Memory adapter freezes the canonical source chunk")
+            raw_adapter_plans, memory_selections = build_reentry_virtual_recent_plans(
+                **common_virtual_kwargs,
+                observation_start_chunk=args.reentry_observation_start_chunk,
+                surfel_index_path=args.warp_surfel_index,
+                surfel_sequence_path=args.warp_surfel_sequence,
+                vae=pipeline.vae,
+                reference_mask_latent=mask_latent,
+                absent_blocks=args.reentry_absent_blocks,
+                refresh_policy="episode_continuous",
+                refresh_ttl_blocks=args.reentry_refresh_ttl_blocks,
+                view_adaptive_source=False,
+                same_surface_source=False,
+                edge_safe=False,
+                reference_protection_dilation_kernel=(
+                    args.warp_reference_protection_kernel
+                ),
+                generated_only_threshold=args.warp_generated_only_threshold,
+                memory_dilation_kernel=args.warp_memory_dilation_kernel,
+                query_feather_kernel=args.warp_query_feather_kernel,
+                warp_valid_erosion_kernel=args.reentry_warp_valid_erosion_kernel,
+            )
+            memory_adapter_contexts = plans_from_warp_reencode(raw_adapter_plans)
+            virtual_recent_contexts = {}
+        elif args.memory_interface:
             if not args.reentry_memory:
                 raise ValueError("Memory-interface ladder requires re-entry lifecycle")
             if args.reentry_observation_start_chunk is None:
@@ -1125,6 +1227,7 @@ def main() -> None:
             memory_contexts=memory_contexts or None,
             virtual_recent_contexts=virtual_recent_contexts or None,
             memory_interface_contexts=memory_interface_contexts or None,
+            memory_adapter_contexts=memory_adapter_contexts or None,
             latent_block_interventions=latent_block_interventions or None,
             conditional_dict=inference_conditioning,
         )
@@ -1144,6 +1247,7 @@ def main() -> None:
             or memory_contexts
             or virtual_recent_contexts
             or memory_interface_contexts
+            or memory_adapter_contexts
             or latent_block_interventions
         ):
             raise ValueError("--verify_memory_off_replay is valid for memory-off only")
@@ -1252,6 +1356,52 @@ def main() -> None:
             plans=memory_interface_contexts,
             vae=pipeline.vae,
             output_root=output_root,
+        )
+    adapter_manifest = None
+    if memory_adapter_contexts:
+        adapter_root = output_root / "memory_adapter"
+        adapter_root.mkdir(parents=True, exist_ok=True)
+        entries = []
+        for target, plan in sorted(memory_adapter_contexts.items()):
+            block_root = adapter_root / f"block_{target:04d}"
+            block_root.mkdir(parents=True, exist_ok=True)
+            torch.save(plan.memory_latent.detach().cpu(), block_root / "L_mem.pt")
+            torch.save(plan.need_mask.detach().cpu(), block_root / "M_need.pt")
+            with torch.no_grad():
+                decoded_memory = (
+                    pipeline.vae.decode_to_pixel(
+                        plan.memory_latent, use_cache=False
+                    )
+                    * 0.5
+                    + 0.5
+                ).clamp(0, 1)
+            _save_rgb(
+                decoded_memory[0, decoded_memory.shape[1] // 2],
+                block_root / "L_mem_decoded.png",
+            )
+            mask_preview = plan.need_mask.detach().float().cpu()
+            while mask_preview.ndim > 2:
+                mask_preview = mask_preview.mean(dim=0)
+            Image.fromarray(
+                (mask_preview.clamp(0, 1).numpy() * 255).round().astype(np.uint8)
+            ).resize((832, 480), Image.Resampling.NEAREST).save(
+                block_root / "M_need.png"
+            )
+            entries.append(
+                {
+                    "target_block": int(target),
+                    "source_chunk": int(plan.source_chunk),
+                    "need_coverage_fraction": float(plan.need_mask.float().mean().item()),
+                }
+            )
+        adapter_manifest = {
+            "architecture": "parallel_zero_init_conv3d_patch_residual",
+            "checkpoint": args.memory_adapter_checkpoint,
+            "zero_init_equivalence": bool(args.memory_adapter_zero_init),
+            "blocks": entries,
+        }
+        (adapter_root / "manifest.json").write_text(
+            json.dumps(adapter_manifest, indent=2), encoding="utf-8"
         )
 
     video_uint8 = (
@@ -1509,6 +1659,37 @@ def main() -> None:
                 "audits": {
                     str(target): audit
                     for target, audit in pipeline.last_memory_interface_audits.items()
+                },
+            },
+            "memory_adapter": {
+                "enabled": bool(memory_adapter_contexts),
+                "checkpoint": args.memory_adapter_checkpoint,
+                "checkpoint_metadata": adapter_checkpoint_metadata,
+                "zero_init_equivalence": bool(args.memory_adapter_zero_init),
+                "architecture": (
+                    None
+                    if not adapter_enabled
+                    else {
+                        "input": "concat[L_mem, raw_last_pred, M_need]",
+                        "injection": "parallel masked patch-token residual",
+                        "hidden_channels": int(
+                            pipeline.generator.model.memory_adapter.config.hidden_channels
+                        ),
+                        "middle_injection": bool(
+                            pipeline.generator.model.memory_adapter.config.inject_middle
+                        ),
+                        "trainable_parameters": int(
+                            pipeline.generator.model.memory_adapter.trainable_parameter_count()
+                        ),
+                    }
+                ),
+                "frozen_geometry": True,
+                "frozen_lifecycle": "episode_continuous",
+                "target_aligned_memory": "RGB-Warp→Wan-VAE",
+                "manifest": adapter_manifest,
+                "audits": {
+                    str(target): audit
+                    for target, audit in pipeline.last_memory_adapter_audits.items()
                 },
             },
         },

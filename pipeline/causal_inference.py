@@ -37,6 +37,7 @@ def denoise_block(
     noise_provider=None,
     memory_context=None,
     memory_interface=None,
+    memory_adapter_context=None,
     recent_slot_len=0,
 ):
     """
@@ -121,6 +122,8 @@ def denoise_block(
             )
             if step_memory is not None:
                 generator_kwargs["memory_context"] = step_memory
+            if memory_adapter_context is not None:
+                generator_kwargs["memory_adapter_context"] = memory_adapter_context
             _, denoised_pred = generator(**generator_kwargs)
             if dual_cache is not None:
                 memory_kwargs = dict(generator_kwargs)
@@ -232,6 +235,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.last_virtual_memory_contexts = {}
         self.last_virtual_recent_audits = {}
         self.last_memory_interface_audits = {}
+        self.last_memory_adapter_audits = {}
 
     def inference(
         self,
@@ -246,6 +250,7 @@ class CausalInferencePipeline(torch.nn.Module):
         memory_contexts: Optional[Mapping[int, object]] = None,
         virtual_recent_contexts: Optional[Mapping[int, object]] = None,
         memory_interface_contexts: Optional[Mapping[int, object]] = None,
+        memory_adapter_contexts: Optional[Mapping[int, object]] = None,
         latent_block_interventions: Optional[Mapping[int, object]] = None,
         conditional_dict: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
@@ -271,6 +276,7 @@ class CausalInferencePipeline(torch.nn.Module):
             memory_contexts
             or virtual_recent_contexts
             or memory_interface_contexts
+            or memory_adapter_contexts
             or latent_block_interventions
             or after_context_write is not None
         ):
@@ -310,6 +316,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.last_virtual_memory_contexts = {}
         self.last_virtual_recent_audits = {}
         self.last_memory_interface_audits = {}
+        self.last_memory_adapter_audits = {}
         for block_id, num_block_frame in enumerate(all_num_frames):
             block_start_time = time.time()
             noisy_input = noise[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
@@ -317,6 +324,7 @@ class CausalInferencePipeline(torch.nn.Module):
             render_block = render_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             mask_block = mask_latent[:, start_index :start_index + num_block_frame ].to(device=noise.device, dtype=noise.dtype)
             interface_plan = (memory_interface_contexts or {}).get(block_id)
+            adapter_plan = (memory_adapter_contexts or {}).get(block_id)
             if interface_plan is not None:
                 if int(interface_plan.target_block) != block_id:
                     raise ValueError(
@@ -353,11 +361,23 @@ class CausalInferencePipeline(torch.nn.Module):
             virtual_plan = (virtual_recent_contexts or {}).get(block_id)
             if sum(
                 value is not None
-                for value in (block_memory, virtual_plan, interface_plan)
+                for value in (block_memory, virtual_plan, interface_plan, adapter_plan)
             ) > 1:
                 raise ValueError(
-                    f"Block {block_id} cannot combine stored-KV, WRE, and memory-interface methods"
+                    f"Block {block_id} cannot combine stored-KV, WRE, memory-interface, "
+                    "and adapter methods"
                 )
+            adapter_context = None
+            if adapter_plan is not None:
+                if block_id == 0 or last_pred is None:
+                    raise ValueError("Memory adapter requires a previous generated block")
+                if int(adapter_plan.target_block) != block_id:
+                    raise ValueError(
+                        f"Memory adapter target {adapter_plan.target_block} != block {block_id}"
+                    )
+                if int(adapter_plan.source_chunk) >= block_id - 1:
+                    raise ValueError("Memory adapter source must be older than runtime Recent")
+                adapter_context = adapter_plan.bind_recent(last_pred)
             if virtual_plan is not None:
                 if block_id == 0 or last_pred is None:
                     raise ValueError("Virtual recent memory requires a previous generated block")
@@ -452,6 +472,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 noise_provider=noise_provider,
                 memory_context=block_memory,
                 memory_interface=interface_plan,
+                memory_adapter_context=adapter_context,
                 recent_slot_len=recent_slot_len,
             )
             latent_intervention = (latent_block_interventions or {}).get(block_id)
@@ -470,6 +491,10 @@ class CausalInferencePipeline(torch.nn.Module):
             if interface_plan is not None:
                 self.last_memory_interface_audits[block_id] = dict(
                     interface_plan.audit
+                )
+            if adapter_context is not None:
+                self.last_memory_adapter_audits[block_id] = dict(
+                    adapter_context.audit
                 )
 
 

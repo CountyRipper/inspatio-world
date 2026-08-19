@@ -1,0 +1,60 @@
+experiment:
+  name: mapkv_lightweight_memory_adapter
+  seed: 0
+  cases:
+    - yaw45m20to35_scene01
+    - yaw45m20to35_scene02
+
+memory:
+  representation: rgb_warp_vae
+  canonical_source_chunk: 11
+  lifecycle: episode_continuous
+  absent_blocks: 2
+  source_protected: true
+  minimum_need_coverage: 0.05
+
+adapter:
+  architecture: patch_only
+  latent_channels: 16
+  hidden_channels: 32
+  zero_init_output: true
+  input: [L_mem, raw_last_pred, M_need]
+  injection: parallel_masked_patch_token_residual
+  middle_injection: false
+  conditional_refinement:
+    trigger: patch_only_fails_two_scene_identity_gate
+    architecture: patch_plus_middle_third
+    middle_blocks: [10, 20]
+    reuse_memory_feature: true
+    zero_init_output: true
+
+training:
+  backbone_frozen: true
+  vae_frozen: true
+  text_encoder_frozen: true
+  scheduler_frozen: true
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  example_a_overfit_steps: 40
+  joint_steps: 80
+  rgb_loss_every: 8
+  balanced_case_sampling: true
+  losses:
+    memory_latent: 1.0
+    memory_rgb: 1.0
+    source_preservation: 1.0
+    boundary: 0.25
+    temporal: 0.25
+
+evaluation:
+  methods:
+    - baseline
+    - episode_wre
+    - latent_anchor_all4
+    - adapter_patch_only
+  full_revisit_video: true
+  reentry_video: true
+  b2_video: true
+  identity_regions_per_case: 2

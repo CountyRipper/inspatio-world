@@ -15,6 +15,17 @@ from mapkv.memory_interface import (
     MemoryInterfacePlan,
     build_dual_recent_cache,
 )
+from mapkv.memory_adapter import (
+    MemoryAdapterConfig,
+    MemoryAdapterContext,
+    MemoryPatchAdapter,
+    load_adapter_checkpoint,
+    save_adapter_checkpoint,
+)
+from mapkv.memory_adapter_training import (
+    balanced_training_position,
+    compute_adapter_losses,
+)
 from mapkv.locality_evaluation import _rotation_warp
 from mapkv.surfel_index import (
     surfel_display_axis_labels,
@@ -2067,3 +2078,118 @@ def test_same_surface_view_selection_rejects_unrelated_pose_match():
     )
     assert [item["chunk_id"] for item in ranking] == [0]
     assert ranking[0]["shared_anchor_surfels"] == 1
+
+
+def test_memory_patch_adapter_is_exact_zero_init_and_support_local():
+    adapter = MemoryPatchAdapter(
+        MemoryAdapterConfig(
+            hidden_channels=8, model_dim=24, patch_size=(1, 2, 2)
+        )
+    )
+    memory = torch.randn(1, 16, 3, 8, 10)
+    recent = torch.randn_like(memory)
+    mask = torch.zeros(1, 1, 3, 8, 10)
+    mask[..., 2:6, 3:8] = 1
+    residual, token_mask, middle = adapter(memory, recent, mask)
+    assert adapter.zero_init_is_exact()
+    assert tuple(residual.shape) == (1, 24, 3, 4, 5)
+    assert tuple(token_mask.shape) == (1, 1, 3, 4, 5)
+    assert torch.count_nonzero(residual) == 0
+    assert torch.count_nonzero(token_mask) > 0
+    assert middle is None
+
+
+def test_patch_middle_adapter_has_two_exact_zero_residuals():
+    adapter = MemoryPatchAdapter(
+        MemoryAdapterConfig(
+            hidden_channels=4,
+            model_dim=12,
+            patch_size=(1, 2, 2),
+            inject_middle=True,
+            middle_start=1,
+            middle_stop=3,
+        )
+    )
+    memory = torch.randn(1, 16, 3, 6, 8)
+    recent = torch.randn_like(memory)
+    mask = torch.ones(1, 1, 3, 6, 8)
+    patch, _, middle = adapter(memory, recent, mask)
+    assert adapter.zero_init_is_exact()
+    assert middle is not None
+    assert torch.count_nonzero(patch) == 0
+    assert torch.count_nonzero(middle) == 0
+
+
+def test_memory_adapter_context_converts_bfchw_and_learns_only_supported_tokens():
+    adapter = MemoryPatchAdapter(
+        MemoryAdapterConfig(
+            hidden_channels=4, model_dim=12, patch_size=(1, 2, 2)
+        )
+    )
+    torch.nn.init.normal_(adapter.patch_projection.weight, std=0.01)
+    memory = torch.randn(1, 3, 16, 6, 8)
+    recent = torch.randn_like(memory)
+    mask = torch.zeros(1, 3, 1, 6, 8)
+    mask[..., 2:4, 2:6] = 1
+    context = MemoryAdapterContext(8, 2, memory, recent, mask)
+    residual = context.patch_residual(adapter, torch.randn(1, 36, 3, 6, 8))
+    assert tuple(residual.shape) == (1, 12, 3, 3, 4)
+    assert torch.count_nonzero(residual[..., 0, :]) == 0
+    assert context.audit["active_token_fraction"] > 0
+
+
+def test_memory_adapter_checkpoint_round_trip(tmp_path: Path):
+    adapter = MemoryPatchAdapter(
+        MemoryAdapterConfig(hidden_channels=4, model_dim=12, patch_size=(1, 2, 2))
+    )
+    torch.nn.init.normal_(adapter.patch_projection.weight, std=0.01)
+    path = save_adapter_checkpoint(
+        tmp_path / "adapter.pt", adapter, training={"steps": 3}
+    )
+    restored, metadata = load_adapter_checkpoint(
+        path, model_dim=12, patch_size=(1, 2, 2)
+    )
+    assert metadata == {"steps": 3}
+    for key, value in adapter.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[key], value)
+
+
+def test_adapter_losses_separate_memory_source_boundary_and_temporal():
+    baseline = torch.zeros(1, 3, 2, 4, 4)
+    memory = torch.ones_like(baseline)
+    need = torch.zeros(1, 3, 1, 4, 4)
+    need[..., :2] = 1
+    source = 1.0 - need
+    ideal = need * memory + source * baseline
+    losses = compute_adapter_losses(
+        ideal,
+        memory=memory,
+        baseline=baseline,
+        need=need,
+        source_valid=source,
+    )
+    assert losses["memory_latent"] == 0
+    assert losses["source"] == 0
+    assert losses["temporal"] == 0
+    assert losses["core_total"] == 0
+    assert losses["total"] == 0
+
+
+def test_adapter_balanced_schedule_covers_each_case_block_and_step():
+    seen = {0: set(), 1: set()}
+    for iteration in range(32):
+        case, block, step = balanced_training_position(
+            iteration, case_count=2, sample_count=4, denoising_step_count=4
+        )
+        seen[case].add((block, step))
+    assert seen[0] == {(block, step) for block in range(4) for step in range(4)}
+    assert seen[1] == seen[0]
+
+
+def test_per_case_rgb_cadence_hits_both_cases():
+    active = {
+        iteration % 2
+        for iteration in range(32)
+        if (iteration // 2) % 8 == 0
+    }
+    assert active == {0, 1}
