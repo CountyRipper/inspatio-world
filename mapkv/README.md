@@ -329,3 +329,18 @@ guidance is partial, native Render memory does not recover the canonical
 instances, and a free final denoising step washes out most steps-012 anchoring.
 All-four-step latent anchoring matches the hard upper bound while keeping the
 measured first-departure and re-entry peaks close to baseline.
+
+## Geometry-addressing HTML presentation
+
+Generate the lightweight 16:9 presentation from the fixed-pose geometry
+artifacts with:
+
+    python scripts/make_mapkv_geometry_presentation.py \
+      --root results/mapkv_fast/yaw45m20to35_scene01_seed0_geometry_repair
+
+The output `presentation.html` is a nine-slide Chinese walkthrough of generated
+history → CUT3R depth/confidence → fixed world alignment → stable RGB surfels →
+target-view visibility → chunk voting → selected KV address. It uses only
+relative artifact paths, includes the full baseline revisit video, supports
+keyboard/fullscreen navigation and `?slide=N`, and ends with the controlled
+coarse-addressing result plus its unrestricted-retrieval limitation.
